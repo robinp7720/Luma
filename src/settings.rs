@@ -122,6 +122,7 @@ pub fn open_config_panel(parent: &ApplicationWindow) -> Result<()> {
     let web_switch = build_switch(config.sources.web);
     let calc_switch = build_switch(config.sources.calc);
     let power_switch = build_switch(config.sources.power);
+    let controls_switch = build_switch(config.sources.controls);
 
     append_setting_row(
         &sources_card,
@@ -194,6 +195,12 @@ pub fn open_config_panel(parent: &ApplicationWindow) -> Result<()> {
         "Power actions",
         "Show lock, suspend, logout, reboot, and shutdown actions.",
         &power_switch,
+    );
+    append_setting_row(
+        &sources_card,
+        "Desktop controls",
+        "Show media, audio, Bluetooth, network, power profile, screenshots, color picker, and notification actions.",
+        &controls_switch,
     );
 
     let email_card = build_card(
@@ -374,6 +381,7 @@ pub fn open_config_panel(parent: &ApplicationWindow) -> Result<()> {
             next.sources.web = web_switch.is_active();
             next.sources.calc = calc_switch.is_active();
             next.sources.power = power_switch.is_active();
+            next.sources.controls = controls_switch.is_active();
 
             next.integrations.email.preferred_backend =
                 email_backend_from_dropdown(email_backend.selected());
@@ -527,6 +535,7 @@ fn build_mode_dropdown(current: SearchMode) -> DropDown {
         "Commands",
         "Web",
         "Calculator",
+        "Controls",
     ]);
     dropdown.set_selected(search_mode_index(current) as u32);
     dropdown
@@ -555,7 +564,8 @@ fn mode_from_dropdown(index: u32) -> SearchMode {
         6 => SearchMode::Email,
         7 => SearchMode::Commands,
         8 => SearchMode::Web,
-        _ => SearchMode::Calc,
+        9 => SearchMode::Calc,
+        _ => SearchMode::Controls,
     }
 }
 
@@ -571,6 +581,7 @@ fn search_mode_index(mode: SearchMode) -> usize {
         SearchMode::Commands => 7,
         SearchMode::Web => 8,
         SearchMode::Calc => 9,
+        SearchMode::Controls => 10,
     }
 }
 

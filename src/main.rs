@@ -8,7 +8,7 @@ mod sources;
 
 use crate::config::{ConfigStore, EmailBackendPreference, EmailConfig};
 use crate::model::PowerOperation;
-use crate::model::{Action, QueryInput, ResultItem, SearchMode};
+use crate::model::{Action, DesktopControlOperation, QueryInput, ResultItem, SearchMode};
 use crate::model::{PasswordOperation, WindowFocusTarget};
 use crate::password::{
     Credential, TypeStep, default_login_steps, format_generated_pass_entry, generate_password,
@@ -1233,6 +1233,9 @@ fn execute_action(
         Action::Power { operation, .. } => {
             execute_power_operation(operation)?;
         }
+        Action::DesktopControl { operation } => {
+            execute_desktop_control_operation(&operation)?;
+        }
         Action::WebSearch { query } => {
             let base = web_search_url();
             let url = format!("{base}{}", urlencoding::encode(&query));
@@ -1328,6 +1331,119 @@ fn execute_power_operation(operation: PowerOperation) -> Result<()> {
             spawn_system_command("systemctl", &["poweroff"], "failed to power off")
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DesktopControlCommand {
+    program: &'static str,
+    args: Vec<String>,
+}
+
+impl DesktopControlCommand {
+    fn new(program: &'static str, args: &[&str]) -> Self {
+        Self {
+            program,
+            args: args.iter().map(|arg| (*arg).to_string()).collect(),
+        }
+    }
+}
+
+fn desktop_control_commands(operation: &DesktopControlOperation) -> Vec<DesktopControlCommand> {
+    match operation {
+        DesktopControlOperation::MediaPlayPause => {
+            vec![DesktopControlCommand::new("playerctl", &["play-pause"])]
+        }
+        DesktopControlOperation::MediaNext => {
+            vec![DesktopControlCommand::new("playerctl", &["next"])]
+        }
+        DesktopControlOperation::MediaPrevious => {
+            vec![DesktopControlCommand::new("playerctl", &["previous"])]
+        }
+        DesktopControlOperation::VolumeUp => vec![DesktopControlCommand::new(
+            "wpctl",
+            &["set-volume", "@DEFAULT_AUDIO_SINK@", "5%+"],
+        )],
+        DesktopControlOperation::VolumeDown => vec![DesktopControlCommand::new(
+            "wpctl",
+            &["set-volume", "@DEFAULT_AUDIO_SINK@", "5%-"],
+        )],
+        DesktopControlOperation::VolumeMute => vec![DesktopControlCommand::new(
+            "wpctl",
+            &["set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"],
+        )],
+        DesktopControlOperation::BrightnessUp => vec![DesktopControlCommand::new(
+            "brightnessctl",
+            &["--class=backlight", "set", "+10%"],
+        )],
+        DesktopControlOperation::BrightnessDown => vec![DesktopControlCommand::new(
+            "brightnessctl",
+            &["--class=backlight", "set", "10%-"],
+        )],
+        DesktopControlOperation::AudioSettings => {
+            vec![DesktopControlCommand::new("pavucontrol", &[])]
+        }
+        DesktopControlOperation::BluetoothTogglePower => vec![DesktopControlCommand::new(
+            "sh",
+            &[
+                "-lc",
+                "state=$(bluetoothctl show | awk '/Powered:/ {print $2}'); if [ \"$state\" = yes ]; then bluetoothctl power off; else bluetoothctl power on; fi",
+            ],
+        )],
+        DesktopControlOperation::NetworkSettings => {
+            vec![DesktopControlCommand::new("nm-connection-editor", &[])]
+        }
+        DesktopControlOperation::PowerProfileCycle => vec![DesktopControlCommand::new(
+            "sh",
+            &[
+                "-lc",
+                "current=$(powerprofilesctl get); case \"$current\" in performance) next=balanced ;; balanced) next=power-saver ;; *) next=performance ;; esac; powerprofilesctl set \"$next\"",
+            ],
+        )],
+        DesktopControlOperation::PowerProfileSet { profile } => vec![DesktopControlCommand {
+            program: "powerprofilesctl",
+            args: vec!["set".to_string(), profile.clone()],
+        }],
+        DesktopControlOperation::ScreenshotArea => vec![DesktopControlCommand::new(
+            "sh",
+            &[
+                "-lc",
+                "dir=\"$HOME/Pictures/Screenshots\"; mkdir -p \"$dir\"; ts=$(date +'%Y-%m-%d %H-%M-%S'); file=\"$dir/Screenshot from $ts.png\"; region=$(slurp) || exit 1; grim -g \"$region\" \"$file\" && wl-copy -t image/png < \"$file\"; notify-send \"Screenshot\" \"Saved to $file\" >/dev/null 2>&1 || true",
+            ],
+        )],
+        DesktopControlOperation::ScreenshotScreen => vec![DesktopControlCommand::new(
+            "sh",
+            &[
+                "-lc",
+                "dir=\"$HOME/Pictures/Screenshots\"; mkdir -p \"$dir\"; ts=$(date +'%Y-%m-%d %H-%M-%S'); file=\"$dir/Screenshot from $ts.png\"; grim \"$file\" && wl-copy -t image/png < \"$file\"; notify-send \"Screenshot\" \"Saved to $file\" >/dev/null 2>&1 || true",
+            ],
+        )],
+        DesktopControlOperation::ColorPicker => {
+            vec![DesktopControlCommand::new("hyprpicker", &["-a"])]
+        }
+        DesktopControlOperation::NotificationHistoryPop => {
+            vec![DesktopControlCommand::new("dunstctl", &["history-pop"])]
+        }
+        DesktopControlOperation::NotificationCloseAll => {
+            vec![DesktopControlCommand::new("dunstctl", &["close-all"])]
+        }
+        DesktopControlOperation::NotificationPauseToggle => vec![DesktopControlCommand::new(
+            "sh",
+            &[
+                "-lc",
+                "paused=$(dunstctl is-paused); if [ \"$paused\" = true ]; then dunstctl set-paused false; else dunstctl set-paused true; fi",
+            ],
+        )],
+    }
+}
+
+fn execute_desktop_control_operation(operation: &DesktopControlOperation) -> Result<()> {
+    for command in desktop_control_commands(operation) {
+        Command::new(command.program)
+            .args(&command.args)
+            .spawn()
+            .with_context(|| format!("failed to spawn {}", command.program))?;
+    }
+    Ok(())
 }
 
 fn lock_session() -> Result<()> {
@@ -2035,6 +2151,7 @@ fn placeholder_for_mode(mode: SearchMode) -> &'static str {
         SearchMode::Commands => "Run a command",
         SearchMode::Web => "Search the web or open a URL",
         SearchMode::Calc => "Evaluate a libqalculate expression",
+        SearchMode::Controls => "Search desktop controls",
     }
 }
 
@@ -2262,12 +2379,16 @@ mod tests {
     use super::{
         EmailOpenStrategy, LAUNCHER_SHADOW_BLUR_PX, LAUNCHER_SHADOW_Y_OFFSET_PX,
         LAUNCHER_SURFACE_MARGIN_BOTTOM_PX, LAUNCHER_SURFACE_MARGIN_PX, action_failure_result,
-        default_ssh_terminal, email_open_strategy, inspected_password_results, launcher_css,
-        layer_shell_enabled, power_confirmation_results, power_requires_confirmation,
-        preserved_selection_index, row_tooltip_text, wayland_available_for_session,
+        default_ssh_terminal, desktop_control_commands, email_open_strategy,
+        inspected_password_results, launcher_css, layer_shell_enabled, power_confirmation_results,
+        power_requires_confirmation, preserved_selection_index, row_tooltip_text,
+        wayland_available_for_session,
     };
     use crate::config::{EmailBackendPreference, EmailConfig};
-    use crate::model::{Action, PasswordOperation, PowerOperation, ResultItem, WindowFocusTarget};
+    use crate::model::{
+        Action, DesktopControlOperation, PasswordOperation, PowerOperation, ResultItem,
+        WindowFocusTarget,
+    };
     use crate::password::parse_credential;
     use std::fs::{self, File};
 
@@ -2504,6 +2625,28 @@ mod tests {
             }
         ));
         assert!(matches!(results[1].action, Action::None));
+    }
+
+    #[test]
+    fn desktop_control_operations_map_to_native_commands() {
+        let media = desktop_control_commands(&DesktopControlOperation::MediaPlayPause);
+        assert_eq!(media[0].program, "playerctl");
+        assert_eq!(media[0].args, vec!["play-pause"]);
+
+        let volume = desktop_control_commands(&DesktopControlOperation::VolumeUp);
+        assert_eq!(volume[0].program, "wpctl");
+        assert_eq!(
+            volume[0].args,
+            vec!["set-volume", "@DEFAULT_AUDIO_SINK@", "5%+"]
+        );
+
+        let bluetooth = desktop_control_commands(&DesktopControlOperation::BluetoothTogglePower);
+        assert_eq!(bluetooth[0].program, "sh");
+        assert!(bluetooth[0].args.join(" ").contains("bluetoothctl power"));
+
+        let color = desktop_control_commands(&DesktopControlOperation::ColorPicker);
+        assert_eq!(color[0].program, "hyprpicker");
+        assert_eq!(color[0].args, vec!["-a"]);
     }
 
     #[test]

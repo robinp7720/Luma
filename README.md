@@ -2,7 +2,7 @@
 
 Luma is a unified command palette for Linux desktops.
 
-It helps you launch apps, switch windows, search files, search email, run commands, manage passwords, open bookmarks, and trigger common desktop actions from one fast overlay.
+It helps you launch apps, switch windows, search files, search email, run commands, manage passwords, open bookmarks, control desktop state, and trigger common desktop actions from one fast overlay.
 
 Luma also includes a built-in settings panel for interactive configuration. Type `settings` in the launcher to open it, or use the `Open settings` result that appears in the default mode.
 
@@ -22,6 +22,7 @@ Luma also includes a built-in settings panel for interactive configuration. Type
 - Recent file search from `~/.local/share/recently-used.xbel`
 - Web search through the default browser
 - `libqalculate` integration through `qalc`
+- Desktop controls for media, audio, screen brightness, Bluetooth, network settings, power profiles, screenshots, color picking, and Dunst notification history
 
 ## Requirements
 
@@ -40,6 +41,15 @@ Optional integrations:
 - `hyprctl` for Hyprland window switching
 - `niri` for Niri window switching
 - `qalc` for calculator queries
+- `playerctl` for media controls
+- `wpctl` for audio controls
+- `brightnessctl` for real backlight brightness controls
+- `bluetoothctl` for Bluetooth controller status and power toggling
+- `nmcli` and `nm-connection-editor` for network status and settings
+- `powerprofilesctl` for power profile status and switching
+- `grim`, `slurp`, and `wl-copy` for screenshots
+- `hyprpicker` for screen color picking
+- `dunstctl` for notification controls and local notification-history search
 
 ## Configuration
 
@@ -52,6 +62,7 @@ The settings panel lets you adjust:
 - which built-in sources are enabled
 - email backend priority, Thunderbird toggle, Evolution toggle, Evolution helper command and timeout, local mail toggle, and mail roots
 - web search URL, SSH terminal, password-store path, password clip timeout, and file-search backend
+- which desktop-control sources are visible through the unified Controls source
 
 Some appearance changes apply on the next launch.
 
@@ -78,6 +89,7 @@ Luma --mode files
 Luma --mode pass
 Luma --mode email
 Luma --mode ssh
+Luma --mode controls
 ```
 
 ## Search Syntax
@@ -90,6 +102,7 @@ recent: report
 pass: github/work
 mail: invoices
 ssh: web-server
+control: volume
 ```
 
 In the default mode, bare text is searched across the unified result set. Password queries also support adding new entries:
@@ -131,6 +144,22 @@ Matching email rows expose actions for:
 
 Reply and compose use `mailto:` for Thunderbird and the Evolution helper for EDS-backed messages. Open uses Thunderbird message URLs when a local profile database is available and otherwise routes through the Evolution helper.
 
+## Desktop Controls
+
+Controls are available in the default result set and can be filtered with `control:`, `controls:`, or `ctl:`.
+
+Control rows expose local desktop actions for:
+
+- Media play/pause, next, and previous through `playerctl`
+- Volume up, volume down, mute, and audio settings through `wpctl` and `pavucontrol`
+- Screen brightness up/down when `brightnessctl` reports a real backlight device
+- Bluetooth controller power toggling through `bluetoothctl`
+- Network settings through NetworkManager tools
+- Power profile cycling and direct profile selection through `powerprofilesctl`
+- Screenshot area/screen actions through `grim`, `slurp`, and `wl-copy`
+- Screen color picking through `hyprpicker`
+- Dunst notification pause/resume, close-all, history pop, and searchable local notification history
+
 ## Notes
 
 - Predictive history is stored as plain JSON in `~/.local/state/Luma/predictions.json`.
@@ -141,6 +170,7 @@ Reply and compose use `mailto:` for Thunderbird and the Evolution helper for EDS
 - Evolution is opt-in in settings so Luma does not talk to EDS unless you enable it and point it at a helper command if needed.
 - The default helper command is `luma-mail-eds`; override it in settings if your build lives elsewhere.
 - Window switching uses `hyprctl clients -j` on Hyprland and `niri msg windows --json` on Niri.
+- Desktop controls are best-effort and only show rows for tools available on the current system. Notification-history result rows are searchable but are not stored in prediction history.
 - Password search reads entry names from `PASSWORD_STORE_DIR` or `~/.password-store`.
 - Autotype uses `wtype` on Wayland and `xdotool` on X11. Copying uses `wl-copy` on Wayland and `xclip` on X11, with secrets passed through stdin.
 - URL, OTP, and custom autotype rows appear after choosing the inspect action for an entry. OTP actions require `pass-otp`.

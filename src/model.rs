@@ -13,6 +13,7 @@ pub enum SearchMode {
     Commands,
     Web,
     Calc,
+    Controls,
 }
 
 impl SearchMode {
@@ -48,6 +49,29 @@ pub enum PowerOperation {
     Shutdown,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum DesktopControlOperation {
+    MediaPlayPause,
+    MediaNext,
+    MediaPrevious,
+    VolumeUp,
+    VolumeDown,
+    VolumeMute,
+    BrightnessUp,
+    BrightnessDown,
+    AudioSettings,
+    BluetoothTogglePower,
+    NetworkSettings,
+    PowerProfileCycle,
+    PowerProfileSet { profile: String },
+    ScreenshotArea,
+    ScreenshotScreen,
+    ColorPicker,
+    NotificationHistoryPop,
+    NotificationCloseAll,
+    NotificationPauseToggle,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum Action {
     LaunchApp {
@@ -79,6 +103,9 @@ pub enum Action {
     Power {
         operation: PowerOperation,
         confirmed: bool,
+    },
+    DesktopControl {
+        operation: DesktopControlOperation,
     },
     OpenUrl {
         url: String,
@@ -167,7 +194,7 @@ fn parse_prefixed_query(raw: &str) -> Option<(SearchMode, SourceFilter, &str)> {
     }
 
     let lowered = raw.to_ascii_lowercase();
-    const PREFIXES: [(&str, SearchMode, SourceFilter); 20] = [
+    const PREFIXES: [(&str, SearchMode, SourceFilter); 23] = [
         ("apps:", SearchMode::Apps, SourceFilter::All),
         ("app:", SearchMode::Apps, SourceFilter::All),
         ("windows:", SearchMode::Windows, SourceFilter::All),
@@ -184,6 +211,9 @@ fn parse_prefixed_query(raw: &str) -> Option<(SearchMode, SourceFilter, &str)> {
         ("command:", SearchMode::Commands, SourceFilter::All),
         ("web:", SearchMode::Web, SourceFilter::All),
         ("calc:", SearchMode::Calc, SourceFilter::All),
+        ("controls:", SearchMode::Controls, SourceFilter::All),
+        ("control:", SearchMode::Controls, SourceFilter::All),
+        ("ctl:", SearchMode::Controls, SourceFilter::All),
         ("bookmarks:", SearchMode::All, SourceFilter::Bookmarks),
         ("bookmark:", SearchMode::All, SourceFilter::Bookmarks),
         ("recents:", SearchMode::All, SourceFilter::Recents),
@@ -372,6 +402,21 @@ mod tests {
         let mail = QueryInput::parse("mail: archive", SearchMode::Apps);
         assert_eq!(mail.mode, SearchMode::Email);
         assert_eq!(mail.text, "archive");
+    }
+
+    #[test]
+    fn textual_prefixes_can_select_controls_mode() {
+        let control = QueryInput::parse("control: volume", SearchMode::Apps);
+        assert_eq!(control.mode, SearchMode::Controls);
+        assert_eq!(control.text, "volume");
+
+        let controls = QueryInput::parse("controls: bluetooth", SearchMode::All);
+        assert_eq!(controls.mode, SearchMode::Controls);
+        assert_eq!(controls.text, "bluetooth");
+
+        let short = QueryInput::parse("ctl: screenshot", SearchMode::All);
+        assert_eq!(short.mode, SearchMode::Controls);
+        assert_eq!(short.text, "screenshot");
     }
 
     #[test]
