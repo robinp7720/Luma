@@ -174,6 +174,7 @@ fn source_label(source: &str) -> &'static str {
         "Recent Files" => "Recent Files",
         "Web" => "Web",
         "Calculator" => "Calculator",
+        "Controls" => "Controls",
         _ => "Predictions",
     }
 }
@@ -324,5 +325,29 @@ mod tests {
         assert_eq!(results[0].title, "Firefox");
         assert_eq!(results[0].source, "Applications");
         assert!(matches!(results[0].action, Action::LaunchApp { .. }));
+    }
+
+    #[test]
+    fn top_predictions_preserve_controls_source_label() {
+        let mut store = PredictionStore::disabled();
+        store
+            .record(
+                StoredPrediction {
+                    key: "control:volume-mute".to_string(),
+                    title: "Mute volume".to_string(),
+                    subtitle: "Volume 61%".to_string(),
+                    source: "Controls".to_string(),
+                    icon_name: "audio-volume-muted-symbolic".to_string(),
+                    action: Action::DesktopControl {
+                        operation: crate::model::DesktopControlOperation::VolumeMute,
+                    },
+                },
+                1_000,
+            )
+            .expect("record prediction");
+
+        let results = store.top_results(1, 1_100);
+
+        assert_eq!(results[0].source, "Controls");
     }
 }

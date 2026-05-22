@@ -1,8 +1,8 @@
 use crate::config::{ConfigStore, EmailBackendPreference, FileSearchBackendChoice, LauncherConfig};
 use crate::mail_eds_protocol::{MailEdsMessageSummary, MailEdsSearchResponse};
 use crate::model::{
-    Action, PasswordOperation, PowerOperation, QueryInput, ResultItem, SearchMode, SourceFilter,
-    WindowFocusTarget, browser_target, password_url_draft, score_text,
+    Action, DesktopControlOperation, PasswordOperation, PowerOperation, QueryInput, ResultItem,
+    SearchMode, SourceFilter, WindowFocusTarget, browser_target, password_url_draft, score_text,
 };
 use crate::prediction::{PredictionStore, StoredPrediction};
 use anyhow::{Context, Result};
@@ -27,6 +27,7 @@ const MAX_EMAIL: usize = 8;
 const MAX_POWER_ACTIONS: usize = 5;
 const MAX_BOOKMARKS: usize = 8;
 const MAX_RECENTS: usize = 8;
+const MAX_CONTROLS: usize = 12;
 const MIN_FILE_QUERY_CHARS: usize = 2;
 
 // Base scores per source sit below the primary launcher categories (apps 900,
@@ -77,6 +78,60 @@ struct PowerAction {
     subtitle: &'static str,
     icon_name: &'static str,
     search_terms: &'static [&'static str],
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ControlSnapshot {
+    pub media: Option<MediaStatus>,
+    pub volume: Option<VolumeStatus>,
+    pub bluetooth: Option<BluetoothStatus>,
+    pub network: Option<NetworkStatus>,
+    pub power_profile: Option<String>,
+    pub screen_brightness: Option<u8>,
+    pub notifications: Vec<NotificationEntry>,
+    pub has_playerctl: bool,
+    pub has_wpctl: bool,
+    pub has_bluetoothctl: bool,
+    pub has_nmcli: bool,
+    pub has_powerprofilesctl: bool,
+    pub has_dunstctl: bool,
+    pub has_grim: bool,
+    pub has_slurp: bool,
+    pub has_hyprpicker: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MediaStatus {
+    pub player: String,
+    pub status: String,
+    pub artist: String,
+    pub title: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct VolumeStatus {
+    pub percent: u8,
+    pub muted: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BluetoothStatus {
+    pub powered: bool,
+    pub connected_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NetworkStatus {
+    pub kind: String,
+    pub connection: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NotificationEntry {
+    pub app_name: String,
+    pub summary: String,
+    pub body: String,
+    pub search_blob: String,
 }
 
 const POWER_ACTIONS: &[PowerAction] = &[
@@ -366,6 +421,10 @@ impl Sources {
 
         if matches!(query.mode, SearchMode::All | SearchMode::Commands) {
             results.extend(self.search_power(&query, now));
+        }
+
+        if query.mode.includes(SearchMode::Controls) {
+            results.extend(self.search_controls(&query, now));
         }
 
         if query.mode == SearchMode::All {
@@ -844,6 +903,25 @@ impl Sources {
             }
         }
 
+        if mode == SearchMode::Controls {
+            if !config.sources.controls {
+                results.push(instruction_result(
+                    "Desktop controls are disabled",
+                    "Open settings to re-enable desktop controls",
+                    "Controls",
+                    "preferences-desktop-symbolic",
+                    65,
+                ));
+            } else {
+                let query = QueryInput {
+                    mode,
+                    source_filter: query.source_filter,
+                    text: String::new(),
+                };
+                results.extend(self.search_controls(&query, now));
+            }
+        }
+
         results
     }
 
@@ -1306,6 +1384,24 @@ impl Sources {
 
         sort_results(&mut items, MAX_POWER_ACTIONS);
         items
+    }
+
+    fn search_controls(&self, query: &QueryInput, now: u64) -> Vec<ResultItem> {
+        if !self.current_config().sources.controls {
+            if query.mode == SearchMode::Controls {
+                return vec![instruction_result(
+                    "Desktop controls are disabled",
+                    "Open settings to re-enable desktop controls",
+                    "Controls",
+                    "preferences-desktop-symbolic",
+                    500,
+                )];
+            }
+            return Vec::new();
+        }
+
+        let snapshot = load_control_snapshot();
+        control_results_from_snapshot(&snapshot, query, now, |key| self.prediction_boost(key, now))
     }
 
     fn search_bookmarks(&self, query: &QueryInput, now: u64) -> Vec<ResultItem> {
@@ -2313,6 +2409,513 @@ fn power_action_score(action: &PowerAction, query: &str) -> Option<i32> {
         .max()
 }
 
+fn control_results_from_snapshot(
+    snapshot: &ControlSnapshot,
+    query: &QueryInput,
+    now: u64,
+    prediction_boost: impl Fn(&str) -> i32,
+) -> Vec<ResultItem> {
+    let mut items = Vec::new();
+    let empty_query = query.text.is_empty();
+
+    let media_subtitle = snapshot.media.as_ref().map(media_subtitle);
+    if snapshot.has_playerctl {
+        push_control_action(
+            &mut items,
+            query,
+            ControlActionSpec {
+                title: "Play/Pause media",
+                subtitle: media_subtitle
+                    .as_deref()
+                    .unwrap_or("Toggle the active media player"),
+                icon_name: "media-playback-start-symbolic",
+                search_terms: &["media", "music", "play", "pause", "toggle", "player"],
+                operation: DesktopControlOperation::MediaPlayPause,
+                prediction_key: Some("control:media-play-pause".to_string()),
+                base_score: 760,
+            },
+            now,
+            &prediction_boost,
+        );
+        push_control_action(
+            &mut items,
+            query,
+            ControlActionSpec {
+                title: "Next media track",
+                subtitle: media_subtitle
+                    .as_deref()
+                    .unwrap_or("Skip the active media player"),
+                icon_name: "media-skip-forward-symbolic",
+                search_terms: &["media", "music", "next", "skip", "track"],
+                operation: DesktopControlOperation::MediaNext,
+                prediction_key: Some("control:media-next".to_string()),
+                base_score: 650,
+            },
+            now,
+            &prediction_boost,
+        );
+        push_control_action(
+            &mut items,
+            query,
+            ControlActionSpec {
+                title: "Previous media track",
+                subtitle: media_subtitle
+                    .as_deref()
+                    .unwrap_or("Go back in the active media player"),
+                icon_name: "media-skip-backward-symbolic",
+                search_terms: &["media", "music", "previous", "back", "track"],
+                operation: DesktopControlOperation::MediaPrevious,
+                prediction_key: Some("control:media-previous".to_string()),
+                base_score: 640,
+            },
+            now,
+            &prediction_boost,
+        );
+    }
+
+    let volume_subtitle = snapshot
+        .volume
+        .as_ref()
+        .map(volume_subtitle)
+        .unwrap_or_else(|| "Adjust the default audio sink".to_string());
+    if snapshot.has_wpctl {
+        push_control_action(
+            &mut items,
+            query,
+            ControlActionSpec {
+                title: "Mute volume",
+                subtitle: &volume_subtitle,
+                icon_name: "audio-volume-muted-symbolic",
+                search_terms: &["volume", "audio", "sound", "mute", "speaker"],
+                operation: DesktopControlOperation::VolumeMute,
+                prediction_key: Some("control:volume-mute".to_string()),
+                base_score: 750,
+            },
+            now,
+            &prediction_boost,
+        );
+        push_control_action(
+            &mut items,
+            query,
+            ControlActionSpec {
+                title: "Raise volume",
+                subtitle: &volume_subtitle,
+                icon_name: "audio-volume-high-symbolic",
+                search_terms: &["volume", "audio", "sound", "raise", "louder", "up"],
+                operation: DesktopControlOperation::VolumeUp,
+                prediction_key: Some("control:volume-up".to_string()),
+                base_score: 700,
+            },
+            now,
+            &prediction_boost,
+        );
+        push_control_action(
+            &mut items,
+            query,
+            ControlActionSpec {
+                title: "Lower volume",
+                subtitle: &volume_subtitle,
+                icon_name: "audio-volume-low-symbolic",
+                search_terms: &["volume", "audio", "sound", "lower", "quieter", "down"],
+                operation: DesktopControlOperation::VolumeDown,
+                prediction_key: Some("control:volume-down".to_string()),
+                base_score: 700,
+            },
+            now,
+            &prediction_boost,
+        );
+    }
+    if command_exists("pavucontrol") {
+        push_control_action(
+            &mut items,
+            query,
+            ControlActionSpec {
+                title: "Open audio settings",
+                subtitle: &volume_subtitle,
+                icon_name: "multimedia-volume-control-symbolic",
+                search_terms: &["audio", "sound", "volume", "pavucontrol", "settings"],
+                operation: DesktopControlOperation::AudioSettings,
+                prediction_key: Some("control:audio-settings".to_string()),
+                base_score: 610,
+            },
+            now,
+            &prediction_boost,
+        );
+    }
+
+    if let Some(percent) = snapshot.screen_brightness {
+        let brightness_subtitle = format!("Screen brightness {percent}%");
+        push_control_action(
+            &mut items,
+            query,
+            ControlActionSpec {
+                title: "Raise brightness",
+                subtitle: &brightness_subtitle,
+                icon_name: "display-brightness-symbolic",
+                search_terms: &[
+                    "brightness",
+                    "screen",
+                    "display",
+                    "backlight",
+                    "raise",
+                    "brighter",
+                ],
+                operation: DesktopControlOperation::BrightnessUp,
+                prediction_key: Some("control:brightness-up".to_string()),
+                base_score: 700,
+            },
+            now,
+            &prediction_boost,
+        );
+        push_control_action(
+            &mut items,
+            query,
+            ControlActionSpec {
+                title: "Lower brightness",
+                subtitle: &brightness_subtitle,
+                icon_name: "display-brightness-symbolic",
+                search_terms: &[
+                    "brightness",
+                    "screen",
+                    "display",
+                    "backlight",
+                    "lower",
+                    "dimmer",
+                ],
+                operation: DesktopControlOperation::BrightnessDown,
+                prediction_key: Some("control:brightness-down".to_string()),
+                base_score: 700,
+            },
+            now,
+            &prediction_boost,
+        );
+    }
+
+    if snapshot.has_bluetoothctl {
+        let bluetooth_subtitle = snapshot
+            .bluetooth
+            .as_ref()
+            .map(bluetooth_subtitle)
+            .unwrap_or_else(|| "Toggle the Bluetooth controller".to_string());
+        push_control_action(
+            &mut items,
+            query,
+            ControlActionSpec {
+                title: "Toggle Bluetooth",
+                subtitle: &bluetooth_subtitle,
+                icon_name: "bluetooth-active-symbolic",
+                search_terms: &["bluetooth", "bt", "wireless", "controller", "power"],
+                operation: DesktopControlOperation::BluetoothTogglePower,
+                prediction_key: Some("control:bluetooth-toggle".to_string()),
+                base_score: 730,
+            },
+            now,
+            &prediction_boost,
+        );
+    }
+
+    if snapshot.has_nmcli {
+        let network_subtitle = snapshot
+            .network
+            .as_ref()
+            .map(network_subtitle)
+            .unwrap_or_else(|| "Open NetworkManager connection settings".to_string());
+        push_control_action(
+            &mut items,
+            query,
+            ControlActionSpec {
+                title: "Open network settings",
+                subtitle: &network_subtitle,
+                icon_name: "network-workgroup-symbolic",
+                search_terms: &["network", "wifi", "wi-fi", "ethernet", "connection", "vpn"],
+                operation: DesktopControlOperation::NetworkSettings,
+                prediction_key: Some("control:network-settings".to_string()),
+                base_score: 690,
+            },
+            now,
+            &prediction_boost,
+        );
+    }
+
+    if snapshot.has_powerprofilesctl {
+        let profile_subtitle = snapshot
+            .power_profile
+            .as_ref()
+            .map(|profile| format!("Current profile: {profile}"))
+            .unwrap_or_else(|| "Cycle the active power profile".to_string());
+        push_control_action(
+            &mut items,
+            query,
+            ControlActionSpec {
+                title: "Cycle power profile",
+                subtitle: &profile_subtitle,
+                icon_name: "power-profile-balanced-symbolic",
+                search_terms: &[
+                    "power profile",
+                    "performance",
+                    "balanced",
+                    "power saver",
+                    "battery",
+                ],
+                operation: DesktopControlOperation::PowerProfileCycle,
+                prediction_key: Some("control:power-profile-cycle".to_string()),
+                base_score: 680,
+            },
+            now,
+            &prediction_boost,
+        );
+        for profile in ["performance", "balanced", "power-saver"] {
+            let title = format!("Set power profile: {profile}");
+            push_control_action(
+                &mut items,
+                query,
+                ControlActionSpec {
+                    title: &title,
+                    subtitle: &profile_subtitle,
+                    icon_name: "power-profile-balanced-symbolic",
+                    search_terms: &["power profile", profile],
+                    operation: DesktopControlOperation::PowerProfileSet {
+                        profile: profile.to_string(),
+                    },
+                    prediction_key: Some(format!("control:power-profile:{profile}")),
+                    base_score: 560,
+                },
+                now,
+                &prediction_boost,
+            );
+        }
+    }
+
+    if snapshot.has_grim && snapshot.has_slurp {
+        push_control_action(
+            &mut items,
+            query,
+            ControlActionSpec {
+                title: "Screenshot area",
+                subtitle: "Select a region, save it, and copy it to the clipboard",
+                icon_name: "camera-photo-symbolic",
+                search_terms: &[
+                    "screenshot",
+                    "screen shot",
+                    "capture",
+                    "area",
+                    "region",
+                    "grim",
+                    "slurp",
+                ],
+                operation: DesktopControlOperation::ScreenshotArea,
+                prediction_key: Some("control:screenshot-area".to_string()),
+                base_score: 720,
+            },
+            now,
+            &prediction_boost,
+        );
+        push_control_action(
+            &mut items,
+            query,
+            ControlActionSpec {
+                title: "Screenshot screen",
+                subtitle: "Save the current screen and copy it to the clipboard",
+                icon_name: "camera-photo-symbolic",
+                search_terms: &["screenshot", "screen shot", "capture", "screen", "grim"],
+                operation: DesktopControlOperation::ScreenshotScreen,
+                prediction_key: Some("control:screenshot-screen".to_string()),
+                base_score: 660,
+            },
+            now,
+            &prediction_boost,
+        );
+    }
+
+    if snapshot.has_hyprpicker {
+        push_control_action(
+            &mut items,
+            query,
+            ControlActionSpec {
+                title: "Pick screen color",
+                subtitle: "Copy a color from the screen to the clipboard",
+                icon_name: "color-select-symbolic",
+                search_terms: &[
+                    "color",
+                    "colour",
+                    "picker",
+                    "pick",
+                    "hyprpicker",
+                    "eyedropper",
+                ],
+                operation: DesktopControlOperation::ColorPicker,
+                prediction_key: Some("control:color-picker".to_string()),
+                base_score: 710,
+            },
+            now,
+            &prediction_boost,
+        );
+    }
+
+    if snapshot.has_dunstctl {
+        push_control_action(
+            &mut items,
+            query,
+            ControlActionSpec {
+                title: "Pause/resume notifications",
+                subtitle: "Toggle Dunst notification pause state",
+                icon_name: "preferences-system-notifications-symbolic",
+                search_terms: &[
+                    "notifications",
+                    "notification",
+                    "dunst",
+                    "pause",
+                    "resume",
+                    "do not disturb",
+                ],
+                operation: DesktopControlOperation::NotificationPauseToggle,
+                prediction_key: Some("control:notifications-pause-toggle".to_string()),
+                base_score: 670,
+            },
+            now,
+            &prediction_boost,
+        );
+        push_control_action(
+            &mut items,
+            query,
+            ControlActionSpec {
+                title: "Close notifications",
+                subtitle: "Close all visible Dunst notifications",
+                icon_name: "preferences-system-notifications-symbolic",
+                search_terms: &[
+                    "notifications",
+                    "notification",
+                    "dunst",
+                    "close",
+                    "dismiss",
+                    "clear",
+                ],
+                operation: DesktopControlOperation::NotificationCloseAll,
+                prediction_key: Some("control:notifications-close-all".to_string()),
+                base_score: 630,
+            },
+            now,
+            &prediction_boost,
+        );
+        for notification in &snapshot.notifications {
+            if empty_query {
+                continue;
+            }
+            let Some(score) = score_text(&notification.search_blob, &query.text) else {
+                continue;
+            };
+            items.push(ResultItem {
+                prediction_key: None,
+                title: format!("Notification: {}", notification.summary),
+                subtitle: notification_subtitle(notification),
+                source: "Controls",
+                icon_name: "preferences-system-notifications-symbolic".to_string(),
+                score: score + 540,
+                action: Action::DesktopControl {
+                    operation: DesktopControlOperation::NotificationHistoryPop,
+                },
+            });
+        }
+    }
+
+    sort_results(&mut items, MAX_CONTROLS);
+    items
+}
+
+struct ControlActionSpec<'a> {
+    title: &'a str,
+    subtitle: &'a str,
+    icon_name: &'a str,
+    search_terms: &'a [&'a str],
+    operation: DesktopControlOperation,
+    prediction_key: Option<String>,
+    base_score: i32,
+}
+
+fn push_control_action(
+    items: &mut Vec<ResultItem>,
+    query: &QueryInput,
+    spec: ControlActionSpec<'_>,
+    _now: u64,
+    prediction_boost: &impl Fn(&str) -> i32,
+) {
+    let search_blob = std::iter::once(spec.title)
+        .chain(std::iter::once(spec.subtitle))
+        .chain(spec.search_terms.iter().copied())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let Some(score) = score_text(&search_blob, &query.text) else {
+        return;
+    };
+    let boost = spec
+        .prediction_key
+        .as_deref()
+        .map(prediction_boost)
+        .unwrap_or_default();
+    items.push(ResultItem {
+        prediction_key: spec.prediction_key,
+        title: spec.title.to_string(),
+        subtitle: spec.subtitle.to_string(),
+        source: "Controls",
+        icon_name: spec.icon_name.to_string(),
+        score: spec.base_score + score + boost,
+        action: Action::DesktopControl {
+            operation: spec.operation,
+        },
+    });
+}
+
+fn media_subtitle(status: &MediaStatus) -> String {
+    let label = if status.artist.is_empty() {
+        status.title.clone()
+    } else {
+        format!("{} - {}", status.artist, status.title)
+    };
+    format!("{} - {} ({})", status.player, label, status.status)
+}
+
+fn volume_subtitle(status: &VolumeStatus) -> String {
+    if status.muted {
+        format!("Volume {}% - muted", status.percent)
+    } else {
+        format!("Volume {}%", status.percent)
+    }
+}
+
+fn bluetooth_subtitle(status: &BluetoothStatus) -> String {
+    if !status.powered {
+        "Off".to_string()
+    } else if status.connected_count == 0 {
+        "On".to_string()
+    } else {
+        format!("On - {} connected", status.connected_count)
+    }
+}
+
+fn network_subtitle(status: &NetworkStatus) -> String {
+    if status.kind == "wifi" {
+        format!("Wi-Fi - {}", status.connection)
+    } else {
+        format!("{} - {}", title_case_ascii(&status.kind), status.connection)
+    }
+}
+
+fn notification_subtitle(notification: &NotificationEntry) -> String {
+    if notification.body.is_empty() {
+        notification.app_name.clone()
+    } else {
+        format!("{} - {}", notification.app_name, notification.body)
+    }
+}
+
+fn title_case_ascii(value: &str) -> String {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    format!("{}{}", first.to_ascii_uppercase(), chars.as_str())
+}
+
 fn power_operation_id(operation: PowerOperation) -> &'static str {
     match operation {
         PowerOperation::Lock => "lock",
@@ -3166,15 +3769,18 @@ fn parse_file_search_line(line: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppEntry, BookmarkEntry, EmailEntry, FileSearchBackend, RecentFileEntry, Sources,
-        append_deferred_results, email_result_items, no_results_item,
-        parse_chromium_bookmarks_json, parse_file_search_line, parse_firefox_bookmark_rows,
-        parse_hypr_windows_json, parse_niri_windows_json, parse_recent_files_xbel, pass_entry_name,
+        AppEntry, BluetoothStatus, BookmarkEntry, ControlSnapshot, EmailEntry, FileSearchBackend,
+        MediaStatus, NetworkStatus, NotificationEntry, RecentFileEntry, Sources, VolumeStatus,
+        append_deferred_results, control_results_from_snapshot, email_result_items,
+        no_results_item, parse_bluetooth_status, parse_chromium_bookmarks_json,
+        parse_dunst_history, parse_file_search_line, parse_firefox_bookmark_rows,
+        parse_hypr_windows_json, parse_niri_windows_json, parse_nmcli_device_status,
+        parse_playerctl_metadata, parse_recent_files_xbel, parse_wpctl_volume, pass_entry_name,
         thunderbird_database_uri, thunderbird_message_uri, window_focus_command,
     };
     use crate::model::{
-        Action, PasswordOperation, PowerOperation, QueryInput, ResultItem, SearchMode,
-        SourceFilter, WindowFocusTarget,
+        Action, DesktopControlOperation, PasswordOperation, PowerOperation, QueryInput, ResultItem,
+        SearchMode, SourceFilter, WindowFocusTarget,
     };
     use crate::prediction::{PredictionStore, StoredPrediction};
     use std::path::Path;
@@ -3300,6 +3906,188 @@ mod tests {
             results
                 .iter()
                 .any(|item| item.title == "Copy sender: robin@example.com")
+        );
+    }
+
+    #[test]
+    fn controls_mode_surfaces_status_rich_control_rows() {
+        let snapshot = ControlSnapshot {
+            media: Some(MediaStatus {
+                player: "firefox".to_string(),
+                status: "Paused".to_string(),
+                artist: "Artist".to_string(),
+                title: "Track".to_string(),
+            }),
+            volume: Some(VolumeStatus {
+                percent: 61,
+                muted: false,
+            }),
+            bluetooth: Some(BluetoothStatus {
+                powered: true,
+                connected_count: 2,
+            }),
+            network: Some(NetworkStatus {
+                kind: "ethernet".to_string(),
+                connection: "Ethernet connection 1".to_string(),
+            }),
+            power_profile: Some("performance".to_string()),
+            screen_brightness: None,
+            notifications: Vec::new(),
+            has_playerctl: true,
+            has_wpctl: true,
+            has_bluetoothctl: true,
+            has_nmcli: true,
+            has_powerprofilesctl: true,
+            has_dunstctl: true,
+            has_grim: true,
+            has_slurp: true,
+            has_hyprpicker: true,
+        };
+        let query = QueryInput::parse("control:", SearchMode::All);
+        let items = control_results_from_snapshot(&snapshot, &query, 1_700_000_000, |_| 0);
+
+        assert!(items.iter().any(|item| item.title == "Play/Pause media"
+            && item.subtitle.contains("Artist - Track")
+            && matches!(
+                item.action,
+                Action::DesktopControl {
+                    operation: DesktopControlOperation::MediaPlayPause
+                }
+            )));
+        assert!(items.iter().any(|item| item.title == "Mute volume"
+            && item.subtitle == "Volume 61%"
+            && matches!(
+                item.action,
+                Action::DesktopControl {
+                    operation: DesktopControlOperation::VolumeMute
+                }
+            )));
+        assert!(items.iter().any(|item| item.title == "Toggle Bluetooth"
+            && item.subtitle == "On - 2 connected"
+            && matches!(
+                item.action,
+                Action::DesktopControl {
+                    operation: DesktopControlOperation::BluetoothTogglePower
+                }
+            )));
+        assert!(
+            items
+                .iter()
+                .any(|item| item.title == "Open network settings"
+                    && item.subtitle == "Ethernet - Ethernet connection 1")
+        );
+        assert!(items.iter().any(|item| item.title == "Pick screen color"));
+        assert!(
+            items
+                .iter()
+                .any(|item| item.title == "Pause/resume notifications")
+        );
+    }
+
+    #[test]
+    fn control_search_matches_notification_history_without_prediction_key() {
+        let snapshot = ControlSnapshot {
+            notifications: vec![NotificationEntry {
+                app_name: "kitty".to_string(),
+                summary: "Build failed".to_string(),
+                body: "cargo test failed".to_string(),
+                search_blob: "kitty build failed cargo test failed".to_string(),
+            }],
+            has_dunstctl: true,
+            ..ControlSnapshot::default()
+        };
+        let query = QueryInput::parse("control: cargo", SearchMode::All);
+        let items = control_results_from_snapshot(&snapshot, &query, 1_700_000_000, |_| 0);
+
+        let notification = items
+            .iter()
+            .find(|item| item.title == "Notification: Build failed")
+            .expect("notification result");
+        assert_eq!(notification.source, "Controls");
+        assert!(notification.prediction_key.is_none());
+        assert!(matches!(
+            notification.action,
+            Action::DesktopControl {
+                operation: DesktopControlOperation::NotificationHistoryPop
+            }
+        ));
+    }
+
+    #[test]
+    fn controls_include_brightness_rows_only_when_a_backlight_exists() {
+        let query = QueryInput::parse("control: brightness", SearchMode::All);
+        let without_backlight = control_results_from_snapshot(
+            &ControlSnapshot::default(),
+            &query,
+            1_700_000_000,
+            |_| 0,
+        );
+        assert!(
+            without_backlight
+                .iter()
+                .all(|item| !item.title.contains("brightness"))
+        );
+
+        let with_backlight = control_results_from_snapshot(
+            &ControlSnapshot {
+                screen_brightness: Some(42),
+                ..ControlSnapshot::default()
+            },
+            &query,
+            1_700_000_000,
+            |_| 0,
+        );
+        assert!(with_backlight.iter().any(
+            |item| item.title == "Raise brightness" && item.subtitle == "Screen brightness 42%"
+        ));
+        assert!(with_backlight.iter().any(
+            |item| item.title == "Lower brightness" && item.subtitle == "Screen brightness 42%"
+        ));
+    }
+
+    #[test]
+    fn control_parsers_extract_status_from_command_output() {
+        let media = parse_playerctl_metadata("firefox|Paused|Artist|Track").expect("media");
+        assert_eq!(media.player, "firefox");
+        assert_eq!(media.status, "Paused");
+        assert_eq!(media.artist, "Artist");
+        assert_eq!(media.title, "Track");
+
+        let volume = parse_wpctl_volume("Volume: 0.61 [MUTED]").expect("volume");
+        assert_eq!(volume.percent, 61);
+        assert!(volume.muted);
+
+        let bluetooth = parse_bluetooth_status(
+            "Controller AA:BB\n\tPowered: yes\n",
+            "Device 01:02 Headphones\nDevice 03:04 Keyboard\n",
+        )
+        .expect("bluetooth");
+        assert!(bluetooth.powered);
+        assert_eq!(bluetooth.connected_count, 2);
+
+        let network = parse_nmcli_device_status("ethernet:connected:Ethernet connection 1\n")
+            .expect("network");
+        assert_eq!(network.kind, "ethernet");
+        assert_eq!(network.connection, "Ethernet connection 1");
+    }
+
+    #[test]
+    fn parses_dunst_history_summaries_and_bodies() {
+        let entries = parse_dunst_history(
+            r#"{
+                "summary" : { "type" : "s", "data" : "Build failed" },
+                "body" : { "type" : "s", "data" : "cargo test failed" },
+                "appname" : { "type" : "s", "data" : "kitty" }
+            }"#,
+        );
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].summary, "Build failed");
+        assert_eq!(entries[0].body, "cargo test failed");
+        assert_eq!(entries[0].app_name, "kitty");
+        assert_eq!(
+            entries[0].search_blob,
+            "kitty build failed cargo test failed"
         );
     }
 
@@ -4047,6 +4835,254 @@ mod tests {
     }
 }
 
+fn load_control_snapshot() -> ControlSnapshot {
+    let has_playerctl = command_exists("playerctl");
+    let has_wpctl = command_exists("wpctl");
+    let has_bluetoothctl = command_exists("bluetoothctl");
+    let has_nmcli = command_exists("nmcli");
+    let has_powerprofilesctl = command_exists("powerprofilesctl");
+    let has_dunstctl = command_exists("dunstctl");
+    let has_grim = command_exists("grim");
+    let has_slurp = command_exists("slurp");
+    let has_hyprpicker = command_exists("hyprpicker");
+
+    ControlSnapshot {
+        media: if has_playerctl {
+            command_output_string(
+                "playerctl",
+                &[
+                    "metadata",
+                    "--format",
+                    "{{playerName}}|{{status}}|{{artist}}|{{title}}",
+                ],
+            )
+            .and_then(|output| parse_playerctl_metadata(&output))
+        } else {
+            None
+        },
+        volume: if has_wpctl {
+            command_output_string("wpctl", &["get-volume", "@DEFAULT_AUDIO_SINK@"])
+                .and_then(|output| parse_wpctl_volume(&output))
+        } else {
+            None
+        },
+        bluetooth: if has_bluetoothctl {
+            let show = command_output_string("bluetoothctl", &["show"]).unwrap_or_default();
+            let connected = command_output_string("bluetoothctl", &["devices", "Connected"])
+                .unwrap_or_default();
+            parse_bluetooth_status(&show, &connected)
+        } else {
+            None
+        },
+        network: if has_nmcli {
+            command_output_string(
+                "nmcli",
+                &["-t", "-f", "TYPE,STATE,CONNECTION", "device", "status"],
+            )
+            .and_then(|output| parse_nmcli_device_status(&output))
+        } else {
+            None
+        },
+        power_profile: if has_powerprofilesctl {
+            command_output_string("powerprofilesctl", &["get"])
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        } else {
+            None
+        },
+        screen_brightness: if command_exists("brightnessctl") {
+            command_output_string("brightnessctl", &["--class=backlight", "-m", "info"])
+                .and_then(|output| parse_backlight_brightness(&output))
+        } else {
+            None
+        },
+        notifications: if has_dunstctl {
+            command_output_string("dunstctl", &["history"])
+                .map(|output| parse_dunst_history(&output))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        },
+        has_playerctl,
+        has_wpctl,
+        has_bluetoothctl,
+        has_nmcli,
+        has_powerprofilesctl,
+        has_dunstctl,
+        has_grim,
+        has_slurp,
+        has_hyprpicker,
+    }
+}
+
+fn command_output_string(program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program).args(args).output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn parse_playerctl_metadata(output: &str) -> Option<MediaStatus> {
+    let mut parts = output.trim().splitn(4, '|');
+    let player = parts.next()?.trim();
+    let status = parts.next()?.trim();
+    let artist = parts.next()?.trim();
+    let title = parts.next()?.trim();
+    if title.is_empty() {
+        return None;
+    }
+    Some(MediaStatus {
+        player: player.to_string(),
+        status: status.to_string(),
+        artist: artist.to_string(),
+        title: title.to_string(),
+    })
+}
+
+fn parse_wpctl_volume(output: &str) -> Option<VolumeStatus> {
+    let trimmed = output.trim();
+    let value = trimmed
+        .split_whitespace()
+        .find_map(|part| part.parse::<f64>().ok())?;
+    let percent = (value * 100.0).round().clamp(0.0, 150.0) as u8;
+    Some(VolumeStatus {
+        percent,
+        muted: trimmed.to_ascii_lowercase().contains("muted"),
+    })
+}
+
+fn parse_bluetooth_status(show_output: &str, connected_output: &str) -> Option<BluetoothStatus> {
+    let powered = show_output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Powered:"))
+        .map(|value| value.trim() == "yes")?;
+    let connected_count = connected_output
+        .lines()
+        .filter(|line| line.trim_start().starts_with("Device "))
+        .count();
+    Some(BluetoothStatus {
+        powered,
+        connected_count,
+    })
+}
+
+fn parse_nmcli_device_status(output: &str) -> Option<NetworkStatus> {
+    output.lines().find_map(|line| {
+        let mut parts = line.splitn(3, ':');
+        let kind = parts.next()?.trim();
+        let state = parts.next()?.trim();
+        let connection = parts.next()?.trim();
+        (state == "connected" && matches!(kind, "wifi" | "ethernet") && !connection.is_empty())
+            .then(|| NetworkStatus {
+                kind: kind.to_string(),
+                connection: connection.to_string(),
+            })
+    })
+}
+
+fn parse_backlight_brightness(output: &str) -> Option<u8> {
+    output.lines().find_map(|line| {
+        let parts = line.split(',').collect::<Vec<_>>();
+        if parts.len() < 5 || parts.get(1).copied() != Some("backlight") {
+            return None;
+        }
+        parts
+            .iter()
+            .find_map(|part| part.trim().strip_suffix('%'))
+            .and_then(|part| part.parse::<u8>().ok())
+    })
+}
+
+fn parse_dunst_history(output: &str) -> Vec<NotificationEntry> {
+    let mut entries = Vec::new();
+    let mut pending_body = String::new();
+    let mut current_summary: Option<String> = None;
+    let mut current_body = String::new();
+
+    for (key, value) in gvariant_string_pairs(output) {
+        match key.as_str() {
+            "body" if current_summary.is_none() => pending_body = value,
+            "body" => current_body = value,
+            "summary" => {
+                current_summary = Some(value);
+                current_body = std::mem::take(&mut pending_body);
+            }
+            "appname" => {
+                if let Some(summary) = current_summary.take() {
+                    let body = std::mem::take(&mut current_body);
+                    let app_name = value;
+                    let search_blob = format!("{app_name} {summary} {body}").to_ascii_lowercase();
+                    entries.push(NotificationEntry {
+                        app_name,
+                        summary,
+                        body,
+                        search_blob,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    entries
+}
+
+fn gvariant_string_pairs(output: &str) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    let mut index = 0;
+    while let Some(key_start_rel) = output[index..].find('"') {
+        let key_start = index + key_start_rel + 1;
+        let Some(key_end_rel) = output[key_start..].find('"') else {
+            break;
+        };
+        let key_end = key_start + key_end_rel;
+        let key = &output[key_start..key_end];
+        if !matches!(key, "summary" | "body" | "appname") {
+            index = key_end + 1;
+            continue;
+        }
+        let Some(data_pos_rel) = output[key_end..].find("\"data\"") else {
+            break;
+        };
+        let data_pos = key_end + data_pos_rel;
+        let Some(value_start_rel) = output[data_pos + 6..].find('"') else {
+            break;
+        };
+        let value_start = data_pos + 6 + value_start_rel + 1;
+        let Some((value, value_end)) = parse_quoted_string(output, value_start) else {
+            break;
+        };
+        pairs.push((key.to_string(), value));
+        index = value_end;
+    }
+    pairs
+}
+
+fn parse_quoted_string(input: &str, mut index: usize) -> Option<(String, usize)> {
+    let mut value = String::new();
+    while index < input.len() {
+        let ch = input[index..].chars().next()?;
+        index += ch.len_utf8();
+        match ch {
+            '"' => return Some((value, index)),
+            '\\' => {
+                let escaped = input[index..].chars().next()?;
+                index += escaped.len_utf8();
+                match escaped {
+                    'n' => value.push('\n'),
+                    't' => value.push('\t'),
+                    '"' => value.push('"'),
+                    '\\' => value.push('\\'),
+                    other => value.push(other),
+                }
+            }
+            other => value.push(other),
+        }
+    }
+    None
+}
+
 fn command_exists(binary: &str) -> bool {
     env::var_os("PATH")
         .unwrap_or_default()
@@ -4093,6 +5129,10 @@ pub(crate) fn no_results_item(query: &QueryInput) -> ResultItem {
             }
             SearchMode::Web => "Press Enter to open a browser search result instead.".to_string(),
             SearchMode::Calc => "Try a valid libqalculate expression such as 42/7.".to_string(),
+            SearchMode::Controls => {
+                "Try media, volume, Bluetooth, network, screenshot, color, or notifications."
+                    .to_string()
+            }
         },
     };
 
