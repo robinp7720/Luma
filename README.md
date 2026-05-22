@@ -2,7 +2,9 @@
 
 Luma is a unified command palette for Linux desktops.
 
-It helps you launch apps, switch windows, search files, run commands, manage passwords, open bookmarks, and trigger common desktop actions from one fast overlay.
+It helps you launch apps, switch windows, search files, search email, run commands, manage passwords, open bookmarks, and trigger common desktop actions from one fast overlay.
+
+Luma also includes a built-in settings panel for interactive configuration. Type `settings` in the launcher to open it, or use the `Open settings` result that appears in the default mode.
 
 ## Features
 
@@ -12,6 +14,8 @@ It helps you launch apps, switch windows, search files, run commands, manage pas
 - File search through `localsearch`
 - Password-store search and native `pass` actions
 - On-the-fly password creation with optional username, email, and URL metadata
+- Email search with open, reply, compose, and copy-sender actions
+- Thunderbird mail database search, EDS-backed Evolution mail, and local maildir-style message files
 - SSH host search from `~/.ssh/config`, `known_hosts`, and `known_hosts.old`
 - Command runner with `$PATH` suggestions
 - Browser bookmark search from Firefox and Chromium-family profiles
@@ -30,10 +34,26 @@ Optional integrations:
 - `pass-otp` for OTP inspection actions
 - `wtype` on Wayland or `xdotool` on X11 for password autotype
 - `wl-copy` on Wayland or `xclip` on X11 for clipboard actions
+- `sqlite3` for Firefox bookmark search and Thunderbird email search
+- Thunderbird for opening indexed email messages from the local message database
+- Evolution and its EDS/Camel libraries for the mail helper backend
 - `hyprctl` for Hyprland window switching
 - `niri` for Niri window switching
-- `sqlite3` for Firefox bookmark search
 - `qalc` for calculator queries
+
+## Configuration
+
+Luma stores its runtime settings in `~/.config/Luma/config.json`.
+
+The settings panel lets you adjust:
+
+- default launcher mode
+- window size and layer-shell behavior
+- which built-in sources are enabled
+- email backend priority, Thunderbird toggle, Evolution toggle, Evolution helper command and timeout, local mail toggle, and mail roots
+- web search URL, SSH terminal, password-store path, password clip timeout, and file-search backend
+
+Some appearance changes apply on the next launch.
 
 ## Usage
 
@@ -56,6 +76,7 @@ Luma --mode commands
 Luma --mode windows
 Luma --mode files
 Luma --mode pass
+Luma --mode email
 Luma --mode ssh
 ```
 
@@ -67,6 +88,7 @@ Luma understands a few lightweight prefixes:
 bookmark: rust docs
 recent: report
 pass: github/work
+mail: invoices
 ssh: web-server
 ```
 
@@ -96,12 +118,28 @@ Password results expose native actions for:
 
 Pressing Enter on a password result autotypes username, Tab, and password into the previously focused window without submitting the form.
 
+## Email Workflow
+
+Email search looks at Thunderbird's local message database, an EDS-backed Evolution helper, and local maildir-style message files.
+
+Matching email rows expose actions for:
+
+- Open message
+- Reply to sender
+- Compose to sender
+- Copy sender address
+
+Reply and compose use `mailto:` for Thunderbird and the Evolution helper for EDS-backed messages. Open uses Thunderbird message URLs when a local profile database is available and otherwise routes through the Evolution helper.
+
 ## Notes
 
 - Predictive history is stored as plain JSON in `~/.local/state/Luma/predictions.json`.
 - File search requires `localsearch` to be installed and indexed.
 - Bookmark search reads Firefox `places.sqlite` through `sqlite3` when available and Chromium-family `Bookmarks` JSON directly.
 - Recent file search reads local `file://` entries from `recently-used.xbel`.
+- Email search reads Thunderbird's `global-messages-db.sqlite` when available and can also search the Evolution helper plus local `.eml` / maildir-style message files.
+- Evolution is opt-in in settings so Luma does not talk to EDS unless you enable it and point it at a helper command if needed.
+- The default helper command is `luma-mail-eds`; override it in settings if your build lives elsewhere.
 - Window switching uses `hyprctl clients -j` on Hyprland and `niri msg windows --json` on Niri.
 - Password search reads entry names from `PASSWORD_STORE_DIR` or `~/.password-store`.
 - Autotype uses `wtype` on Wayland and `xdotool` on X11. Copying uses `wl-copy` on Wayland and `xclip` on X11, with secrets passed through stdin.

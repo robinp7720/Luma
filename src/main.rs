@@ -1,17 +1,25 @@
+mod config;
+mod mail_eds_protocol;
 mod model;
 mod password;
 mod prediction;
+mod settings;
 mod sources;
 
+use crate::config::{ConfigStore, EmailBackendPreference, EmailConfig};
 use crate::model::PowerOperation;
-use crate::model::{Action, ResultItem, SearchMode};
+use crate::model::{Action, QueryInput, ResultItem, SearchMode};
 use crate::model::{PasswordOperation, WindowFocusTarget};
 use crate::password::{
     Credential, TypeStep, default_login_steps, format_generated_pass_entry, generate_password,
     parse_credential, pass_insert_command, run_program_input, wl_copy_command,
     wtype_commands_for_steps, xclip_command, xdotool_commands_for_steps,
 };
-use crate::sources::{Sources, focus_window, focused_window_target};
+use crate::settings::open_config_panel;
+use crate::sources::{
+    SearchSnapshot, Sources, append_deferred_results, evolution_helper_command, focus_window,
+    focused_window_target, no_results_item, run_mail_helper_action, sort_and_limit_results,
+};
 use anyhow::{Context, Result};
 use clap::Parser;
 use gtk4::gdk;
@@ -28,25 +36,27 @@ use std::cell::Cell;
 use std::cell::RefCell;
 use std::process::Command;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
+use std::time::Instant;
+
+static APP_CONFIG: OnceLock<Arc<ConfigStore>> = OnceLock::new();
 
 #[derive(Parser, Debug)]
 #[command(name = "Luma")]
 #[command(
-    about = "Unified predictive desktop launcher for apps, windows, files, passwords, SSH, commands, web, and libqalculate"
+    about = "Unified predictive desktop launcher for apps, windows, files, passwords, email, SSH, commands, web, and libqalculate"
 )]
 struct Cli {
-    #[arg(long, value_enum, default_value_t = SearchMode::All)]
-    mode: SearchMode,
+    #[arg(long, value_enum)]
+    mode: Option<SearchMode>,
 
     #[arg(long)]
     query: Option<String>,
 }
 
-const LAUNCHER_WIDTH_PX: i32 = 720;
-const LAUNCHER_LAYER_TOP_MARGIN_PX: i32 = 72;
+#[cfg(test)]
 const LAUNCHER_SURFACE_MARGIN_PX: i32 = 56;
 const LAUNCHER_SHADOW_Y_OFFSET_PX: i32 = 18;
 const LAUNCHER_SHADOW_BLUR_PX: i32 = 44;
@@ -68,6 +78,193 @@ enum AddPasswordStep {
     Url,
 }
 
+const DEFERRED_SEARCH_IDLE_DELAY_MS: u64 = 180;
+
+#[derive(Clone)]
+struct SearchController {
+    entry: Entry,
+    sources: Arc<Sources>,
+    list: ListBox,
+    scroller: ScrolledWindow,
+    current_results: Rc<RefCell<Vec<ResultItem>>>,
+    clipboard_url: Rc<RefCell<Option<String>>>,
+    add_password_draft: Rc<RefCell<Option<AddPasswordDraft>>>,
+    mode: SearchMode,
+    state: Rc<RefCell<SearchAsyncState>>,
+    update_tx: std::sync::mpsc::Sender<SearchUpdate>,
+    update_rx: Rc<RefCell<std::sync::mpsc::Receiver<SearchUpdate>>>,
+}
+
+#[derive(Debug, Default)]
+struct SearchAsyncState {
+    generation: u64,
+    pending_timeout: Option<glib::SourceId>,
+}
+
+#[derive(Debug)]
+struct SearchUpdate {
+    generation: u64,
+    snapshot: SearchSnapshot,
+    deferred_results: Vec<ResultItem>,
+}
+
+impl SearchController {
+    fn new(
+        entry: Entry,
+        sources: Arc<Sources>,
+        list: ListBox,
+        scroller: ScrolledWindow,
+        current_results: Rc<RefCell<Vec<ResultItem>>>,
+        clipboard_url: Rc<RefCell<Option<String>>>,
+        add_password_draft: Rc<RefCell<Option<AddPasswordDraft>>>,
+        mode: SearchMode,
+    ) -> Self {
+        let (update_tx, update_rx) = std::sync::mpsc::channel();
+        Self {
+            entry,
+            sources,
+            list,
+            scroller,
+            current_results,
+            clipboard_url,
+            add_password_draft,
+            mode,
+            state: Rc::new(RefCell::new(SearchAsyncState::default())),
+            update_tx,
+            update_rx: Rc::new(RefCell::new(update_rx)),
+        }
+    }
+
+    fn start_update_poller(&self) {
+        let controller = self.clone();
+        glib::timeout_add_local(Duration::from_millis(16), move || {
+            controller.drain_updates();
+            glib::ControlFlow::Continue
+        });
+    }
+
+    fn refresh(&self) {
+        if self.add_password_draft.borrow().is_some() {
+            return;
+        }
+
+        let query = self.entry.text().to_string();
+        let clipboard_url = self.clipboard_url.borrow().clone();
+        let generation = self.bump_generation();
+        self.render_results(vec![loading_result("Searching…")]);
+
+        let sources = self.sources.clone();
+        let tx = self.update_tx.clone();
+        let mode = self.mode;
+        thread::spawn(move || {
+            let snapshot = sources.search_snapshot(&query, mode, clipboard_url.as_deref());
+            let _ = tx.send(SearchUpdate {
+                generation,
+                snapshot,
+                deferred_results: Vec::new(),
+            });
+        });
+    }
+
+    fn drain_updates(&self) {
+        loop {
+            let update = { self.update_rx.borrow_mut().try_recv() };
+
+            match update {
+                Ok(update) => self.apply_deferred_results(update),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+    }
+
+    fn bump_generation(&self) -> u64 {
+        let mut state = self.state.borrow_mut();
+        state.generation = state.generation.saturating_add(1);
+        let _ = state.pending_timeout.take();
+        state.generation
+    }
+
+    fn schedule_deferred(&self, snapshot: SearchSnapshot, generation: u64) {
+        let controller = self.clone();
+        let snapshot_for_timeout = snapshot.clone();
+        let source_id = glib::timeout_add_local_once(
+            Duration::from_millis(DEFERRED_SEARCH_IDLE_DELAY_MS),
+            move || {
+                if controller.state.borrow().generation != generation {
+                    return;
+                }
+
+                controller.state.borrow_mut().pending_timeout = None;
+
+                let sources = controller.sources.clone();
+                let snapshot = snapshot_for_timeout.clone();
+                let tx = controller.update_tx.clone();
+                thread::spawn(move || {
+                    let deferred_results = sources.search_deferred_results(&snapshot);
+                    let _ = tx.send(SearchUpdate {
+                        generation,
+                        snapshot,
+                        deferred_results,
+                    });
+                });
+            },
+        );
+        self.state.borrow_mut().pending_timeout = Some(source_id);
+    }
+
+    fn apply_deferred_results(&self, update: SearchUpdate) {
+        let SearchUpdate {
+            generation,
+            snapshot,
+            deferred_results,
+        } = update;
+
+        if self.state.borrow().generation != generation {
+            return;
+        }
+
+        if deferred_results.is_empty() {
+            let mut results = snapshot.immediate_results.clone();
+            if snapshot.deferred.is_empty() {
+                let results = finalize_loaded_results(results, &snapshot.query);
+                self.render_results(results);
+            } else {
+                results.push(loading_result(snapshot.deferred.loading_label()));
+                let results = sort_and_limit_results(results);
+                self.render_results(results);
+                self.schedule_deferred(snapshot, generation);
+            }
+            return;
+        }
+
+        let mut results =
+            append_deferred_results(snapshot.immediate_results.clone(), deferred_results);
+        if results.is_empty() {
+            results.push(no_results_item(&snapshot.query));
+        }
+        self.render_results(results);
+    }
+
+    fn render_results(&self, results: Vec<ResultItem>) {
+        // Keep the user's arrow-key selection anchored to its item when a rebuild
+        // is triggered by deferred results arriving, rather than snapping to row 0.
+        let previous_selection = self
+            .list
+            .selected_row()
+            .map(|row| row.index())
+            .filter(|index| *index >= 0)
+            .and_then(|index| self.current_results.borrow().get(index as usize).cloned());
+        rebuild_results(
+            &self.list,
+            &self.scroller,
+            &results,
+            previous_selection.as_ref(),
+        );
+        self.current_results.replace(results);
+    }
+}
+
 fn layer_shell_enabled(display_is_wayland: bool, protocol_supported: bool) -> bool {
     display_is_wayland && protocol_supported
 }
@@ -82,6 +279,10 @@ fn layer_shell_supported() -> bool {
     layer_shell_enabled(display_is_wayland, gtk4_layer_shell::is_supported())
 }
 
+pub(crate) fn app_config() -> Option<Arc<ConfigStore>> {
+    APP_CONFIG.get().cloned()
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("{error:?}");
@@ -90,19 +291,79 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let cli = Cli::parse();
-    let sources = Arc::new(Sources::load());
-    sources.warm_external_sources();
+    let args: Vec<String> = std::env::args().collect();
+    let cli = Cli::parse_from(&args);
+    configure_gdk_backend();
+    let config = Arc::new(ConfigStore::load());
+    let _ = APP_CONFIG.set(config.clone());
+    let sources = Arc::new(Sources::load(config.clone()));
+    let mode = cli.mode.unwrap_or_else(|| config.current().default_mode);
     let application = Application::builder()
         .application_id("me.robindecker.Luma")
         .build();
+    application.add_main_option(
+        "mode",
+        glib::Char::from(b'\0'),
+        glib::OptionFlags::NONE,
+        glib::OptionArg::String,
+        "Launcher mode",
+        Some("MODE"),
+    );
+    application.add_main_option(
+        "query",
+        glib::Char::from(b'\0'),
+        glib::OptionFlags::NONE,
+        glib::OptionArg::String,
+        "Initial query",
+        Some("QUERY"),
+    );
 
     application.connect_activate(move |app| {
-        build_ui(app, cli.mode, cli.query.clone(), sources.clone());
+        build_ui(app, mode, cli.query.clone(), sources.clone());
     });
 
-    application.run_with_args(&["Luma"]);
+    application.run_with_args(&args);
     Ok(())
+}
+
+fn configure_gdk_backend() {
+    if std::env::var_os("GDK_BACKEND").is_some() {
+        return;
+    }
+
+    if let Some(backend) = gdk_backend_for_session(
+        std::env::var("XDG_SESSION_TYPE").ok().as_deref(),
+        std::env::var_os("DISPLAY").is_some(),
+        std::env::var_os("WAYLAND_DISPLAY").is_some(),
+    ) {
+        // GTK reads this very early during application startup. We set it
+        // before any GTK objects are constructed so the runtime picks the
+        // compositor that matches the current session instead of guessing from
+        // stray mixed-session environment variables.
+        unsafe {
+            std::env::set_var("GDK_BACKEND", backend);
+        }
+    }
+}
+
+fn gdk_backend_for_session(
+    session_type: Option<&str>,
+    display_set: bool,
+    wayland_display_set: bool,
+) -> Option<&'static str> {
+    match session_type.map(|value| value.to_ascii_lowercase()) {
+        Some(session) if session == "x11" => display_set.then_some("x11"),
+        Some(session) if session == "wayland" => wayland_display_set.then_some("wayland"),
+        _ => {
+            if wayland_display_set && !display_set {
+                Some("wayland")
+            } else if display_set {
+                Some("x11")
+            } else {
+                None
+            }
+        }
+    }
 }
 
 fn build_ui(
@@ -111,16 +372,19 @@ fn build_ui(
     initial_query: Option<String>,
     sources: Arc<Sources>,
 ) {
+    let config = app_config()
+        .map(|store| store.current())
+        .unwrap_or_default();
     let window = ApplicationWindow::builder()
         .application(app)
-        .default_width(LAUNCHER_WIDTH_PX)
-        .default_height(420)
+        .default_width(config.ui.width_px)
+        .default_height(config.ui.height_px)
         .decorated(false)
         .resizable(false)
         .title("Luma")
         .build();
 
-    if layer_shell_supported() {
+    if config.ui.use_layer_shell && layer_shell_supported() {
         window.init_layer_shell();
         window.set_layer(gtk4_layer_shell::Layer::Overlay);
         // The launcher should behave like a modal overlay. On-demand focus is
@@ -128,7 +392,7 @@ fn build_ui(
         window.set_keyboard_mode(gtk4_layer_shell::KeyboardMode::Exclusive);
         window.set_namespace(Some("Luma"));
         window.set_anchor(gtk4_layer_shell::Edge::Top, true);
-        window.set_margin(gtk4_layer_shell::Edge::Top, LAUNCHER_LAYER_TOP_MARGIN_PX);
+        window.set_margin(gtk4_layer_shell::Edge::Top, config.ui.top_margin_px);
     }
 
     apply_css();
@@ -137,11 +401,11 @@ fn build_ui(
     let outer = GtkBox::new(Orientation::Vertical, 10);
     outer.add_css_class("launcher-shell");
     outer.set_halign(Align::Center);
-    outer.set_size_request(LAUNCHER_WIDTH_PX, -1);
-    outer.set_margin_top(LAUNCHER_SURFACE_MARGIN_PX);
+    outer.set_size_request(config.ui.width_px, -1);
+    outer.set_margin_top(config.ui.surface_margin_px);
     outer.set_margin_bottom(LAUNCHER_SURFACE_MARGIN_BOTTOM_PX);
-    outer.set_margin_start(LAUNCHER_SURFACE_MARGIN_PX);
-    outer.set_margin_end(LAUNCHER_SURFACE_MARGIN_PX);
+    outer.set_margin_start(config.ui.surface_margin_px);
+    outer.set_margin_end(config.ui.surface_margin_px);
 
     let entry = Entry::builder()
         .placeholder_text(placeholder_for_mode(mode))
@@ -173,28 +437,31 @@ fn build_ui(
     let current_results = Rc::new(RefCell::new(Vec::<ResultItem>::new()));
     let add_password_draft = Rc::new(RefCell::new(None::<AddPasswordDraft>));
     let clipboard_url = Rc::new(RefCell::new(None::<String>));
+    let search = SearchController::new(
+        entry.clone(),
+        sources.clone(),
+        list.clone(),
+        scroller.clone(),
+        current_results.clone(),
+        clipboard_url.clone(),
+        add_password_draft.clone(),
+        mode,
+    );
+    search.start_update_poller();
+
+    if profiling_enabled() {
+        install_frame_profiler(&window);
+    }
 
     {
-        let sources = sources.clone();
-        let list = list.clone();
-        let scroller = scroller.clone();
-        let current_results = current_results.clone();
+        let search = search.clone();
         let add_password_draft = add_password_draft.clone();
-        let clipboard_url = clipboard_url.clone();
-        entry.connect_changed(move |entry| {
+        entry.connect_changed(move |_| {
             if add_password_draft.borrow().is_some() {
                 return;
             }
 
-            refresh_search_results(
-                entry,
-                &sources,
-                &list,
-                &scroller,
-                &current_results,
-                &clipboard_url,
-                mode,
-            );
+            search.refresh();
         });
     }
 
@@ -337,106 +604,30 @@ fn build_ui(
         }
     }
 
-    refresh_search_results(
-        &entry,
-        &sources,
-        &list,
-        &scroller,
-        &current_results,
-        &clipboard_url,
-        mode,
-    );
+    search.refresh();
     window.present();
     request_initial_focus(&window, &entry);
-    schedule_clipboard_url_loads(
-        &entry,
-        &sources,
-        &list,
-        &scroller,
-        &current_results,
-        &clipboard_url,
-        &add_password_draft,
-        mode,
-    );
+    schedule_clipboard_url_loads(&search);
 }
 
-fn refresh_search_results(
-    entry: &Entry,
-    sources: &Sources,
-    list: &ListBox,
-    scroller: &ScrolledWindow,
-    current_results: &Rc<RefCell<Vec<ResultItem>>>,
-    clipboard_url: &Rc<RefCell<Option<String>>>,
-    mode: SearchMode,
-) {
-    let query = entry.text().to_string();
-    let clipboard_url = clipboard_url.borrow().clone();
-    let results = if let Some(clipboard_url) = clipboard_url.as_deref() {
-        sources.search_with_clipboard_url(&query, mode, Some(clipboard_url))
-    } else {
-        sources.search(&query, mode)
-    };
-    rebuild_results(list, scroller, &results);
-    current_results.replace(results);
-}
-
-fn schedule_clipboard_url_loads(
-    entry: &Entry,
-    sources: &Arc<Sources>,
-    list: &ListBox,
-    scroller: &ScrolledWindow,
-    current_results: &Rc<RefCell<Vec<ResultItem>>>,
-    clipboard_url: &Rc<RefCell<Option<String>>>,
-    add_password_draft: &Rc<RefCell<Option<AddPasswordDraft>>>,
-    mode: SearchMode,
-) {
+fn schedule_clipboard_url_loads(search: &SearchController) {
     for delay_ms in [80_u64, 220, 500] {
-        let entry = entry.clone();
-        let sources = sources.clone();
-        let list = list.clone();
-        let scroller = scroller.clone();
-        let current_results = current_results.clone();
-        let clipboard_url = clipboard_url.clone();
-        let add_password_draft = add_password_draft.clone();
+        let search = search.clone();
         glib::timeout_add_local_once(Duration::from_millis(delay_ms), move || {
-            if clipboard_url.borrow().is_some() {
+            if search.clipboard_url.borrow().is_some() {
                 return;
             }
-            load_clipboard_url(
-                &entry,
-                &sources,
-                &list,
-                &scroller,
-                &current_results,
-                &clipboard_url,
-                &add_password_draft,
-                mode,
-            );
+            load_clipboard_url(&search);
         });
     }
 }
 
-fn load_clipboard_url(
-    entry: &Entry,
-    sources: &Arc<Sources>,
-    list: &ListBox,
-    scroller: &ScrolledWindow,
-    current_results: &Rc<RefCell<Vec<ResultItem>>>,
-    clipboard_url: &Rc<RefCell<Option<String>>>,
-    add_password_draft: &Rc<RefCell<Option<AddPasswordDraft>>>,
-    mode: SearchMode,
-) {
+fn load_clipboard_url(search: &SearchController) {
     let Some(display) = gdk::Display::default() else {
         return;
     };
 
-    let entry = entry.clone();
-    let sources = sources.clone();
-    let list = list.clone();
-    let scroller = scroller.clone();
-    let current_results = current_results.clone();
-    let clipboard_url = clipboard_url.clone();
-    let add_password_draft = add_password_draft.clone();
+    let search = search.clone();
     display
         .clipboard()
         .read_text_async(None::<&gio::Cancellable>, move |result| {
@@ -448,17 +639,9 @@ fn load_clipboard_url(
                 return;
             }
 
-            clipboard_url.replace(Some(text.to_string()));
-            if add_password_draft.borrow().is_none() {
-                refresh_search_results(
-                    &entry,
-                    &sources,
-                    &list,
-                    &scroller,
-                    &current_results,
-                    &clipboard_url,
-                    mode,
-                );
+            search.clipboard_url.replace(Some(text.to_string()));
+            if search.add_password_draft.borrow().is_none() {
+                search.refresh();
             }
         });
 }
@@ -478,20 +661,136 @@ fn request_initial_focus(window: &ApplicationWindow, entry: &Entry) {
     }
 }
 
-fn rebuild_results(list: &ListBox, scroller: &ScrolledWindow, results: &[ResultItem]) {
+fn profiling_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("LUMA_PROFILE").is_some())
+}
+
+fn ms(value: Duration) -> f64 {
+    value.as_secs_f64() * 1000.0
+}
+
+thread_local! {
+    static ICON_LOOKUP_TIME: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+    // GLib monotonic-clock timestamps (microseconds) so the frame profiler can
+    // line each rebuild up against the frame the compositor actually presents.
+    static LAST_REBUILD_DONE_US: Cell<i64> = const { Cell::new(0) };
+    static LAST_FRAME_TIME_US: Cell<i64> = const { Cell::new(0) };
+}
+
+// Logs how long the compositor takes to turn a finished rebuild into a
+// presented frame, isolating window-manager/present latency from the
+// main-thread rebuild cost measured in `rebuild_results`.
+fn install_frame_profiler(window: &ApplicationWindow) {
+    let id = window.add_tick_callback(|_widget, clock| {
+        let frame_time = clock.frame_time();
+        let previous = LAST_FRAME_TIME_US.replace(frame_time);
+        let rebuild_us = LAST_REBUILD_DONE_US.replace(0);
+        if rebuild_us != 0 {
+            let to_frame = (frame_time - rebuild_us) as f64 / 1000.0;
+            let interval = if previous != 0 {
+                (frame_time - previous) as f64 / 1000.0
+            } else {
+                f64::NAN
+            };
+            let present = clock
+                .current_timings()
+                .map(|timings| timings.presentation_time())
+                .filter(|value| *value != 0)
+                .map(|value| (value - frame_time) as f64 / 1000.0);
+            match present {
+                Some(present) => eprintln!(
+                    "[luma-profile] present  rebuild->frame={to_frame:>6.2}ms  frame_interval={interval:>6.2}ms  present_latency={present:>6.2}ms"
+                ),
+                None => eprintln!(
+                    "[luma-profile] present  rebuild->frame={to_frame:>6.2}ms  frame_interval={interval:>6.2}ms  present_latency=unavailable(x11)"
+                ),
+            }
+        }
+        glib::ControlFlow::Continue
+    });
+    // Keep the callback alive for the (short) process lifetime regardless of
+    // whether TickCallbackId behaves as an RAII guard.
+    std::mem::forget(id);
+}
+
+// Two result rows refer to the same logical entry when their source and visible
+// text match. Used to keep a row selected across rebuilds (e.g. when deferred
+// search results arrive) instead of snapping back to the top.
+fn same_result(left: &ResultItem, right: &ResultItem) -> bool {
+    left.source == right.source && left.title == right.title && left.subtitle == right.subtitle
+}
+
+fn preserved_selection_index(previous: Option<&ResultItem>, results: &[ResultItem]) -> usize {
+    previous
+        .and_then(|prev| results.iter().position(|item| same_result(item, prev)))
+        .unwrap_or(0)
+}
+
+fn rebuild_results(
+    list: &ListBox,
+    scroller: &ScrolledWindow,
+    results: &[ResultItem],
+    previous_selection: Option<&ResultItem>,
+) {
+    let profile = profiling_enabled();
+    if profile {
+        ICON_LOOKUP_TIME.with(|cell| cell.set(Duration::ZERO));
+    }
+    let total_start = Instant::now();
+
+    let teardown_start = Instant::now();
     while let Some(child) = list.first_child() {
         list.remove(&child);
     }
+    let teardown = teardown_start.elapsed();
 
+    let build_start = Instant::now();
     for item in results {
         let row = build_row(item);
         list.append(&row);
     }
+    let build = build_start.elapsed();
 
-    if let Some(row) = list.row_at_index(0) {
+    let selected = preserved_selection_index(previous_selection, results) as i32;
+    if let Some(row) = list.row_at_index(selected) {
         list.select_row(Some(&row));
         scroll_row_into_view(list, scroller, &row);
     }
+
+    if profile {
+        let icon = ICON_LOOKUP_TIME.with(Cell::get);
+        let total = total_start.elapsed();
+        LAST_REBUILD_DONE_US.with(|cell| cell.set(glib::monotonic_time()));
+        eprintln!(
+            "[luma-profile] rebuild  rows={:>2}  total={:>6.2}ms  teardown={:>6.2}ms  build={:>6.2}ms  icon_lookup={:>6.2}ms",
+            results.len(),
+            ms(total),
+            ms(teardown),
+            ms(build),
+            ms(icon),
+        );
+    }
+}
+
+fn loading_result(title: &str) -> ResultItem {
+    ResultItem {
+        prediction_key: None,
+        title: title.to_string(),
+        subtitle: "Running slower providers in the background".to_string(),
+        source: "Status",
+        icon_name: "system-search-symbolic".to_string(),
+        score: -10_000,
+        action: Action::None,
+    }
+}
+
+fn finalize_loaded_results(results: Vec<ResultItem>, query: &QueryInput) -> Vec<ResultItem> {
+    let mut results = sort_and_limit_results(results);
+    if results.is_empty() {
+        results.push(no_results_item(query));
+    }
+    results
 }
 
 fn build_row(item: &ResultItem) -> ListBoxRow {
@@ -507,7 +806,14 @@ fn build_row(item: &ResultItem) -> ListBoxRow {
     layout.set_margin_start(10);
     layout.set_margin_end(10);
 
-    let icon = Image::from_icon_name(&item.icon_name);
+    let icon = if profiling_enabled() {
+        let start = Instant::now();
+        let icon = Image::from_icon_name(&item.icon_name);
+        ICON_LOOKUP_TIME.with(|cell| cell.set(cell.get() + start.elapsed()));
+        icon
+    } else {
+        Image::from_icon_name(&item.icon_name)
+    };
     icon.set_pixel_size(24);
     icon.add_css_class("launcher-icon");
     icon.set_halign(Align::Center);
@@ -602,7 +908,7 @@ fn activate_item(
     {
         if power_requires_confirmation(operation) {
             let results = power_confirmation_results(operation);
-            rebuild_results(list, scroller, &results);
+            rebuild_results(list, scroller, &results, None);
             current_results.replace(results);
             return;
         }
@@ -616,7 +922,7 @@ fn activate_item(
         match load_pass_credential(entry) {
             Ok(credential) => {
                 let results = inspected_password_results(&credential);
-                rebuild_results(list, scroller, &results);
+                rebuild_results(list, scroller, &results, None);
                 current_results.replace(results);
             }
             Err(error) => show_status_result(
@@ -768,7 +1074,7 @@ fn finish_add_password_flow(
     match create_generated_password_entry(sources, &draft) {
         Ok(credential) => {
             let results = inspected_password_results(&credential);
-            rebuild_results(list, scroller, &results);
+            rebuild_results(list, scroller, &results, None);
             current_results.replace(results);
         }
         Err(error) => show_status_result(
@@ -822,8 +1128,22 @@ fn pass_entry_exists_on_disk(entry: &str) -> Result<bool> {
 }
 
 fn password_store_dir() -> Option<std::path::PathBuf> {
-    std::env::var_os("PASSWORD_STORE_DIR")
-        .map(std::path::PathBuf::from)
+    app_config()
+        .and_then(|config| {
+            config
+                .current()
+                .integrations
+                .password_store_dir
+                .and_then(|value| {
+                    let trimmed = value.trim().to_string();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(std::path::PathBuf::from(trimmed))
+                    }
+                })
+        })
+        .or_else(|| std::env::var_os("PASSWORD_STORE_DIR").map(std::path::PathBuf::from))
         .or_else(|| dirs::home_dir().map(|home| home.join(".password-store")))
 }
 
@@ -855,7 +1175,7 @@ fn show_status_result(
     item: ResultItem,
 ) {
     let results = vec![item];
-    rebuild_results(list, scroller, &results);
+    rebuild_results(list, scroller, &results, None);
     current_results.replace(results);
 }
 
@@ -890,6 +1210,7 @@ fn execute_action(
                 .context("failed to open file")?;
         }
         Action::Ssh { host } => launch_ssh(&host)?,
+        Action::OpenConfigPanel => open_config_panel(window)?,
         Action::CopyPass { entry } => {
             let secret = load_pass_secret(&entry)?;
             copy_secret(&secret)?;
@@ -913,15 +1234,13 @@ fn execute_action(
             execute_power_operation(operation)?;
         }
         Action::WebSearch { query } => {
-            let base = std::env::var("DOT_LAUNCHER_SEARCH_URL")
-                .unwrap_or_else(|_| "https://duckduckgo.com/?q=".to_string());
+            let base = web_search_url();
             let url = format!("{base}{}", urlencoding::encode(&query));
             gio::AppInfo::launch_default_for_uri(&url, gio::AppLaunchContext::NONE)
                 .context("failed to open search URL")?;
         }
         Action::OpenUrl { url } => {
-            gio::AppInfo::launch_default_for_uri(&url, gio::AppLaunchContext::NONE)
-                .context("failed to open URL")?;
+            open_mail_or_url(&url)?;
         }
         Action::CopyText { text } => {
             copy_to_clipboard(&text);
@@ -1337,11 +1656,16 @@ fn command_exists(program: &str) -> bool {
 }
 
 fn password_clip_timeout_seconds() -> u64 {
-    std::env::var("PASSWORD_STORE_CLIP_TIME")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
+    app_config()
+        .map(|config| config.current().integrations.password_clip_timeout_seconds)
         .filter(|seconds| *seconds > 0)
-        .unwrap_or(15)
+        .unwrap_or_else(|| {
+            std::env::var("PASSWORD_STORE_CLIP_TIME")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|seconds| *seconds > 0)
+                .unwrap_or(15)
+        })
 }
 
 fn inspected_password_results(credential: &Credential) -> Vec<ResultItem> {
@@ -1506,9 +1830,21 @@ fn launch_desktop_app(desktop_id: &str) -> Result<()> {
 }
 
 fn launch_ssh(host: &str) -> Result<()> {
-    let terminal = std::env::var("DOT_LAUNCHER_TERMINAL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
+    let terminal = app_config()
+        .and_then(|config| {
+            let value = config.current().integrations.ssh_terminal;
+            let trimmed = value.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        })
+        .or_else(|| {
+            std::env::var("DOT_LAUNCHER_TERMINAL")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
         .unwrap_or_else(|| default_ssh_terminal(dirs::home_dir().as_deref()));
 
     Command::new(&terminal)
@@ -1518,14 +1854,184 @@ fn launch_ssh(host: &str) -> Result<()> {
     Ok(())
 }
 
+fn web_search_url() -> String {
+    app_config()
+        .map(|config| config.current().integrations.web_search_url)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            std::env::var("DOT_LAUNCHER_SEARCH_URL")
+                .unwrap_or_else(|_| "https://duckduckgo.com/?q=".to_string())
+        })
+}
+
+fn open_mail_or_url(url: &str) -> Result<()> {
+    if let Some((action, message_id)) = parse_luma_mail_helper_uri(url) {
+        let email_config = app_config_email_config();
+        let Some(command) = evolution_helper_command(&email_config) else {
+            anyhow::bail!("Evolution mail helper is not configured");
+        };
+
+        run_mail_helper_action(
+            &command,
+            &action,
+            &message_id,
+            email_config.evolution_helper_timeout_ms,
+        )?;
+        return Ok(());
+    }
+
+    match email_open_strategy(url, &app_config_email_config()) {
+        EmailOpenStrategy::ThunderbirdUrl => {
+            if spawn_optional_command("thunderbird", &[url])?.is_some() {
+                return Ok(());
+            }
+        }
+        EmailOpenStrategy::ThunderbirdFile(path) => {
+            let path = path.to_string_lossy().to_string();
+            if spawn_optional_command("thunderbird", &["-file", &path])?.is_some() {
+                return Ok(());
+            }
+        }
+        EmailOpenStrategy::EvolutionUrl => {
+            if spawn_optional_command("evolution", &[url])?.is_some() {
+                return Ok(());
+            }
+        }
+        EmailOpenStrategy::EvolutionFile(path) => {
+            let path = path.to_string_lossy().to_string();
+            if spawn_optional_command("evolution", &["--component=mail", "--view", &path])?
+                .is_some()
+            {
+                return Ok(());
+            }
+        }
+        EmailOpenStrategy::DefaultUri => {}
+    }
+
+    gio::AppInfo::launch_default_for_uri(url, gio::AppLaunchContext::NONE)
+        .context("failed to open mail or URL")
+}
+
+fn parse_luma_mail_helper_uri(url: &str) -> Option<(String, String)> {
+    let rest = url.strip_prefix("luma-mail-eds://")?;
+    let (action, query) = rest.split_once('?').unwrap_or((rest, ""));
+    if action.trim().is_empty() {
+        return None;
+    }
+
+    let mut message_id = None;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=')?;
+        if key == "message_id" {
+            message_id = urlencoding::decode(value)
+                .ok()
+                .map(|value| value.into_owned());
+            break;
+        }
+    }
+
+    message_id.map(|message_id| (action.to_string(), message_id))
+}
+
+fn app_config_email_config() -> EmailConfig {
+    app_config()
+        .map(|config| config.current().integrations.email)
+        .unwrap_or_default()
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum EmailOpenStrategy {
+    ThunderbirdUrl,
+    ThunderbirdFile(std::path::PathBuf),
+    EvolutionUrl,
+    EvolutionFile(std::path::PathBuf),
+    DefaultUri,
+}
+
+fn email_open_strategy(url: &str, config: &EmailConfig) -> EmailOpenStrategy {
+    if url.starts_with("imap-message://")
+        || url.starts_with("mailbox-message://")
+        || url.starts_with("message://")
+    {
+        return EmailOpenStrategy::ThunderbirdUrl;
+    }
+
+    if url.starts_with("mailto:") {
+        return match preferred_mail_client(config) {
+            Some(PreferredMailClient::Evolution) => EmailOpenStrategy::EvolutionUrl,
+            Some(PreferredMailClient::Thunderbird) => EmailOpenStrategy::ThunderbirdUrl,
+            None => EmailOpenStrategy::DefaultUri,
+        };
+    }
+
+    if let Some(path) = file_uri_to_path(url) {
+        return match preferred_mail_client(config) {
+            Some(PreferredMailClient::Evolution) => EmailOpenStrategy::EvolutionFile(path),
+            Some(PreferredMailClient::Thunderbird) => EmailOpenStrategy::ThunderbirdFile(path),
+            None => EmailOpenStrategy::DefaultUri,
+        };
+    }
+
+    EmailOpenStrategy::DefaultUri
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreferredMailClient {
+    Thunderbird,
+    Evolution,
+}
+
+fn preferred_mail_client(config: &EmailConfig) -> Option<PreferredMailClient> {
+    let thunderbird = config.thunderbird_enabled;
+    let evolution = config.evolution_enabled;
+
+    match config.preferred_backend {
+        EmailBackendPreference::Thunderbird | EmailBackendPreference::Auto => {
+            if thunderbird {
+                Some(PreferredMailClient::Thunderbird)
+            } else if evolution {
+                Some(PreferredMailClient::Evolution)
+            } else {
+                None
+            }
+        }
+        EmailBackendPreference::Evolution => {
+            if evolution {
+                Some(PreferredMailClient::Evolution)
+            } else if thunderbird {
+                Some(PreferredMailClient::Thunderbird)
+            } else {
+                None
+            }
+        }
+        EmailBackendPreference::LocalMail => {
+            if thunderbird {
+                Some(PreferredMailClient::Thunderbird)
+            } else if evolution {
+                Some(PreferredMailClient::Evolution)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn file_uri_to_path(uri: &str) -> Option<std::path::PathBuf> {
+    let file = gio::File::for_uri(uri);
+    file.path()
+}
+
 fn placeholder_for_mode(mode: SearchMode) -> &'static str {
     match mode {
-        SearchMode::All => "Search apps, files, passwords, SSH, commands, web, and calculations",
+        SearchMode::All => {
+            "Search apps, files, passwords, email, SSH, commands, web, and calculations"
+        }
         SearchMode::Apps => "Launch an application",
         SearchMode::Windows => "Switch to an active window",
         SearchMode::Files => "Search files with LocalSearch",
         SearchMode::Ssh => "Search SSH hosts",
         SearchMode::Pass => "Search password-store entries",
+        SearchMode::Email => "Search email messages",
         SearchMode::Commands => "Run a command",
         SearchMode::Web => "Search the web or open a URL",
         SearchMode::Calc => "Evaluate a libqalculate expression",
@@ -1676,6 +2182,67 @@ fn launcher_css() -> &'static str {
         font-size: 1rem;
         font-weight: 650;
       }
+
+      .settings-shell {
+        background: linear-gradient(180deg, rgba(18, 22, 31, 0.94), rgba(10, 13, 21, 0.98));
+        border: 1px solid rgba(255, 255, 255, 0.10);
+        border-radius: 22px;
+        box-shadow: 0 22px 58px rgba(0, 0, 0, 0.40);
+      }
+
+      .settings-scroller {
+        background: transparent;
+      }
+
+      .settings-header {
+        padding-bottom: 4px;
+      }
+
+      .settings-title {
+        font-size: 1.55rem;
+        font-weight: 720;
+        color: rgba(247, 249, 255, 0.98);
+      }
+
+      .settings-subtitle {
+        color: rgba(210, 219, 237, 0.78);
+      }
+
+      .settings-card {
+        background: rgba(255, 255, 255, 0.04);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 18px;
+        padding: 16px;
+      }
+
+      .settings-card-title {
+        font-size: 1.05rem;
+        font-weight: 680;
+        color: rgba(247, 249, 255, 0.98);
+      }
+
+      .settings-card-subtitle {
+        color: rgba(210, 219, 237, 0.76);
+      }
+
+      .settings-row {
+        min-height: 46px;
+        padding-top: 4px;
+        padding-bottom: 4px;
+      }
+
+      .settings-row-title {
+        font-weight: 600;
+        color: rgba(247, 249, 255, 0.96);
+      }
+
+      .settings-row-subtitle {
+        color: rgba(210, 219, 237, 0.72);
+      }
+
+      .settings-status {
+        color: rgba(210, 219, 237, 0.76);
+      }
     "#
 }
 
@@ -1693,11 +2260,13 @@ fn apply_css() {
 #[cfg(test)]
 mod tests {
     use super::{
-        LAUNCHER_SHADOW_BLUR_PX, LAUNCHER_SHADOW_Y_OFFSET_PX, LAUNCHER_SURFACE_MARGIN_BOTTOM_PX,
-        LAUNCHER_SURFACE_MARGIN_PX, action_failure_result, default_ssh_terminal,
-        inspected_password_results, launcher_css, layer_shell_enabled, power_confirmation_results,
-        power_requires_confirmation, row_tooltip_text, wayland_available_for_session,
+        EmailOpenStrategy, LAUNCHER_SHADOW_BLUR_PX, LAUNCHER_SHADOW_Y_OFFSET_PX,
+        LAUNCHER_SURFACE_MARGIN_BOTTOM_PX, LAUNCHER_SURFACE_MARGIN_PX, action_failure_result,
+        default_ssh_terminal, email_open_strategy, inspected_password_results, launcher_css,
+        layer_shell_enabled, power_confirmation_results, power_requires_confirmation,
+        preserved_selection_index, row_tooltip_text, wayland_available_for_session,
     };
+    use crate::config::{EmailBackendPreference, EmailConfig};
     use crate::model::{Action, PasswordOperation, PowerOperation, ResultItem, WindowFocusTarget};
     use crate::password::parse_credential;
     use std::fs::{self, File};
@@ -1737,6 +2306,49 @@ mod tests {
     #[test]
     fn falls_back_to_kitty_without_wrapper() {
         assert_eq!(default_ssh_terminal(None), "kitty");
+    }
+
+    fn selection_test_item(source: &'static str, title: &str) -> ResultItem {
+        ResultItem {
+            prediction_key: None,
+            title: title.to_string(),
+            subtitle: String::new(),
+            source,
+            icon_name: String::new(),
+            score: 0,
+            action: Action::None,
+        }
+    }
+
+    #[test]
+    fn selection_follows_the_chosen_item_when_async_results_change_order() {
+        let app = selection_test_item("Applications", "Reddit Client");
+        let bookmark = selection_test_item("Bookmarks", "Reddit");
+        let email = selection_test_item("Email", "Open email: Reddit digest");
+
+        // The user had arrowed down to the bookmark in the immediate results;
+        // the async email result then arrives and reorders the merged list.
+        let merged = vec![app, email, bookmark.clone()];
+
+        assert_eq!(preserved_selection_index(Some(&bookmark), &merged), 2);
+    }
+
+    #[test]
+    fn selection_falls_back_to_top_when_previous_item_is_gone() {
+        let bookmark = selection_test_item("Bookmarks", "Reddit");
+        let merged = vec![
+            selection_test_item("Applications", "Reddit Client"),
+            selection_test_item("Email", "Open email: Reddit digest"),
+        ];
+
+        assert_eq!(preserved_selection_index(Some(&bookmark), &merged), 0);
+    }
+
+    #[test]
+    fn selection_defaults_to_top_when_nothing_was_selected() {
+        let merged = vec![selection_test_item("Applications", "Reddit Client")];
+
+        assert_eq!(preserved_selection_index(None, &merged), 0);
     }
 
     #[test]
@@ -1796,6 +2408,22 @@ mod tests {
     }
 
     #[test]
+    fn x11_session_prefers_x11_gdk_backend() {
+        assert_eq!(
+            super::gdk_backend_for_session(Some("x11"), true, true),
+            Some("x11")
+        );
+    }
+
+    #[test]
+    fn wayland_session_prefers_wayland_gdk_backend() {
+        assert_eq!(
+            super::gdk_backend_for_session(Some("wayland"), true, true),
+            Some("wayland")
+        );
+    }
+
+    #[test]
     fn xwayland_hyprland_targets_use_the_x11_type_backend() {
         assert!(super::use_x11_type_backend(&WindowFocusTarget::Hyprland {
             address: "0xabc".to_string(),
@@ -1805,6 +2433,53 @@ mod tests {
             address: "0xabc".to_string(),
             xwayland: false,
         }));
+    }
+
+    #[test]
+    fn thunderbird_message_urls_open_with_thunderbird() {
+        let config = EmailConfig {
+            preferred_backend: EmailBackendPreference::Evolution,
+            thunderbird_enabled: true,
+            evolution_enabled: true,
+            local_mail_enabled: true,
+            ..EmailConfig::default()
+        };
+
+        assert_eq!(
+            email_open_strategy("imap-message://imap://example.com/INBOX#123", &config),
+            EmailOpenStrategy::ThunderbirdUrl
+        );
+        assert_eq!(
+            email_open_strategy("mailto:robin@example.com", &config),
+            EmailOpenStrategy::EvolutionUrl
+        );
+    }
+
+    #[test]
+    fn local_file_mail_prefers_the_selected_client() {
+        let evolution_config = EmailConfig {
+            preferred_backend: EmailBackendPreference::Evolution,
+            thunderbird_enabled: true,
+            evolution_enabled: true,
+            local_mail_enabled: true,
+            ..EmailConfig::default()
+        };
+        let thunderbird_config = EmailConfig {
+            preferred_backend: EmailBackendPreference::Thunderbird,
+            thunderbird_enabled: true,
+            evolution_enabled: true,
+            local_mail_enabled: true,
+            ..EmailConfig::default()
+        };
+
+        assert!(matches!(
+            email_open_strategy("file:///tmp/message.eml", &evolution_config),
+            EmailOpenStrategy::EvolutionFile(_)
+        ));
+        assert!(matches!(
+            email_open_strategy("file:///tmp/message.eml", &thunderbird_config),
+            EmailOpenStrategy::ThunderbirdFile(_)
+        ));
     }
 
     #[test]

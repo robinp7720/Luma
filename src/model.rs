@@ -1,7 +1,7 @@
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Deserialize, Serialize)]
 pub enum SearchMode {
     All,
     Apps,
@@ -9,6 +9,7 @@ pub enum SearchMode {
     Files,
     Ssh,
     Pass,
+    Email,
     Commands,
     Web,
     Calc,
@@ -85,6 +86,7 @@ pub enum Action {
     WebSearch {
         query: String,
     },
+    OpenConfigPanel,
     CopyText {
         text: String,
     },
@@ -165,7 +167,7 @@ fn parse_prefixed_query(raw: &str) -> Option<(SearchMode, SourceFilter, &str)> {
     }
 
     let lowered = raw.to_ascii_lowercase();
-    const PREFIXES: [(&str, SearchMode, SourceFilter); 18] = [
+    const PREFIXES: [(&str, SearchMode, SourceFilter); 20] = [
         ("apps:", SearchMode::Apps, SourceFilter::All),
         ("app:", SearchMode::Apps, SourceFilter::All),
         ("windows:", SearchMode::Windows, SourceFilter::All),
@@ -176,6 +178,8 @@ fn parse_prefixed_query(raw: &str) -> Option<(SearchMode, SourceFilter, &str)> {
         ("ssh:", SearchMode::Ssh, SourceFilter::All),
         ("pass:", SearchMode::Pass, SourceFilter::All),
         ("password:", SearchMode::Pass, SourceFilter::All),
+        ("email:", SearchMode::Email, SourceFilter::All),
+        ("mail:", SearchMode::Email, SourceFilter::All),
         ("cmd:", SearchMode::Commands, SourceFilter::All),
         ("command:", SearchMode::Commands, SourceFilter::All),
         ("web:", SearchMode::Web, SourceFilter::All),
@@ -357,6 +361,17 @@ mod tests {
         let query = QueryInput::parse("SSH: prod-box", SearchMode::All);
         assert_eq!(query.mode, SearchMode::Ssh);
         assert_eq!(query.text, "prod-box");
+    }
+
+    #[test]
+    fn textual_prefixes_can_select_email_mode() {
+        let email = QueryInput::parse("EMAIL: invoices", SearchMode::Apps);
+        assert_eq!(email.mode, SearchMode::Email);
+        assert_eq!(email.text, "invoices");
+
+        let mail = QueryInput::parse("mail: archive", SearchMode::Apps);
+        assert_eq!(mail.mode, SearchMode::Email);
+        assert_eq!(mail.text, "archive");
     }
 
     #[test]

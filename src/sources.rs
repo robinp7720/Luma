@@ -1,18 +1,21 @@
+use crate::config::{ConfigStore, EmailBackendPreference, FileSearchBackendChoice, LauncherConfig};
+use crate::mail_eds_protocol::{MailEdsMessageSummary, MailEdsSearchResponse};
 use crate::model::{
     Action, PasswordOperation, PowerOperation, QueryInput, ResultItem, SearchMode, SourceFilter,
     WindowFocusTarget, browser_target, password_url_draft, score_text,
 };
 use crate::prediction::{PredictionStore, StoredPrediction};
+use anyhow::{Context, Result};
 use gtk4::gio;
 use gtk4::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_APPS: usize = 8;
 const MAX_WINDOWS: usize = 8;
@@ -20,10 +23,53 @@ const MAX_FILES: usize = 8;
 const MAX_SSH: usize = 6;
 const MAX_PASS: usize = 8;
 const MAX_COMMANDS: usize = 8;
+const MAX_EMAIL: usize = 8;
 const MAX_POWER_ACTIONS: usize = 5;
 const MAX_BOOKMARKS: usize = 8;
 const MAX_RECENTS: usize = 8;
 const MIN_FILE_QUERY_CHARS: usize = 2;
+
+// Base scores per source sit below the primary launcher categories (apps 900,
+// pass 880, bookmarks 830) so a strong text match on a deferred result cannot
+// leapfrog a normal app/bookmark match. score_text (0..=1000) still orders
+// results within and across these lower bands.
+const EMAIL_BASE_SCORE: i32 = 300;
+const FILE_BASE_SCORE: i32 = 280;
+
+// A typed URL is an explicit navigation intent, so its "Open URL" action always
+// ranks first. This base sits above the highest score any other result can reach
+// for a typed query: max source base (~1100) + score_text (≤1000) + prediction
+// boost (≤500). The empty-query prediction rows (base 2000) never appear here
+// because a URL query is non-empty.
+const URL_BASE_SCORE: i32 = 10_000;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DeferredSearchPlan {
+    pub files: bool,
+    pub email: bool,
+}
+
+impl DeferredSearchPlan {
+    pub fn is_empty(self) -> bool {
+        !self.files && !self.email
+    }
+
+    pub fn loading_label(self) -> &'static str {
+        match (self.files, self.email) {
+            (true, true) => "Searching files and mail…",
+            (true, false) => "Searching files…",
+            (false, true) => "Searching mail…",
+            (false, false) => "Searching…",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SearchSnapshot {
+    pub query: QueryInput,
+    pub immediate_results: Vec<ResultItem>,
+    pub deferred: DeferredSearchPlan,
+}
 
 struct PowerAction {
     operation: PowerOperation,
@@ -156,13 +202,36 @@ pub struct RecentFileEntry {
 }
 
 #[derive(Clone, Debug)]
+pub struct EmailEntry {
+    pub subject: String,
+    pub sender: String,
+    pub sender_email: Option<String>,
+    pub folder: String,
+    pub date_label: String,
+    pub open_url: String,
+    pub reply_url: Option<String>,
+    pub compose_url: Option<String>,
+    pub search_blob: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EmailBackend {
+    Thunderbird,
+    Evolution,
+    LocalMail,
+}
+
+#[derive(Clone, Debug)]
 pub struct Sources {
+    config: Arc<ConfigStore>,
     apps: Vec<AppEntry>,
     ssh_hosts: Vec<String>,
     pass_entries: Arc<Mutex<Vec<PassEntry>>>,
     commands: Vec<String>,
     bookmarks: Vec<BookmarkEntry>,
     recent_files: Vec<RecentFileEntry>,
+    thunderbird_email_database_paths: Vec<PathBuf>,
+    local_email_entries: Vec<EmailEntry>,
     file_search_backend: Option<FileSearchBackend>,
     pass_available: bool,
     qalc_available: bool,
@@ -170,14 +239,19 @@ pub struct Sources {
 }
 
 impl Sources {
-    pub fn load() -> Self {
+    pub fn load(config: Arc<ConfigStore>) -> Self {
         Self {
+            config: config.clone(),
             apps: load_applications(),
             ssh_hosts: load_ssh_hosts(),
-            pass_entries: Arc::new(Mutex::new(load_pass_entries())),
+            pass_entries: Arc::new(Mutex::new(load_pass_entries(&config.current()))),
             commands: load_commands(),
             bookmarks: load_browser_bookmarks(),
             recent_files: load_recent_files(),
+            thunderbird_email_database_paths: load_thunderbird_email_databases(
+                &config.current().integrations.email,
+            ),
+            local_email_entries: load_local_email_entries(&config.current().integrations.email),
             file_search_backend: FileSearchBackend::detect(),
             pass_available: command_exists("pass"),
             qalc_available: command_exists("qalc"),
@@ -185,12 +259,9 @@ impl Sources {
         }
     }
 
-    pub fn warm_external_sources(&self) {
-        if let Some(backend) = self.file_search_backend {
-            thread::spawn(move || {
-                let _ = backend.run_search("a", 1);
-            });
-        }
+    #[cfg(test)]
+    pub fn with_config(config: LauncherConfig) -> Self {
+        Self::load(Arc::new(ConfigStore::disabled(config)))
     }
 
     pub fn refresh_pass_entries(&self) {
@@ -199,7 +270,7 @@ impl Sources {
         }
 
         if let Ok(mut entries) = self.pass_entries.lock() {
-            *entries = load_pass_entries();
+            *entries = load_pass_entries(&self.current_config());
         }
     }
 
@@ -209,33 +280,70 @@ impl Sources {
             .is_ok_and(|entries| entries.iter().any(|candidate| candidate.name == entry))
     }
 
+    fn current_config(&self) -> LauncherConfig {
+        self.config.current()
+    }
+
+    fn configured_file_search_backend(&self) -> Option<FileSearchBackend> {
+        match self.current_config().integrations.file_search_backend {
+            FileSearchBackendChoice::Disabled => None,
+            FileSearchBackendChoice::Auto => self.file_search_backend,
+            FileSearchBackendChoice::LocalSearch => {
+                if command_exists("localsearch") {
+                    Some(FileSearchBackend::LocalSearch)
+                } else {
+                    None
+                }
+            }
+            FileSearchBackendChoice::Tracker3 => {
+                if command_exists("tracker3") {
+                    Some(FileSearchBackend::Tracker3)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
     pub fn search(&self, raw_query: &str, cli_mode: SearchMode) -> Vec<ResultItem> {
         self.search_with_clipboard_url(raw_query, cli_mode, None)
     }
 
-    pub fn search_with_clipboard_url(
+    pub(crate) fn search_snapshot(
         &self,
         raw_query: &str,
         cli_mode: SearchMode,
         clipboard_url: Option<&str>,
-    ) -> Vec<ResultItem> {
+    ) -> SearchSnapshot {
         let query = QueryInput::parse(raw_query, cli_mode);
         let mut results = Vec::new();
         let now = current_unix_time();
 
         if query.text.is_empty() {
             results.extend(self.default_results(&query, now, clipboard_url));
-            return results;
+            return SearchSnapshot {
+                query,
+                immediate_results: results,
+                deferred: DeferredSearchPlan::default(),
+            };
         }
 
         match query.source_filter {
             SourceFilter::Bookmarks => {
                 results.extend(self.search_bookmarks(&query, now));
-                return finish_search_results(results, &query);
+                return SearchSnapshot {
+                    query: query.clone(),
+                    immediate_results: finalize_search_results(results, &query, true),
+                    deferred: DeferredSearchPlan::default(),
+                };
             }
             SourceFilter::Recents => {
                 results.extend(self.search_recent_files(&query, now));
-                return finish_search_results(results, &query);
+                return SearchSnapshot {
+                    query: query.clone(),
+                    immediate_results: finalize_search_results(results, &query, true),
+                    deferred: DeferredSearchPlan::default(),
+                };
             }
             SourceFilter::All => {}
         }
@@ -246,10 +354,6 @@ impl Sources {
 
         if query.mode.includes(SearchMode::Windows) {
             results.extend(self.search_windows(&query, now));
-        }
-
-        if query.mode.includes(SearchMode::Files) {
-            results.extend(self.search_files(&query, now));
         }
 
         if query.mode.includes(SearchMode::Ssh) {
@@ -277,6 +381,10 @@ impl Sources {
             }
         }
 
+        if let Some(result) = self.search_settings(&query, now) {
+            results.push(result);
+        }
+
         if query.mode.includes(SearchMode::Calc) {
             if let Some(result) = self.search_calc(&query, now) {
                 results.push(result);
@@ -291,7 +399,147 @@ impl Sources {
             results.push(self.search_web(&query, now));
         }
 
-        finish_search_results(results, &query)
+        let file_search_deferred = self.should_defer_file_search(&query);
+        if !file_search_deferred && query.mode == SearchMode::Files {
+            results.extend(self.file_search_status_result(&query));
+        }
+
+        let email_search_deferred = self.should_defer_email_search(&query);
+        if !email_search_deferred && query.mode == SearchMode::Email {
+            results.extend(self.email_search_status_result(&query));
+        }
+
+        SearchSnapshot {
+            query,
+            immediate_results: results,
+            deferred: DeferredSearchPlan {
+                files: file_search_deferred,
+                email: email_search_deferred,
+            },
+        }
+    }
+
+    pub(crate) fn search_deferred_results(&self, snapshot: &SearchSnapshot) -> Vec<ResultItem> {
+        let now = current_unix_time();
+        let mut results = Vec::new();
+
+        if snapshot.deferred.files {
+            results.extend(self.search_files(&snapshot.query, now));
+        }
+
+        if snapshot.deferred.email {
+            results.extend(self.search_email(&snapshot.query, now));
+        }
+
+        results
+    }
+
+    pub fn search_with_clipboard_url(
+        &self,
+        raw_query: &str,
+        cli_mode: SearchMode,
+        clipboard_url: Option<&str>,
+    ) -> Vec<ResultItem> {
+        let snapshot = self.search_snapshot(raw_query, cli_mode, clipboard_url);
+        let mut results = snapshot.immediate_results.clone();
+        results.extend(self.search_deferred_results(&snapshot));
+        finalize_search_results(results, &snapshot.query, true)
+    }
+
+    fn should_defer_file_search(&self, query: &QueryInput) -> bool {
+        if !query.mode.includes(SearchMode::Files) {
+            return false;
+        }
+
+        let config = self.current_config();
+        config.sources.files
+            && self.configured_file_search_backend().is_some()
+            && query.text.chars().count() >= MIN_FILE_QUERY_CHARS
+    }
+
+    fn should_defer_email_search(&self, query: &QueryInput) -> bool {
+        if !query.mode.includes(SearchMode::Email) {
+            return false;
+        }
+
+        let config = self.current_config();
+        let email_config = &config.integrations.email;
+        let evolution_helper_available =
+            email_config.evolution_enabled && evolution_helper_command(email_config).is_some();
+        config.sources.email
+            && ((email_config.thunderbird_enabled
+                && !self.thunderbird_email_database_paths.is_empty())
+                || evolution_helper_available
+                || (email_config.local_mail_enabled && !self.local_email_entries.is_empty()))
+    }
+
+    fn file_search_status_result(&self, query: &QueryInput) -> Vec<ResultItem> {
+        let config = self.current_config();
+        if !config.sources.files {
+            return vec![instruction_result(
+                "File search is disabled",
+                "Open settings to re-enable file search",
+                "Files",
+                "system-search-symbolic",
+                520,
+            )];
+        }
+
+        if query.text.chars().count() < MIN_FILE_QUERY_CHARS {
+            return vec![instruction_result(
+                "Keep typing to search files",
+                "Type at least 2 characters before querying the file index",
+                "Files",
+                "system-search-symbolic",
+                520,
+            )];
+        }
+
+        if self.configured_file_search_backend().is_none() {
+            return vec![ResultItem {
+                prediction_key: None,
+                title: "Indexed file search unavailable".to_string(),
+                subtitle: "Install LocalSearch to enable indexed file search".to_string(),
+                source: "Files",
+                icon_name: "system-search-symbolic".to_string(),
+                score: 500,
+                action: Action::None,
+            }];
+        }
+
+        Vec::new()
+    }
+
+    fn email_search_status_result(&self, query: &QueryInput) -> Vec<ResultItem> {
+        let config = self.current_config();
+        if !config.sources.email {
+            return vec![instruction_result(
+                "Email search is disabled",
+                "Open settings to re-enable email search",
+                "Email",
+                "mail-unread-symbolic",
+                500,
+            )];
+        }
+
+        let email_config = &config.integrations.email;
+        let evolution_helper_available =
+            email_config.evolution_enabled && evolution_helper_command(email_config).is_some();
+        let any_backend_available = (email_config.thunderbird_enabled
+            && !self.thunderbird_email_database_paths.is_empty())
+            || evolution_helper_available
+            || (email_config.local_mail_enabled && !self.local_email_entries.is_empty());
+        if !any_backend_available && query.mode == SearchMode::Email {
+            return vec![instruction_result(
+                "No email source found",
+                "Enable Thunderbird, Evolution helper, or local mail roots in settings",
+                "Email",
+                "mail-unread-symbolic",
+                65,
+            )];
+        }
+
+        Vec::new()
     }
 
     pub fn record_activation(&self, item: &ResultItem) {
@@ -322,6 +570,7 @@ impl Sources {
         now: u64,
         clipboard_url: Option<&str>,
     ) -> Vec<ResultItem> {
+        let config = self.current_config();
         let mut results = Vec::new();
         let mode = query.mode;
 
@@ -350,6 +599,7 @@ impl Sources {
         }
 
         if matches!(mode, SearchMode::All | SearchMode::Pass)
+            && config.sources.pass
             && self.pass_available
             && let Some(draft) = clipboard_url
                 .and_then(password_url_draft)
@@ -360,9 +610,10 @@ impl Sources {
 
         if mode == SearchMode::All {
             results.extend(self.top_prediction_results(now));
+            results.push(self.settings_result(now));
         }
 
-        if mode.includes(SearchMode::Apps) {
+        if mode.includes(SearchMode::Apps) && config.sources.apps {
             results.extend(self.apps.iter().take(8).map(|app| ResultItem {
                 prediction_key: Some(app_prediction_key(&app.desktop_id)),
                 title: app.name.clone(),
@@ -380,7 +631,48 @@ impl Sources {
             }));
         }
 
+        if mode == SearchMode::Email {
+            if !config.sources.email {
+                results.push(instruction_result(
+                    "Email search is disabled",
+                    "Open settings to re-enable email results",
+                    "Email",
+                    "mail-unread-symbolic",
+                    65,
+                ));
+            } else if self.thunderbird_email_database_paths.is_empty()
+                && self.local_email_entries.is_empty()
+                && evolution_helper_command(&config.integrations.email).is_none()
+            {
+                results.push(instruction_result(
+                    "No email source found",
+                    "Install Thunderbird, enable Evolution, or point Luma at a local maildir to search email",
+                    "Email",
+                    "mail-unread-symbolic",
+                    65,
+                ));
+            } else {
+                results.push(instruction_result(
+                    "Email mode",
+                    "Type a subject, sender, folder, or body fragment to search mail",
+                    "Email",
+                    "mail-unread-symbolic",
+                    65,
+                ));
+            }
+        }
+
         if mode == SearchMode::Windows {
+            if !config.sources.windows {
+                results.push(instruction_result(
+                    "Window search is disabled",
+                    "Open settings to re-enable active window switching",
+                    "Windows",
+                    "view-grid-symbolic",
+                    65,
+                ));
+                return results;
+            }
             let windows = load_windows();
             if windows.is_empty() {
                 results.push(instruction_result(
@@ -400,7 +692,7 @@ impl Sources {
             }
         }
 
-        if mode.includes(SearchMode::Ssh) {
+        if mode.includes(SearchMode::Ssh) && config.sources.ssh {
             results.extend(self.ssh_hosts.iter().take(4).map(|host| ResultItem {
                 prediction_key: Some(ssh_prediction_key(host)),
                 title: host.clone(),
@@ -413,6 +705,16 @@ impl Sources {
         }
 
         if mode == SearchMode::Pass {
+            if !config.sources.pass {
+                results.push(instruction_result(
+                    "Password search is disabled",
+                    "Open settings to re-enable pass integration",
+                    "Passwords",
+                    "dialog-password-symbolic",
+                    65,
+                ));
+                return results;
+            }
             if !self.pass_available {
                 results.push(instruction_result(
                     "pass is not installed",
@@ -445,7 +747,15 @@ impl Sources {
         }
 
         if mode == SearchMode::Files {
-            if self.file_search_backend.is_some() {
+            if !config.sources.files {
+                results.push(instruction_result(
+                    "File search is disabled",
+                    "Open settings to re-enable file search",
+                    "Files",
+                    "system-search-symbolic",
+                    65,
+                ));
+            } else if self.configured_file_search_backend().is_some() {
                 results.push(instruction_result(
                     "File mode",
                     "Type a name or path fragment to search indexed files",
@@ -465,6 +775,16 @@ impl Sources {
         }
 
         if mode == SearchMode::Commands {
+            if !config.sources.commands {
+                results.push(instruction_result(
+                    "Command search is disabled",
+                    "Open settings to re-enable shell commands",
+                    "Commands",
+                    "utilities-terminal-symbolic",
+                    65,
+                ));
+                return results;
+            }
             results.push(instruction_result(
                 "Command mode",
                 "Type a shell command and press Enter to run it",
@@ -475,6 +795,16 @@ impl Sources {
         }
 
         if mode == SearchMode::Web {
+            if !config.sources.web {
+                results.push(instruction_result(
+                    "Web search is disabled",
+                    "Open settings to re-enable browser search",
+                    "Web",
+                    "web-browser-symbolic",
+                    65,
+                ));
+                return results;
+            }
             results.push(instruction_result(
                 "Web mode",
                 "Type a query and press Enter to search the web",
@@ -485,6 +815,16 @@ impl Sources {
         }
 
         if mode == SearchMode::Calc {
+            if !config.sources.calc {
+                results.push(instruction_result(
+                    "Calculator search is disabled",
+                    "Open settings to re-enable calculator results",
+                    "Calculator",
+                    "accessories-calculator-symbolic",
+                    65,
+                ));
+                return results;
+            }
             if self.qalc_available {
                 results.push(instruction_result(
                     "Calculator mode",
@@ -508,6 +848,10 @@ impl Sources {
     }
 
     fn search_apps(&self, query: &QueryInput, now: u64) -> Vec<ResultItem> {
+        if !self.current_config().sources.apps {
+            return Vec::new();
+        }
+
         let mut items = self
             .apps
             .iter()
@@ -537,6 +881,10 @@ impl Sources {
     }
 
     fn search_windows(&self, query: &QueryInput, now: u64) -> Vec<ResultItem> {
+        if !self.current_config().sources.windows {
+            return Vec::new();
+        }
+
         let mut items = load_windows()
             .into_iter()
             .filter_map(|window| {
@@ -552,6 +900,20 @@ impl Sources {
     }
 
     fn search_files(&self, query: &QueryInput, now: u64) -> Vec<ResultItem> {
+        let config = self.current_config();
+        if !config.sources.files {
+            if query.mode == SearchMode::Files {
+                return vec![instruction_result(
+                    "File search is disabled",
+                    "Open settings to re-enable file search",
+                    "Files",
+                    "system-search-symbolic",
+                    520,
+                )];
+            }
+            return Vec::new();
+        }
+
         if query.text.chars().count() < MIN_FILE_QUERY_CHARS {
             if query.mode == SearchMode::Files {
                 return vec![instruction_result(
@@ -565,7 +927,7 @@ impl Sources {
             return Vec::new();
         }
 
-        let Some(backend) = self.file_search_backend else {
+        let Some(backend) = self.configured_file_search_backend() else {
             if query.mode == SearchMode::Files {
                 return vec![ResultItem {
                     prediction_key: None,
@@ -604,7 +966,8 @@ impl Sources {
                     subtitle: path.clone(),
                     source: "Files",
                     icon_name: "folder-documents-symbolic".to_string(),
-                    score: 760 + self.prediction_boost(&file_prediction_key(&path), now),
+                    score: FILE_BASE_SCORE
+                        + self.prediction_boost(&file_prediction_key(&path), now),
                     action: Action::OpenFile { path },
                 }
             })
@@ -612,6 +975,10 @@ impl Sources {
     }
 
     fn search_ssh(&self, query: &QueryInput, now: u64) -> Vec<ResultItem> {
+        if !self.current_config().sources.ssh {
+            return Vec::new();
+        }
+
         let mut items = self
             .ssh_hosts
             .iter()
@@ -635,6 +1002,20 @@ impl Sources {
     }
 
     fn search_pass(&self, query: &QueryInput, now: u64) -> Vec<ResultItem> {
+        let config = self.current_config();
+        if !config.sources.pass {
+            if query.mode == SearchMode::Pass {
+                return vec![instruction_result(
+                    "Password search is disabled",
+                    "Open settings to re-enable pass integration",
+                    "Passwords",
+                    "dialog-password-symbolic",
+                    500,
+                )];
+            }
+            return Vec::new();
+        }
+
         if !self.pass_available {
             if query.mode == SearchMode::Pass {
                 return vec![ResultItem {
@@ -683,7 +1064,180 @@ impl Sources {
         items
     }
 
+    fn search_email(&self, query: &QueryInput, now: u64) -> Vec<ResultItem> {
+        let config = self.current_config();
+        if !config.sources.email {
+            if query.mode == SearchMode::Email {
+                return vec![instruction_result(
+                    "Email search is disabled",
+                    "Open settings to re-enable email search",
+                    "Email",
+                    "mail-unread-symbolic",
+                    500,
+                )];
+            }
+            return Vec::new();
+        }
+
+        let email_config = &config.integrations.email;
+        let evolution_helper_available =
+            email_config.evolution_enabled && evolution_helper_command(email_config).is_some();
+        let any_backend_available = (email_config.thunderbird_enabled
+            && !self.thunderbird_email_database_paths.is_empty())
+            || evolution_helper_available
+            || (email_config.local_mail_enabled && !self.local_email_entries.is_empty());
+        let mut seen_open_urls = HashSet::new();
+        let mut items = Vec::new();
+        if email_config.thunderbird_enabled && !self.thunderbird_email_database_paths.is_empty() {
+            items.extend(self.search_thunderbird_email(
+                query,
+                now,
+                email_config.preferred_backend,
+                &mut seen_open_urls,
+            ));
+        }
+        if email_config.evolution_enabled {
+            items.extend(search_evolution_email_entries(
+                query,
+                now,
+                email_config,
+                &mut seen_open_urls,
+            ));
+        }
+        if email_config.local_mail_enabled && !self.local_email_entries.is_empty() {
+            items.extend(self.search_local_email_entries(
+                &self.local_email_entries,
+                query,
+                now,
+                EmailBackend::LocalMail,
+                email_config.preferred_backend,
+                &mut seen_open_urls,
+            ));
+        }
+
+        if !any_backend_available && query.mode == SearchMode::Email {
+            items.push(instruction_result(
+                "No email source found",
+                "Enable Thunderbird, Evolution helper, or local mail roots in settings",
+                "Email",
+                "mail-unread-symbolic",
+                65,
+            ));
+        }
+
+        sort_results(&mut items, MAX_EMAIL);
+        items
+    }
+
+    fn search_thunderbird_email(
+        &self,
+        query: &QueryInput,
+        now: u64,
+        preferred_backend: EmailBackendPreference,
+        seen_open_urls: &mut HashSet<String>,
+    ) -> Vec<ResultItem> {
+        if !command_exists("sqlite3") {
+            return Vec::new();
+        }
+
+        let mut items = Vec::new();
+        for database in &self.thunderbird_email_database_paths {
+            let Ok(output) = Command::new("sqlite3")
+                .args([
+                    "-readonly",
+                    "-separator",
+                    "\t",
+                    &thunderbird_database_uri(database),
+                    &thunderbird_email_search_sql(&query.text, MAX_EMAIL * 2),
+                ])
+                .output()
+            else {
+                continue;
+            };
+
+            if !output.status.success() {
+                continue;
+            }
+
+            items.extend(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .filter_map(parse_thunderbird_email_row)
+                    .filter_map(|entry| {
+                        if !seen_open_urls.insert(entry.open_url.clone()) {
+                            return None;
+                        }
+
+                        let score = score_text(&entry.search_blob, &query.text)?;
+                        Some(
+                            email_result_items(
+                                &entry,
+                                score
+                                    + EMAIL_BASE_SCORE
+                                    + email_backend_bonus(
+                                        preferred_backend,
+                                        EmailBackend::Thunderbird,
+                                    )
+                                    + self.prediction_boost(
+                                        &email_prediction_key(&entry.open_url),
+                                        now,
+                                    ),
+                                query.mode == SearchMode::Email,
+                            )
+                            .into_iter(),
+                        )
+                    })
+                    .flatten(),
+            );
+        }
+
+        items
+    }
+
+    fn search_local_email_entries(
+        &self,
+        entries: &[EmailEntry],
+        query: &QueryInput,
+        now: u64,
+        backend: EmailBackend,
+        preferred_backend: EmailBackendPreference,
+        seen_open_urls: &mut HashSet<String>,
+    ) -> Vec<ResultItem> {
+        entries
+            .iter()
+            .filter_map(|entry| {
+                if !seen_open_urls.insert(entry.open_url.clone()) {
+                    return None;
+                }
+
+                let score = score_text(&entry.search_blob, &query.text)?;
+                Some(email_result_items(
+                    entry,
+                    score
+                        + EMAIL_BASE_SCORE
+                        + email_backend_bonus(preferred_backend, backend)
+                        + self.prediction_boost(&email_prediction_key(&entry.open_url), now),
+                    query.mode == SearchMode::Email,
+                ))
+            })
+            .flatten()
+            .collect()
+    }
+
     fn search_commands(&self, query: &QueryInput, now: u64) -> Vec<ResultItem> {
+        if !self.current_config().sources.commands {
+            if query.mode == SearchMode::Commands {
+                return vec![instruction_result(
+                    "Command search is disabled",
+                    "Open settings to re-enable shell commands",
+                    "Commands",
+                    "utilities-terminal-symbolic",
+                    500,
+                )];
+            }
+            return Vec::new();
+        }
+
         let mut items = Vec::new();
         let run_prediction_key = command_prediction_key(&query.text);
         items.push(ResultItem {
@@ -724,6 +1278,10 @@ impl Sources {
     }
 
     fn search_power(&self, query: &QueryInput, now: u64) -> Vec<ResultItem> {
+        if !self.current_config().sources.power {
+            return Vec::new();
+        }
+
         let mut items = POWER_ACTIONS
             .iter()
             .filter_map(|action| {
@@ -751,6 +1309,13 @@ impl Sources {
     }
 
     fn search_bookmarks(&self, query: &QueryInput, now: u64) -> Vec<ResultItem> {
+        if !self.current_config().sources.bookmarks {
+            if query.mode == SearchMode::All {
+                return Vec::new();
+            }
+            return Vec::new();
+        }
+
         let mut items = self
             .bookmarks
             .iter()
@@ -776,6 +1341,10 @@ impl Sources {
     }
 
     fn search_recent_files(&self, query: &QueryInput, now: u64) -> Vec<ResultItem> {
+        if !self.current_config().sources.recents {
+            return Vec::new();
+        }
+
         let mut items = self
             .recent_files
             .iter()
@@ -806,6 +1375,10 @@ impl Sources {
     }
 
     fn search_all_mode_command(&self, query: &QueryInput, now: u64) -> Option<ResultItem> {
+        if !self.current_config().sources.commands {
+            return None;
+        }
+
         let mut words = query.text.split_whitespace();
         let program = words.next()?;
         words.next()?;
@@ -829,6 +1402,10 @@ impl Sources {
     }
 
     fn search_calc(&self, query: &QueryInput, now: u64) -> Option<ResultItem> {
+        if !self.current_config().sources.calc {
+            return None;
+        }
+
         if !self.qalc_available {
             return None;
         }
@@ -864,6 +1441,10 @@ impl Sources {
     }
 
     fn search_url(&self, query: &QueryInput, now: u64) -> Option<ResultItem> {
+        if !self.current_config().sources.web {
+            return None;
+        }
+
         if !matches!(query.mode, SearchMode::All | SearchMode::Web) {
             return None;
         }
@@ -876,12 +1457,22 @@ impl Sources {
             subtitle: "Open URL in the default browser".to_string(),
             source: "Web",
             icon_name: "web-browser-symbolic".to_string(),
-            score: 1_200 + self.prediction_boost(&prediction_key, now),
+            score: URL_BASE_SCORE + self.prediction_boost(&prediction_key, now),
             action: Action::OpenUrl { url },
         })
     }
 
     fn search_web(&self, query: &QueryInput, now: u64) -> ResultItem {
+        if !self.current_config().sources.web {
+            return instruction_result(
+                "Web search is disabled",
+                "Open settings to re-enable browser search",
+                "Web",
+                "web-browser-symbolic",
+                120,
+            );
+        }
+
         let prediction_key = web_prediction_key(&query.text);
         ResultItem {
             prediction_key: Some(prediction_key.clone()),
@@ -896,6 +1487,15 @@ impl Sources {
         }
     }
 
+    fn search_settings(&self, query: &QueryInput, now: u64) -> Option<ResultItem> {
+        if query.mode != SearchMode::All {
+            return None;
+        }
+
+        let score = score_text("settings preferences config panel", &query.text)?;
+        Some(self.settings_result_with_score(score + 640, now))
+    }
+
     fn prediction_boost(&self, key: &str, now: u64) -> i32 {
         self.predictions
             .lock()
@@ -908,6 +1508,23 @@ impl Sources {
             .lock()
             .map(|predictions| predictions.top_results(8, now))
             .unwrap_or_default()
+    }
+
+    fn settings_result(&self, now: u64) -> ResultItem {
+        self.settings_result_with_score(260, now)
+    }
+
+    fn settings_result_with_score(&self, score: i32, now: u64) -> ResultItem {
+        let prediction_key = "settings:panel".to_string();
+        ResultItem {
+            prediction_key: Some(prediction_key.clone()),
+            title: "Open settings".to_string(),
+            subtitle: "Configure sources, integrations, and launcher behavior".to_string(),
+            source: "Settings",
+            icon_name: "preferences-system-symbolic".to_string(),
+            score: score + self.prediction_boost(&prediction_key, now),
+            action: Action::OpenConfigPanel,
+        }
     }
 }
 
@@ -1307,6 +1924,284 @@ fn recent_prediction_key(path: &str) -> String {
     format!("recent:{path}")
 }
 
+fn email_prediction_key(open_url: &str) -> String {
+    format!("email:{open_url}")
+}
+
+fn email_backend_bonus(preferred: EmailBackendPreference, backend: EmailBackend) -> i32 {
+    let rank = match preferred {
+        EmailBackendPreference::Thunderbird | EmailBackendPreference::Auto => match backend {
+            EmailBackend::Thunderbird => 3,
+            EmailBackend::Evolution => 2,
+            EmailBackend::LocalMail => 1,
+        },
+        EmailBackendPreference::Evolution => match backend {
+            EmailBackend::Evolution => 3,
+            EmailBackend::Thunderbird => 2,
+            EmailBackend::LocalMail => 1,
+        },
+        EmailBackendPreference::LocalMail => match backend {
+            EmailBackend::LocalMail => 3,
+            EmailBackend::Evolution => 2,
+            EmailBackend::Thunderbird => 1,
+        },
+    };
+
+    rank * 10
+}
+
+fn email_result_items(entry: &EmailEntry, score: i32, include_secondary: bool) -> Vec<ResultItem> {
+    let mut rows = vec![email_result_item(
+        format!("Open email: {}", entry.subject),
+        email_subtitle(&entry.sender, &entry.folder, &entry.date_label),
+        entry.open_url.clone(),
+        score + 80,
+        Some(email_prediction_key(&entry.open_url)),
+    )];
+
+    if include_secondary {
+        if let Some(sender_email) = &entry.sender_email {
+            let reply_subject = if entry.subject.is_empty() {
+                "Re:".to_string()
+            } else {
+                format!("Re: {}", entry.subject)
+            };
+            let reply_url = entry
+                .reply_url
+                .clone()
+                .unwrap_or_else(|| mailto_reply_url(sender_email, &reply_subject));
+            let compose_url = entry
+                .compose_url
+                .clone()
+                .unwrap_or_else(|| mailto_compose_url(sender_email));
+            rows.extend([
+                email_result_item(
+                    format!("Reply to {}", entry.sender),
+                    email_subtitle(sender_email, &entry.folder, &entry.date_label),
+                    reply_url,
+                    score + 50,
+                    None,
+                ),
+                email_result_item(
+                    format!("Compose to {}", entry.sender),
+                    email_subtitle(sender_email, &entry.folder, &entry.date_label),
+                    compose_url,
+                    score + 45,
+                    None,
+                ),
+                ResultItem {
+                    prediction_key: None,
+                    title: format!("Copy sender: {}", sender_email),
+                    subtitle: "Copy the sender address to the clipboard".to_string(),
+                    source: "Email",
+                    icon_name: "edit-copy-symbolic".to_string(),
+                    score: score + 40,
+                    action: Action::CopyText {
+                        text: sender_email.clone(),
+                    },
+                },
+            ]);
+        }
+    }
+
+    rows
+}
+
+fn email_result_item(
+    title: String,
+    subtitle: String,
+    open_url: String,
+    score: i32,
+    prediction_key: Option<String>,
+) -> ResultItem {
+    ResultItem {
+        prediction_key,
+        title,
+        subtitle,
+        source: "Email",
+        icon_name: "mail-unread-symbolic".to_string(),
+        score,
+        action: Action::OpenUrl { url: open_url },
+    }
+}
+
+fn email_subtitle(sender: &str, folder: &str, date_label: &str) -> String {
+    let mut parts = Vec::new();
+    if !sender.trim().is_empty() {
+        parts.push(sender.trim().to_string());
+    }
+    if !folder.trim().is_empty() {
+        parts.push(folder.trim().to_string());
+    }
+    if !date_label.trim().is_empty() {
+        parts.push(date_label.trim().to_string());
+    }
+    parts.join(" · ")
+}
+
+fn mailto_compose_url(sender_email: &str) -> String {
+    format!("mailto:{}", urlencoding::encode(sender_email))
+}
+
+fn mailto_reply_url(sender_email: &str, subject: &str) -> String {
+    let mut url = format!("mailto:{}", urlencoding::encode(sender_email));
+    let mut params = Vec::new();
+    if !subject.trim().is_empty() {
+        params.push(format!("subject={}", urlencoding::encode(subject)));
+    }
+    if !params.is_empty() {
+        url.push('?');
+        url.push_str(&params.join("&"));
+    }
+    url
+}
+
+fn thunderbird_email_search_sql(query: &str, limit: usize) -> String {
+    let escaped = sql_quote(query);
+    format!(
+        "select m.date, m.messageKey, l.folderURI, l.name, c.c1subject, c.c3author, c.c0body \
+         from messages m \
+         join folderLocations l on l.id = m.folderID \
+         join messagesText_content c on c.docid = m.id \
+         where lower(coalesce(c.c1subject,'') || ' ' || coalesce(c.c3author,'') || ' ' || coalesce(c.c0body,'') || ' ' || coalesce(l.name,'')) \
+         like '%' || lower({escaped}) || '%' \
+         order by m.date desc \
+         limit {limit}"
+    )
+}
+
+fn parse_thunderbird_email_row(raw: &str) -> Option<EmailEntry> {
+    let mut fields = raw.split('\t');
+    let date = fields.next()?.trim().parse::<i64>().ok()?;
+    let message_key = fields.next()?.trim().parse::<u64>().ok()?;
+    let folder_uri = fields.next()?.trim().to_string();
+    let folder_name = fields.next()?.trim().to_string();
+    let subject = fields.next()?.trim().to_string();
+    let author = fields.next()?.trim().to_string();
+    let body = fields.next()?.trim().to_string();
+
+    let subject = if subject.is_empty() {
+        "(no subject)".to_string()
+    } else {
+        subject
+    };
+    let sender = if author.is_empty() {
+        "Unknown sender".to_string()
+    } else {
+        author.clone()
+    };
+    let sender_email = extract_email_address(&author);
+    let open_url = thunderbird_message_uri(&folder_uri, message_key);
+    let folder_label = if folder_name.is_empty() {
+        folder_uri.clone()
+    } else {
+        folder_name
+    };
+    let date_label = email_date_label(date as u64, current_unix_seconds());
+    let search_blob = format!("{subject} {sender} {folder_label} {body}").to_ascii_lowercase();
+    Some(EmailEntry {
+        subject,
+        sender,
+        sender_email,
+        folder: folder_label,
+        date_label,
+        open_url,
+        reply_url: None,
+        compose_url: None,
+        search_blob,
+    })
+}
+
+fn email_date_label(message_date_micros: u64, now: u64) -> String {
+    let message_seconds = message_date_micros / 1_000_000;
+    let age_seconds = now.saturating_sub(message_seconds);
+    if age_seconds < 60 {
+        "just now".to_string()
+    } else if age_seconds < 3_600 {
+        format!("{}m ago", age_seconds / 60)
+    } else if age_seconds < 86_400 {
+        format!("{}h ago", age_seconds / 3_600)
+    } else if age_seconds < 172_800 {
+        "yesterday".to_string()
+    } else {
+        format!("{}d ago", age_seconds / 86_400)
+    }
+}
+
+fn current_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+fn thunderbird_message_uri(folder_uri: &str, message_key: u64) -> String {
+    let scheme = if folder_uri.starts_with("imap://") {
+        "imap-message://"
+    } else if folder_uri.starts_with("mailbox://") {
+        "mailbox-message://"
+    } else {
+        "message://"
+    };
+    format!("{scheme}{folder_uri}#{message_key}")
+}
+
+fn thunderbird_database_uri(path: &Path) -> String {
+    format!("file:{}?immutable=1", path.to_string_lossy())
+}
+
+fn extract_email_address(author: &str) -> Option<String> {
+    let candidate = author
+        .split_once('<')
+        .and_then(|(_, rest)| rest.split_once('>'))
+        .map(|(value, _)| value)
+        .unwrap_or(author)
+        .trim();
+    if candidate.contains('@') {
+        Some(candidate.to_string())
+    } else {
+        None
+    }
+}
+
+fn header_value(headers: &str, target: &str) -> Option<String> {
+    let target = target.to_ascii_lowercase();
+    let mut current_key = String::new();
+    let mut current_value = String::new();
+
+    for line in headers.lines() {
+        if line.starts_with([' ', '\t']) {
+            if !current_key.is_empty() {
+                current_value.push(' ');
+                current_value.push_str(line.trim());
+            }
+            continue;
+        }
+
+        if !current_key.is_empty() && current_key == target {
+            return Some(current_value.trim().to_string());
+        }
+
+        let Some((key, value)) = line.split_once(':') else {
+            current_key.clear();
+            current_value.clear();
+            continue;
+        };
+        current_key = key.trim().to_ascii_lowercase();
+        current_value = value.trim().to_string();
+    }
+
+    if !current_key.is_empty() && current_key == target {
+        return Some(current_value.trim().to_string());
+    }
+
+    None
+}
+
+fn sql_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 fn password_action_results(entry: &str, score: i32, include_secondary: bool) -> Vec<ResultItem> {
     let mut rows = vec![password_action_result(
         entry,
@@ -1558,8 +2453,8 @@ fn load_commands() -> Vec<String> {
     commands.into_iter().collect()
 }
 
-fn load_pass_entries() -> Vec<PassEntry> {
-    let Some(store_dir) = password_store_dir() else {
+fn load_pass_entries(config: &LauncherConfig) -> Vec<PassEntry> {
+    let Some(store_dir) = password_store_dir(config) else {
         return Vec::new();
     };
 
@@ -1609,6 +2504,442 @@ fn load_recent_files() -> Vec<RecentFileEntry> {
     fs::read_to_string(path)
         .map(|contents| parse_recent_files_xbel(&contents))
         .unwrap_or_default()
+}
+
+fn load_thunderbird_email_databases(email_config: &crate::config::EmailConfig) -> Vec<PathBuf> {
+    if !email_config.thunderbird_enabled {
+        return Vec::new();
+    }
+
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+
+    let roots = [home.join(".thunderbird"), home.join(".mozilla/thunderbird")];
+    let mut databases = Vec::new();
+
+    for root in roots {
+        let Ok(profiles) = fs::read_dir(root) else {
+            continue;
+        };
+
+        for profile in profiles.flatten() {
+            let path = profile.path().join("global-messages-db.sqlite");
+            if path.is_file() {
+                databases.push(path);
+            }
+        }
+    }
+
+    databases.sort();
+    databases.dedup();
+    databases
+}
+
+fn load_local_email_entries(email_config: &crate::config::EmailConfig) -> Vec<EmailEntry> {
+    if !email_config.local_mail_enabled {
+        return Vec::new();
+    }
+
+    let roots = local_email_roots(email_config);
+    load_local_email_entries_from_roots(&roots)
+}
+
+fn load_local_email_entries_from_roots(roots: &[PathBuf]) -> Vec<EmailEntry> {
+    if roots.is_empty() {
+        return Vec::new();
+    }
+
+    let mut entries = Vec::new();
+    for root in roots {
+        collect_local_email_entries(root, &mut entries);
+    }
+
+    entries.sort_by(|left, right| {
+        right
+            .date_label
+            .cmp(&left.date_label)
+            .then_with(|| left.subject.cmp(&right.subject))
+    });
+    entries.truncate(MAX_EMAIL * 8);
+    entries
+}
+
+fn local_email_roots(_email_config: &crate::config::EmailConfig) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        roots.extend([
+            home.join("Maildir"),
+            home.join(".local/share/mail"),
+            home.join(".mail"),
+            home.join("Mail"),
+        ]);
+    }
+
+    roots.retain(|path| path.exists());
+    roots
+}
+
+pub(crate) fn evolution_helper_command(
+    email_config: &crate::config::EmailConfig,
+) -> Option<Vec<String>> {
+    let command = email_config
+        .evolution_helper_command
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(parse_command_line)
+        .and_then(std::result::Result::ok)
+        .or_else(|| {
+            if command_exists("luma-mail-eds") {
+                Some(vec!["luma-mail-eds".to_string()])
+            } else {
+                None
+            }
+        })?;
+
+    Some(command)
+}
+
+fn search_evolution_email_entries(
+    query: &QueryInput,
+    now: u64,
+    email_config: &crate::config::EmailConfig,
+    seen_open_urls: &mut HashSet<String>,
+) -> Vec<ResultItem> {
+    let Some(command) = evolution_helper_command(email_config) else {
+        return Vec::new();
+    };
+
+    let Some(response) = run_mail_helper_search(
+        &command,
+        &query.text,
+        MAX_EMAIL * 2,
+        email_config.evolution_helper_timeout_ms,
+    ) else {
+        return Vec::new();
+    };
+
+    if !response.ok {
+        return Vec::new();
+    }
+
+    response
+        .results
+        .into_iter()
+        .filter_map(|summary| {
+            let entry = evolution_summary_to_entry(summary, now)?;
+            if !seen_open_urls.insert(entry.open_url.clone()) {
+                return None;
+            }
+            let score = score_text(&entry.search_blob, &query.text)?;
+            Some((entry, score))
+        })
+        .flat_map(|(entry, score)| {
+            email_result_items(
+                &entry,
+                score
+                    + EMAIL_BASE_SCORE
+                    + email_backend_bonus(email_config.preferred_backend, EmailBackend::Evolution),
+                query.mode == SearchMode::Email,
+            )
+        })
+        .collect()
+}
+
+fn evolution_summary_to_entry(summary: MailEdsMessageSummary, now: u64) -> Option<EmailEntry> {
+    let open_url = evolution_helper_action_url("open", &summary.message_id);
+    let reply_url = summary
+        .replyable
+        .then(|| evolution_helper_action_url("reply", &summary.message_id));
+    let compose_url = summary
+        .composable
+        .then(|| evolution_helper_action_url("compose", &summary.message_id));
+    let sender = if summary.sender.trim().is_empty() {
+        summary
+            .sender_email
+            .as_ref()
+            .map(|value| format!("Sender <{value}>"))
+            .unwrap_or_else(|| "Unknown sender".to_string())
+    } else {
+        summary.sender
+    };
+    let folder = if summary.folder_uri.trim().is_empty() {
+        "Mail".to_string()
+    } else {
+        folder_label_from_uri(&summary.folder_uri)
+    };
+    let search_blob = format!(
+        "{} {} {} {}",
+        summary.subject, sender, folder, summary.snippet
+    )
+    .to_ascii_lowercase();
+    let date_label = if summary.date_label.trim().is_empty() {
+        email_date_label(now.saturating_sub(1), now)
+    } else {
+        summary.date_label
+    };
+
+    Some(EmailEntry {
+        subject: summary.subject,
+        sender,
+        sender_email: summary.sender_email,
+        folder,
+        date_label,
+        open_url,
+        reply_url,
+        compose_url,
+        search_blob,
+    })
+}
+
+fn folder_label_from_uri(folder_uri: &str) -> String {
+    folder_uri
+        .rsplit('/')
+        .next()
+        .filter(|label| !label.trim().is_empty())
+        .unwrap_or(folder_uri)
+        .to_string()
+}
+
+fn evolution_helper_action_url(action: &str, message_id: &str) -> String {
+    format!(
+        "luma-mail-eds://{}?message_id={}",
+        action,
+        urlencoding::encode(message_id)
+    )
+}
+
+fn parse_command_line(command: &str) -> std::result::Result<Vec<String>, std::io::Error> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut escape = false;
+
+    for ch in command.chars() {
+        if escape {
+            current.push(ch);
+            escape = false;
+            continue;
+        }
+
+        match ch {
+            '\\' => escape = true,
+            '"' => in_quotes = !in_quotes,
+            ch if ch.is_whitespace() && !in_quotes => {
+                if !current.is_empty() {
+                    args.push(current.clone());
+                    current.clear();
+                }
+            }
+            ch => current.push(ch),
+        }
+    }
+
+    if escape || in_quotes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "unterminated quoted command",
+        ));
+    }
+
+    if !current.is_empty() {
+        args.push(current);
+    }
+
+    if args.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "empty helper command",
+        ));
+    }
+
+    Ok(args)
+}
+
+fn run_mail_helper_search(
+    command: &[String],
+    query: &str,
+    limit: usize,
+    timeout_ms: u64,
+) -> Option<MailEdsSearchResponse> {
+    let mut cmd = Command::new(command.first()?);
+    if command.len() > 1 {
+        cmd.args(&command[1..]);
+    }
+    cmd.args(["search", "--query", query, "--limit", &limit.to_string()]);
+
+    let output = run_command_with_timeout(cmd, timeout_ms).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    serde_json::from_slice::<MailEdsSearchResponse>(&output.stdout).ok()
+}
+
+pub(crate) fn run_mail_helper_action(
+    command: &[String],
+    subcommand: &str,
+    message_id: &str,
+    timeout_ms: u64,
+) -> Result<()> {
+    let mut cmd = Command::new(command.first().context("missing mail helper command")?);
+    if command.len() > 1 {
+        cmd.args(&command[1..]);
+    }
+    cmd.args([subcommand, "--message-id", message_id]);
+
+    let output = run_command_with_timeout(cmd, timeout_ms)
+        .with_context(|| format!("failed to run mail helper {subcommand}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let message = stderr.trim().to_string();
+        let message = if message.is_empty() {
+            stdout.trim().to_string()
+        } else {
+            message
+        };
+        let message = if message.is_empty() {
+            format!("mail helper {subcommand} failed")
+        } else {
+            message
+        };
+        return Err(anyhow::anyhow!("{message}"));
+    }
+
+    Ok(())
+}
+
+fn run_command_with_timeout(
+    mut command: Command,
+    timeout_ms: u64,
+) -> std::io::Result<std::process::Output> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
+
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output();
+        }
+
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "mail helper timed out",
+            ));
+        }
+
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn collect_local_email_entries(root: &Path, entries: &mut Vec<EmailEntry>) {
+    let Ok(metadata) = fs::metadata(root) else {
+        return;
+    };
+
+    if metadata.is_file() {
+        if let Some(entry) = parse_local_email_file(root) {
+            entries.push(entry);
+        }
+        return;
+    }
+
+    let Ok(children) = fs::read_dir(root) else {
+        return;
+    };
+
+    for child in children.flatten() {
+        let path = child.path();
+        if path.is_dir() {
+            let dir_name = path
+                .file_name()
+                .and_then(|part| part.to_str())
+                .unwrap_or("");
+            if matches!(dir_name, "cur" | "new") {
+                collect_maildir_messages(&path, entries);
+            } else {
+                collect_local_email_entries(&path, entries);
+            }
+        } else if path.is_file() {
+            if path.extension().and_then(|part| part.to_str()) == Some("eml") {
+                if let Some(entry) = parse_local_email_file(&path) {
+                    entries.push(entry);
+                }
+            }
+        }
+    }
+}
+
+fn collect_maildir_messages(root: &Path, entries: &mut Vec<EmailEntry>) {
+    let Ok(children) = fs::read_dir(root) else {
+        return;
+    };
+
+    for child in children.flatten() {
+        let path = child.path();
+        if path.is_file()
+            && let Some(entry) = parse_local_email_file(&path)
+        {
+            entries.push(entry);
+        }
+    }
+}
+
+fn parse_local_email_file(path: &Path) -> Option<EmailEntry> {
+    let contents = fs::read_to_string(path).ok()?;
+    let (headers, body) = split_email_headers_and_body(&contents)?;
+    let subject = header_value(headers, "subject").unwrap_or_else(|| "(no subject)".to_string());
+    let sender = header_value(headers, "from")
+        .or_else(|| header_value(headers, "sender"))
+        .unwrap_or_else(|| "Unknown sender".to_string());
+    let sender_email = extract_email_address(&sender);
+    let folder = path
+        .parent()
+        .and_then(
+            |parent| match parent.file_name().and_then(|part| part.to_str()) {
+                Some("cur") | Some("new") => parent
+                    .parent()
+                    .and_then(|grandparent| grandparent.file_name())
+                    .and_then(|part| part.to_str())
+                    .map(|part| part.to_string()),
+                _ => parent
+                    .file_name()
+                    .and_then(|part| part.to_str())
+                    .map(|part| part.to_string()),
+            },
+        )
+        .unwrap_or_else(|| "Mail".to_string());
+    let date_label = header_value(headers, "date")
+        .map(|date| date.split('(').next().unwrap_or(&date).trim().to_string())
+        .unwrap_or_default();
+    let search_blob = format!("{subject} {sender} {folder} {body}").to_ascii_lowercase();
+    let open_url = gio::File::for_path(path).uri();
+
+    Some(EmailEntry {
+        subject,
+        sender,
+        sender_email,
+        folder,
+        date_label,
+        open_url: open_url.to_string(),
+        reply_url: None,
+        compose_url: None,
+        search_blob,
+    })
+}
+
+fn split_email_headers_and_body(raw: &str) -> Option<(&str, &str)> {
+    if let Some(boundary) = raw.find("\r\n\r\n") {
+        return Some((&raw[..boundary], &raw[boundary + 4..]));
+    }
+
+    let boundary = raw.find("\n\n")?;
+    Some((&raw[..boundary], &raw[boundary + 2..]))
 }
 
 fn parse_chromium_bookmarks_json(raw: &str) -> Vec<BookmarkEntry> {
@@ -1781,10 +3112,19 @@ fn parse_xbel_timestamp(raw: &str) -> Option<i64> {
     digits.parse().ok()
 }
 
-fn password_store_dir() -> Option<PathBuf> {
-    env::var_os("PASSWORD_STORE_DIR")
+fn password_store_dir(config: &LauncherConfig) -> Option<PathBuf> {
+    config
+        .integrations
+        .password_store_dir
+        .as_ref()
+        .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("PASSWORD_STORE_DIR")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
         .or_else(|| dirs::home_dir().map(|home| home.join(".password-store")))
         .filter(|path| path.is_dir())
 }
@@ -1826,14 +3166,15 @@ fn parse_file_search_line(line: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppEntry, BookmarkEntry, FileSearchBackend, RecentFileEntry, Sources, no_results_item,
+        AppEntry, BookmarkEntry, EmailEntry, FileSearchBackend, RecentFileEntry, Sources,
+        append_deferred_results, email_result_items, no_results_item,
         parse_chromium_bookmarks_json, parse_file_search_line, parse_firefox_bookmark_rows,
         parse_hypr_windows_json, parse_niri_windows_json, parse_recent_files_xbel, pass_entry_name,
-        window_focus_command,
+        thunderbird_database_uri, thunderbird_message_uri, window_focus_command,
     };
     use crate::model::{
-        Action, PasswordOperation, PowerOperation, QueryInput, SearchMode, SourceFilter,
-        WindowFocusTarget,
+        Action, PasswordOperation, PowerOperation, QueryInput, ResultItem, SearchMode,
+        SourceFilter, WindowFocusTarget,
     };
     use crate::prediction::{PredictionStore, StoredPrediction};
     use std::path::Path;
@@ -1853,18 +3194,20 @@ mod tests {
     }
 
     fn empty_sources() -> Sources {
-        Sources {
-            apps: Vec::new(),
-            ssh_hosts: Vec::new(),
-            pass_entries: pass_entries(Vec::new()),
-            commands: Vec::new(),
-            bookmarks: Vec::new(),
-            recent_files: Vec::new(),
-            file_search_backend: None,
-            pass_available: false,
-            qalc_available: false,
-            predictions: empty_prediction_store(),
-        }
+        let mut sources = Sources::with_config(crate::config::LauncherConfig::default());
+        sources.apps = Vec::new();
+        sources.ssh_hosts = Vec::new();
+        sources.pass_entries = pass_entries(Vec::new());
+        sources.commands = Vec::new();
+        sources.bookmarks = Vec::new();
+        sources.recent_files = Vec::new();
+        sources.thunderbird_email_database_paths = Vec::new();
+        sources.local_email_entries = Vec::new();
+        sources.file_search_backend = None;
+        sources.pass_available = false;
+        sources.qalc_available = false;
+        sources.predictions = empty_prediction_store();
+        sources
     }
 
     fn pass_entries(entries: Vec<super::PassEntry>) -> Arc<Mutex<Vec<super::PassEntry>>> {
@@ -1877,6 +3220,228 @@ mod tests {
         assert_eq!(
             parse_file_search_line(line).as_deref(),
             Some("/tmp/with space#hash.txt")
+        );
+    }
+
+    #[test]
+    fn thunderbird_message_uris_keep_the_folder_uri() {
+        assert_eq!(
+            thunderbird_message_uri("imap://example.com/INBOX", 123),
+            "imap-message://imap://example.com/INBOX#123"
+        );
+        assert_eq!(
+            thunderbird_message_uri("mailbox://Local%20Folders/Sent", 77),
+            "mailbox-message://mailbox://Local%20Folders/Sent#77"
+        );
+    }
+
+    #[test]
+    fn thunderbird_database_uri_uses_immutable_file_reads() {
+        let uri = thunderbird_database_uri(Path::new("/tmp/global-messages-db.sqlite"));
+        assert_eq!(uri, "file:/tmp/global-messages-db.sqlite?immutable=1");
+    }
+
+    #[test]
+    fn email_result_items_offer_open_reply_compose_and_copy_actions() {
+        let entry = EmailEntry {
+            subject: "Quarterly update".to_string(),
+            sender: "Robin <robin@example.com>".to_string(),
+            sender_email: Some("robin@example.com".to_string()),
+            folder: "INBOX".to_string(),
+            date_label: "2h ago".to_string(),
+            open_url: "imap-message://imap://example.com/INBOX#123".to_string(),
+            reply_url: None,
+            compose_url: None,
+            search_blob: "quarterly update robin inbox".to_string(),
+        };
+
+        let items = email_result_items(&entry, 100, true);
+        assert_eq!(items.len(), 4);
+        assert!(matches!(items[0].action, Action::OpenUrl { .. }));
+        assert!(matches!(items[1].action, Action::OpenUrl { .. }));
+        assert!(matches!(items[2].action, Action::OpenUrl { .. }));
+        assert!(matches!(items[3].action, Action::CopyText { .. }));
+    }
+
+    #[test]
+    fn email_search_returns_rows_for_matching_local_entries() {
+        let mut sources = empty_sources();
+        sources.local_email_entries = vec![EmailEntry {
+            subject: "Quarterly update".to_string(),
+            sender: "Robin <robin@example.com>".to_string(),
+            sender_email: Some("robin@example.com".to_string()),
+            folder: "INBOX".to_string(),
+            date_label: "2h ago".to_string(),
+            open_url: "imap-message://imap://example.com/INBOX#123".to_string(),
+            reply_url: None,
+            compose_url: None,
+            search_blob: "quarterly update robin inbox".to_string(),
+        }];
+
+        let query = QueryInput::parse("mail: quarterly", SearchMode::All);
+        let results = sources.search_email(&query, 1_700_000_000);
+
+        assert!(
+            results
+                .iter()
+                .any(|item| item.title == "Open email: Quarterly update")
+        );
+        assert!(
+            results
+                .iter()
+                .any(|item| item.title == "Reply to Robin <robin@example.com>")
+        );
+        assert!(
+            results
+                .iter()
+                .any(|item| item.title == "Compose to Robin <robin@example.com>")
+        );
+        assert!(
+            results
+                .iter()
+                .any(|item| item.title == "Copy sender: robin@example.com")
+        );
+    }
+
+    #[test]
+    fn apps_outrank_strongly_matching_email_in_unified_search() {
+        let mut sources = empty_sources();
+        sources.apps = vec![AppEntry {
+            desktop_id: "report-studio.desktop".to_string(),
+            name: "Report Studio".to_string(),
+            description: "Build reports".to_string(),
+            executable: "report-studio".to_string(),
+            icon_name: "application-x-executable-symbolic".to_string(),
+            search_blob: "report studio".to_string(),
+        }];
+        sources.local_email_entries = vec![EmailEntry {
+            subject: "report".to_string(),
+            sender: "Robin <robin@example.com>".to_string(),
+            sender_email: Some("robin@example.com".to_string()),
+            folder: "INBOX".to_string(),
+            date_label: "2h ago".to_string(),
+            open_url: "imap-message://imap://example.com/INBOX#1".to_string(),
+            reply_url: None,
+            compose_url: None,
+            search_blob: "report".to_string(),
+        }];
+
+        let results = sources.search("report", SearchMode::All);
+
+        let app_index = results
+            .iter()
+            .position(|item| item.source == "Applications")
+            .expect("an application result");
+        let email_index = results
+            .iter()
+            .position(|item| item.source == "Email")
+            .expect("an email result");
+
+        assert!(
+            app_index < email_index,
+            "expected the application to outrank email, got app at {app_index}, email at {email_index}"
+        );
+    }
+
+    #[test]
+    fn entering_a_url_ranks_the_open_url_action_first() {
+        let mut sources = empty_sources();
+        sources.bookmarks = vec![BookmarkEntry {
+            title: "Example".to_string(),
+            url: "https://example.com".to_string(),
+            search_blob: "https://example.com example bookmark".to_string(),
+        }];
+
+        let results = sources.search("https://example.com", SearchMode::All);
+
+        let first = results.first().expect("at least one result");
+        assert_eq!(first.source, "Web");
+        assert!(
+            matches!(&first.action, Action::OpenUrl { url } if url == "https://example.com"),
+            "expected the Open URL action ranked first, got {:?} ({:?})",
+            first.title,
+            first.action
+        );
+    }
+
+    #[test]
+    fn typing_a_bare_domain_ranks_open_url_above_a_matching_bookmark() {
+        let mut sources = empty_sources();
+        sources.bookmarks = vec![BookmarkEntry {
+            title: "Reddit".to_string(),
+            url: "https://reddit.com".to_string(),
+            search_blob: "reddit https://reddit.com reddit.com".to_string(),
+        }];
+
+        let results = sources.search("reddit.com", SearchMode::All);
+
+        let first = results.first().expect("at least one result");
+        assert_eq!(first.source, "Web");
+        assert!(
+            matches!(&first.action, Action::OpenUrl { url } if url == "https://reddit.com"),
+            "expected the Open URL action ranked first, got {:?} ({:?})",
+            first.title,
+            first.action
+        );
+    }
+
+    fn scored_item(source: &'static str, title: &str, score: i32) -> ResultItem {
+        ResultItem {
+            prediction_key: None,
+            title: title.to_string(),
+            subtitle: String::new(),
+            source,
+            icon_name: String::new(),
+            score,
+            action: Action::None,
+        }
+    }
+
+    #[test]
+    fn deferred_results_load_below_immediate_results_without_reordering_them() {
+        let immediate = vec![
+            scored_item("Applications", "Firefox", 1900),
+            scored_item("Web", "Search the web for reddit.com", 120),
+        ];
+        // The email outscores the low web result, but it arrives later and must
+        // load below the already-shown rows so their positions stay stable.
+        let deferred = vec![scored_item("Email", "Open email: reddit signup", 900)];
+
+        let merged = append_deferred_results(immediate, deferred);
+
+        let titles: Vec<&str> = merged.iter().map(|item| item.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec![
+                "Firefox",
+                "Search the web for reddit.com",
+                "Open email: reddit signup",
+            ]
+        );
+    }
+
+    #[test]
+    fn disabling_email_search_removes_email_results() {
+        let config = crate::config::LauncherConfig {
+            sources: crate::config::SourceToggles {
+                email: false,
+                ..crate::config::SourceToggles::default()
+            },
+            ..crate::config::LauncherConfig::default()
+        };
+        let sources = Sources::with_config(config);
+
+        let results = sources.search("mail: github", SearchMode::All);
+
+        assert!(
+            results
+                .iter()
+                .any(|item| item.title == "Email search is disabled")
+        );
+        assert!(
+            results
+                .iter()
+                .all(|item| { item.source != "Email" || item.title == "Email search is disabled" })
         );
     }
 
@@ -2425,6 +3990,53 @@ mod tests {
     }
 
     #[test]
+    fn deferred_search_plans_for_files_and_mail_in_all_mode() {
+        let mut sources = empty_sources();
+        sources.file_search_backend = Some(FileSearchBackend::LocalSearch);
+        sources.local_email_entries = vec![EmailEntry {
+            subject: "Reddit digest".to_string(),
+            sender: "Reddit <noreply@reddit.com>".to_string(),
+            sender_email: Some("noreply@reddit.com".to_string()),
+            folder: "INBOX".to_string(),
+            date_label: "today".to_string(),
+            open_url: "mailbox-message://mailbox://Local Folders/Inbox#1".to_string(),
+            reply_url: None,
+            compose_url: None,
+            search_blob: "reddit digest inbox".to_string(),
+        }];
+
+        let snapshot = sources.search_snapshot("reddit", SearchMode::All, None);
+
+        assert!(snapshot.deferred.files);
+        assert!(snapshot.deferred.email);
+        assert!(
+            snapshot
+                .immediate_results
+                .iter()
+                .all(|item| item.source != "Files" && item.source != "Email")
+        );
+    }
+
+    #[test]
+    fn specific_file_and_email_modes_show_status_rows_when_deferred_search_is_not_used() {
+        let sources = empty_sources();
+
+        let file_snapshot = sources.search_snapshot("a", SearchMode::Files, None);
+        assert!(!file_snapshot.deferred.files);
+        assert_eq!(
+            file_snapshot.immediate_results[0].title,
+            "Keep typing to search files"
+        );
+
+        let email_snapshot = sources.search_snapshot("reddit", SearchMode::Email, None);
+        assert!(!email_snapshot.deferred.email);
+        assert_eq!(
+            email_snapshot.immediate_results[0].title,
+            "No email source found"
+        );
+    }
+
+    #[test]
     fn pass_entry_names_are_derived_from_store_paths() {
         let root = Path::new("/tmp/store");
         let path = Path::new("/tmp/store/personal/github.gpg");
@@ -2458,7 +4070,7 @@ fn looks_like_math(query: &str) -> bool {
         || query.contains(" to ")
 }
 
-fn no_results_item(query: &QueryInput) -> ResultItem {
+pub(crate) fn no_results_item(query: &QueryInput) -> ResultItem {
     let subtitle = match query.source_filter {
         SourceFilter::Bookmarks => "Try a different bookmark title or URL fragment.".to_string(),
         SourceFilter::Recents => "Try a different recently used file name.".to_string(),
@@ -2473,6 +4085,9 @@ fn no_results_item(query: &QueryInput) -> ResultItem {
                 "Check ~/.ssh/config and known_hosts for the expected host.".to_string()
             }
             SearchMode::Pass => "Try a different password-store entry name.".to_string(),
+            SearchMode::Email => {
+                "Try a different subject, sender, folder, or message fragment.".to_string()
+            }
             SearchMode::Commands => {
                 "Try a different executable name or a full shell command.".to_string()
             }
@@ -2502,7 +4117,7 @@ fn sort_results(results: &mut Vec<ResultItem>, limit: usize) {
     results.truncate(limit);
 }
 
-fn finish_search_results(mut results: Vec<ResultItem>, query: &QueryInput) -> Vec<ResultItem> {
+pub(crate) fn sort_and_limit_results(mut results: Vec<ResultItem>) -> Vec<ResultItem> {
     results.sort_by(|left, right| {
         right
             .score
@@ -2510,8 +4125,39 @@ fn finish_search_results(mut results: Vec<ResultItem>, query: &QueryInput) -> Ve
             .then_with(|| left.title.cmp(&right.title))
     });
     results.truncate(24);
-    if results.is_empty() {
+    results
+}
+
+/// Combine already-displayed `immediate` results with `deferred` results that
+/// finished loading later. The immediate block keeps its established order and
+/// the deferred results are sorted among themselves and appended below, so rows
+/// the user is looking at never reflow when slower providers return. The total
+/// is capped at the same limit as a normal search.
+pub(crate) fn append_deferred_results(
+    immediate: Vec<ResultItem>,
+    deferred: Vec<ResultItem>,
+) -> Vec<ResultItem> {
+    let mut results = sort_and_limit_results(immediate);
+    let remaining = 24usize.saturating_sub(results.len());
+    if remaining > 0 {
+        let mut deferred = sort_and_limit_results(deferred);
+        deferred.truncate(remaining);
+        results.extend(deferred);
+    }
+    results
+}
+
+pub(crate) fn finalize_search_results(
+    results: Vec<ResultItem>,
+    query: &QueryInput,
+    include_no_results: bool,
+) -> Vec<ResultItem> {
+    let mut results = sort_and_limit_results(results);
+    if include_no_results && results.is_empty() {
         results.push(no_results_item(query));
+    }
+    if results.is_empty() {
+        return results;
     }
     results
 }
