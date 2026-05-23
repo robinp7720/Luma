@@ -119,14 +119,9 @@ impl PredictionStore {
         entries
             .into_iter()
             .take(limit)
-            .map(|entry| ResultItem {
-                title: entry.prediction.title.clone(),
-                subtitle: entry.prediction.subtitle.clone(),
-                source: source_label(&entry.prediction.source),
-                icon_name: entry.prediction.icon_name.clone(),
-                score: 2_000 + self.boost_for_key(&entry.prediction.key, now),
-                action: entry.prediction.action.clone(),
-                prediction_key: Some(entry.prediction.key.clone()),
+            .map(|entry| {
+                let score = 2_000 + self.boost_for_key(&entry.prediction.key, now);
+                prediction_result_item(&entry.prediction, score)
             })
             .collect()
     }
@@ -161,6 +156,36 @@ impl PredictionStore {
     }
 }
 
+fn prediction_result_item(prediction: &StoredPrediction, score: i32) -> ResultItem {
+    if let Some(entry) = prediction
+        .key
+        .strip_prefix("pass:")
+        .filter(|entry| !entry.is_empty())
+    {
+        return ResultItem {
+            title: entry.to_string(),
+            subtitle: "Open password actions".to_string(),
+            source: "Passwords",
+            icon_name: "dialog-password-symbolic".to_string(),
+            score,
+            action: Action::PasswordActions {
+                entry: entry.to_string(),
+            },
+            prediction_key: Some(prediction.key.clone()),
+        };
+    }
+
+    ResultItem {
+        title: prediction.title.clone(),
+        subtitle: prediction.subtitle.clone(),
+        source: source_label(&prediction.source),
+        icon_name: prediction.icon_name.clone(),
+        score,
+        action: prediction.action.clone(),
+        prediction_key: Some(prediction.key.clone()),
+    }
+}
+
 fn source_label(source: &str) -> &'static str {
     match source {
         "Applications" => "Applications",
@@ -188,7 +213,7 @@ fn prediction_state_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{PredictionStore, StoredPrediction};
-    use crate::model::Action;
+    use crate::model::{Action, PasswordOperation};
     use std::fs;
 
     fn temp_history_path(name: &str) -> std::path::PathBuf {
@@ -325,6 +350,36 @@ mod tests {
         assert_eq!(results[0].title, "Firefox");
         assert_eq!(results[0].source, "Applications");
         assert!(matches!(results[0].action, Action::LaunchApp { .. }));
+    }
+
+    #[test]
+    fn top_predictions_normalize_password_history_to_action_menus() {
+        let mut store = PredictionStore::disabled();
+        store
+            .record(
+                StoredPrediction {
+                    key: "pass:github/work".to_string(),
+                    title: "Autotype login: github/work".to_string(),
+                    subtitle: "Type username, Tab, and password without submitting".to_string(),
+                    source: "Passwords".to_string(),
+                    icon_name: "dialog-password-symbolic".to_string(),
+                    action: Action::Password {
+                        entry: "github/work".to_string(),
+                        operation: PasswordOperation::AutotypeLogin,
+                    },
+                },
+                1_000,
+            )
+            .expect("record prediction");
+
+        let results = store.top_results(10, 1_100);
+
+        assert_eq!(results[0].title, "github/work");
+        assert_eq!(results[0].subtitle, "Open password actions");
+        assert!(matches!(
+            &results[0].action,
+            Action::PasswordActions { entry } if entry == "github/work"
+        ));
     }
 
     #[test]

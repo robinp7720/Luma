@@ -93,6 +93,9 @@ pub enum Action {
         entry: String,
         operation: PasswordOperation,
     },
+    PasswordActions {
+        entry: String,
+    },
     AddPassword {
         entry: String,
         url: Option<String>,

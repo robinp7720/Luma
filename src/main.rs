@@ -18,7 +18,8 @@ use crate::password::{
 use crate::settings::open_config_panel;
 use crate::sources::{
     SearchSnapshot, Sources, append_deferred_results, evolution_helper_command, focus_window,
-    focused_window_target, no_results_item, run_mail_helper_action, sort_and_limit_results,
+    focused_window_target, no_results_item, pass_prediction_key, run_mail_helper_action,
+    sort_and_limit_results,
 };
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -970,6 +971,23 @@ fn activate_item(
         return;
     }
 
+    if let Action::PasswordActions { entry } = &item.action {
+        match load_pass_credential(entry) {
+            Ok(credential) => {
+                let results = inspected_password_results(&credential);
+                rebuild_results(list, scroller, &results, None);
+                current_results.replace(results);
+            }
+            Err(error) => show_status_result(
+                list,
+                scroller,
+                current_results,
+                action_failure_result(&error.root_cause().to_string()),
+            ),
+        }
+        return;
+    }
+
     if let Action::AddPassword { entry, url } = &item.action {
         start_add_password_flow(
             entry_widget,
@@ -1255,6 +1273,9 @@ fn execute_action(
         Action::Password { entry, operation } => {
             execute_password_operation(window, &entry, operation, previous_focus_target)?;
             return Ok(());
+        }
+        Action::PasswordActions { .. } => {
+            anyhow::bail!("password action menu must open from the launcher UI");
         }
         Action::AddPassword { .. } => {
             anyhow::bail!("password creation must start from the launcher UI");
@@ -1827,6 +1848,7 @@ fn inspected_password_results(credential: &Credential) -> Vec<ResultItem> {
             "Type username, Tab, and password without submitting",
             PasswordOperation::AutotypeLogin,
             1_000,
+            Some(pass_prediction_key(&credential.entry)),
         ),
         password_action_result(
             &credential.entry,
@@ -1834,6 +1856,7 @@ fn inspected_password_results(credential: &Credential) -> Vec<ResultItem> {
             "Copy password and clear it after the password-store timeout",
             PasswordOperation::CopyPassword,
             950,
+            None,
         ),
         password_action_result(
             &credential.entry,
@@ -1841,6 +1864,7 @@ fn inspected_password_results(credential: &Credential) -> Vec<ResultItem> {
             "Copy username metadata or the entry basename",
             PasswordOperation::CopyUsername,
             940,
+            None,
         ),
         password_action_result(
             &credential.entry,
@@ -1848,6 +1872,7 @@ fn inspected_password_results(credential: &Credential) -> Vec<ResultItem> {
             "Type only the password into the focused window",
             PasswordOperation::TypePassword,
             930,
+            None,
         ),
         password_action_result(
             &credential.entry,
@@ -1855,6 +1880,7 @@ fn inspected_password_results(credential: &Credential) -> Vec<ResultItem> {
             "Type only the username into the focused window",
             PasswordOperation::TypeUsername,
             920,
+            None,
         ),
     ];
 
@@ -1865,6 +1891,7 @@ fn inspected_password_results(credential: &Credential) -> Vec<ResultItem> {
             "Open this entry's URL in the default browser",
             PasswordOperation::OpenUrl,
             910,
+            None,
         ));
         rows.push(password_action_result(
             &credential.entry,
@@ -1872,6 +1899,7 @@ fn inspected_password_results(credential: &Credential) -> Vec<ResultItem> {
             "Copy this entry's URL",
             PasswordOperation::CopyUrl,
             900,
+            None,
         ));
     }
 
@@ -1882,6 +1910,7 @@ fn inspected_password_results(credential: &Credential) -> Vec<ResultItem> {
             "Generate and copy a one-time password with pass-otp",
             PasswordOperation::CopyOtp,
             890,
+            None,
         ));
         rows.push(password_action_result(
             &credential.entry,
@@ -1889,6 +1918,7 @@ fn inspected_password_results(credential: &Credential) -> Vec<ResultItem> {
             "Generate and type a one-time password with pass-otp",
             PasswordOperation::TypeOtp,
             880,
+            None,
         ));
     }
 
@@ -1899,6 +1929,7 @@ fn inspected_password_results(credential: &Credential) -> Vec<ResultItem> {
             "Run this entry's autotype template",
             PasswordOperation::CustomAutotype,
             870,
+            None,
         ));
     }
 
@@ -1911,9 +1942,10 @@ fn password_action_result(
     subtitle: &str,
     operation: PasswordOperation,
     score: i32,
+    prediction_key: Option<String>,
 ) -> ResultItem {
     ResultItem {
-        prediction_key: None,
+        prediction_key,
         title: format!("{title}: {entry}"),
         subtitle: subtitle.to_string(),
         source: "Passwords",
@@ -2736,5 +2768,16 @@ mod tests {
         assert!(operations.contains(&PasswordOperation::CopyOtp));
         assert!(operations.contains(&PasswordOperation::TypeOtp));
         assert!(operations.contains(&PasswordOperation::CustomAutotype));
+    }
+
+    #[test]
+    fn inspected_password_results_records_autotype_against_entry_prediction_key() {
+        let credential =
+            parse_credential("github/work", "secret\nuser: robin\n").expect("credential");
+
+        let rows = inspected_password_results(&credential);
+
+        assert_eq!(rows[0].title, "Autotype login: github/work");
+        assert_eq!(rows[0].prediction_key.as_deref(), Some("pass:github/work"));
     }
 }

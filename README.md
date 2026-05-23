@@ -120,16 +120,18 @@ Password entries use the standard `pass` format:
 
 Recognized username keys are `user`, `username`, and `email`. If none of those are present, the entry basename is used.
 
-Password results expose native actions for:
+Password search shows one row per matching entry. Selecting a password entry opens a focused action menu with:
 
 - Autotype
 - Copy password
 - Copy username
 - Type password
 - Type username
-- Inspect metadata
+- Open or copy URL metadata when present
+- Copy or type OTP when `pass-otp` metadata is present
+- Custom autotype when an entry defines an autotype template
 
-Pressing Enter on a password result autotypes username, Tab, and password into the previously focused window without submitting the form.
+Choosing Autotype types username, Tab, and password into the previously focused window without submitting the form.
 
 ## Email Workflow
 
@@ -173,7 +175,7 @@ Control rows expose local desktop actions for:
 - Desktop controls are best-effort and only show rows for tools available on the current system. Notification-history result rows are searchable but are not stored in prediction history.
 - Password search reads entry names from `PASSWORD_STORE_DIR` or `~/.password-store`.
 - Autotype uses `wtype` on Wayland and `xdotool` on X11. Copying uses `wl-copy` on Wayland and `xclip` on X11, with secrets passed through stdin.
-- URL, OTP, and custom autotype rows appear after choosing the inspect action for an entry. OTP actions require `pass-otp`.
+- URL, OTP, and custom autotype rows appear in the focused action menu when the entry contains matching metadata. OTP actions require `pass-otp`.
 - Copied password data expires after `PASSWORD_STORE_CLIP_TIME` seconds, defaulting to 15 seconds.
 - Web search defaults to DuckDuckGo. Override it with `DOT_LAUNCHER_SEARCH_URL`.
 - SSH sessions launch through `~/.dotfiles/scripts/launch_kitty.sh -e ssh <host>`.

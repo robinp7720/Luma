@@ -1,8 +1,8 @@
 use crate::config::{ConfigStore, EmailBackendPreference, FileSearchBackendChoice, LauncherConfig};
 use crate::mail_eds_protocol::{MailEdsMessageSummary, MailEdsSearchResponse};
 use crate::model::{
-    Action, DesktopControlOperation, PasswordOperation, PowerOperation, QueryInput, ResultItem,
-    SearchMode, SourceFilter, WindowFocusTarget, browser_target, password_url_draft, score_text,
+    Action, DesktopControlOperation, PowerOperation, QueryInput, ResultItem, SearchMode,
+    SourceFilter, WindowFocusTarget, browser_target, password_url_draft, score_text,
 };
 use crate::prediction::{PredictionStore, StoredPrediction};
 use anyhow::{Context, Result};
@@ -1122,11 +1122,7 @@ impl Sources {
             };
             let prediction_key = pass_prediction_key(&entry.name);
             let boosted_score = score + 880 + self.prediction_boost(&prediction_key, now);
-            items.extend(password_action_results(
-                &entry.name,
-                boosted_score,
-                query.mode == SearchMode::Pass,
-            ));
+            items.push(password_entry_result(&entry.name, boosted_score));
         }
 
         sort_results(&mut items, MAX_PASS);
@@ -1999,7 +1995,7 @@ fn ssh_prediction_key(host: &str) -> String {
     format!("ssh:{host}")
 }
 
-fn pass_prediction_key(entry: &str) -> String {
+pub(crate) fn pass_prediction_key(entry: &str) -> String {
     format!("pass:{entry}")
 }
 
@@ -2289,82 +2285,16 @@ fn sql_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-fn password_action_results(entry: &str, score: i32, include_secondary: bool) -> Vec<ResultItem> {
-    let mut rows = vec![password_action_result(
-        entry,
-        "Autotype login",
-        "Type username, Tab, and password without submitting",
-        PasswordOperation::AutotypeLogin,
-        score + 80,
-        Some(pass_prediction_key(entry)),
-    )];
-
-    if include_secondary {
-        rows.extend([
-            password_action_result(
-                entry,
-                "Copy password",
-                "Copy password and clear it after the password-store timeout",
-                PasswordOperation::CopyPassword,
-                score + 50,
-                None,
-            ),
-            password_action_result(
-                entry,
-                "Copy username",
-                "Copy username metadata or the entry basename",
-                PasswordOperation::CopyUsername,
-                score + 45,
-                None,
-            ),
-            password_action_result(
-                entry,
-                "Type password",
-                "Type only the password into the focused window",
-                PasswordOperation::TypePassword,
-                score + 40,
-                None,
-            ),
-            password_action_result(
-                entry,
-                "Type username",
-                "Type only the username into the focused window",
-                PasswordOperation::TypeUsername,
-                score + 35,
-                None,
-            ),
-            password_action_result(
-                entry,
-                "Inspect actions",
-                "Decrypt this entry to show URL, OTP, and custom actions",
-                PasswordOperation::Inspect,
-                score + 30,
-                None,
-            ),
-        ]);
-    }
-
-    rows
-}
-
-fn password_action_result(
-    entry: &str,
-    title: &str,
-    subtitle: &str,
-    operation: PasswordOperation,
-    score: i32,
-    prediction_key: Option<String>,
-) -> ResultItem {
+fn password_entry_result(entry: &str, score: i32) -> ResultItem {
     ResultItem {
-        prediction_key,
-        title: format!("{title}: {entry}"),
-        subtitle: subtitle.to_string(),
+        prediction_key: Some(pass_prediction_key(entry)),
+        title: entry.to_string(),
+        subtitle: "Open password actions".to_string(),
         source: "Passwords",
         icon_name: "dialog-password-symbolic".to_string(),
         score,
-        action: Action::Password {
+        action: Action::PasswordActions {
             entry: entry.to_string(),
-            operation,
         },
     }
 }
@@ -3770,8 +3700,8 @@ mod tests {
         thunderbird_database_uri, thunderbird_message_uri, window_focus_command,
     };
     use crate::model::{
-        Action, DesktopControlOperation, PasswordOperation, PowerOperation, QueryInput, ResultItem,
-        SearchMode, SourceFilter, WindowFocusTarget,
+        Action, DesktopControlOperation, PowerOperation, QueryInput, ResultItem, SearchMode,
+        SourceFilter, WindowFocusTarget,
     };
     use crate::prediction::{PredictionStore, StoredPrediction};
     use std::path::Path;
@@ -4363,7 +4293,7 @@ mod tests {
     }
 
     #[test]
-    fn all_mode_password_matches_default_to_autotype_login() {
+    fn all_mode_password_matches_open_password_actions() {
         let sources = Sources {
             pass_entries: pass_entries(vec![super::PassEntry {
                 name: "github/work".to_string(),
@@ -4376,15 +4306,16 @@ mod tests {
         let results = sources.search("pass: github", SearchMode::All);
         assert!(matches!(
             results.first().map(|item| &item.action),
-            Some(Action::Password {
-                entry,
-                operation: PasswordOperation::AutotypeLogin,
-            }) if entry == "github/work"
+            Some(Action::PasswordActions { entry }) if entry == "github/work"
         ));
+        assert_eq!(
+            results[0].prediction_key.as_deref(),
+            Some("pass:github/work")
+        );
     }
 
     #[test]
-    fn pass_mode_surfaces_action_rows_for_matching_entries() {
+    fn pass_mode_surfaces_one_row_per_matching_entry() {
         let sources = Sources {
             pass_entries: pass_entries(vec![super::PassEntry {
                 name: "github/work".to_string(),
@@ -4395,20 +4326,20 @@ mod tests {
         };
 
         let results = sources.search("pass: github", SearchMode::All);
-        let operations = results
+        let password_rows = results
             .iter()
             .filter_map(|item| match &item.action {
-                Action::Password { operation, .. } => Some(operation),
+                Action::PasswordActions { entry } => Some(entry.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>();
 
-        assert!(operations.contains(&&PasswordOperation::AutotypeLogin));
-        assert!(operations.contains(&&PasswordOperation::CopyPassword));
-        assert!(operations.contains(&&PasswordOperation::CopyUsername));
-        assert!(operations.contains(&&PasswordOperation::TypePassword));
-        assert!(operations.contains(&&PasswordOperation::TypeUsername));
-        assert!(operations.contains(&&PasswordOperation::Inspect));
+        assert_eq!(password_rows, vec!["github/work"]);
+        assert!(
+            !results
+                .iter()
+                .any(|item| matches!(item.action, Action::Password { .. }))
+        );
     }
 
     #[test]
