@@ -54,15 +54,6 @@ impl DeferredSearchPlan {
     pub fn is_empty(self) -> bool {
         !self.files && !self.email
     }
-
-    pub fn loading_label(self) -> &'static str {
-        match (self.files, self.email) {
-            (true, true) => "Searching files and mail…",
-            (true, false) => "Searching files…",
-            (false, true) => "Searching mail…",
-            (false, false) => "Searching…",
-        }
-    }
 }
 
 #[derive(Clone, Debug)]

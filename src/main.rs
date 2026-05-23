@@ -29,7 +29,7 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
     Align, Application, ApplicationWindow, Box as GtkBox, Entry, EventControllerKey, Image, Label,
-    ListBox, ListBoxRow, Orientation, ScrolledWindow, SelectionMode,
+    ListBox, ListBoxRow, Orientation, Overlay, ScrolledWindow, SelectionMode, Spinner,
 };
 use gtk4_layer_shell::LayerShell;
 use std::cell::Cell;
@@ -83,6 +83,7 @@ const DEFERRED_SEARCH_IDLE_DELAY_MS: u64 = 180;
 #[derive(Clone)]
 struct SearchController {
     entry: Entry,
+    spinner: Spinner,
     sources: Arc<Sources>,
     list: ListBox,
     scroller: ScrolledWindow,
@@ -104,13 +105,21 @@ struct SearchAsyncState {
 #[derive(Debug)]
 struct SearchUpdate {
     generation: u64,
+    phase: SearchUpdatePhase,
     snapshot: SearchSnapshot,
     deferred_results: Vec<ResultItem>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SearchUpdatePhase {
+    Immediate,
+    Deferred,
 }
 
 impl SearchController {
     fn new(
         entry: Entry,
+        spinner: Spinner,
         sources: Arc<Sources>,
         list: ListBox,
         scroller: ScrolledWindow,
@@ -122,6 +131,7 @@ impl SearchController {
         let (update_tx, update_rx) = std::sync::mpsc::channel();
         Self {
             entry,
+            spinner,
             sources,
             list,
             scroller,
@@ -151,7 +161,7 @@ impl SearchController {
         let query = self.entry.text().to_string();
         let clipboard_url = self.clipboard_url.borrow().clone();
         let generation = self.bump_generation();
-        self.render_results(vec![loading_result("Searching…")]);
+        set_background_processing(&self.spinner, true);
 
         let sources = self.sources.clone();
         let tx = self.update_tx.clone();
@@ -160,6 +170,7 @@ impl SearchController {
             let snapshot = sources.search_snapshot(&query, mode, clipboard_url.as_deref());
             let _ = tx.send(SearchUpdate {
                 generation,
+                phase: SearchUpdatePhase::Immediate,
                 snapshot,
                 deferred_results: Vec::new(),
             });
@@ -204,6 +215,7 @@ impl SearchController {
                     let deferred_results = sources.search_deferred_results(&snapshot);
                     let _ = tx.send(SearchUpdate {
                         generation,
+                        phase: SearchUpdatePhase::Deferred,
                         snapshot,
                         deferred_results,
                     });
@@ -216,6 +228,7 @@ impl SearchController {
     fn apply_deferred_results(&self, update: SearchUpdate) {
         let SearchUpdate {
             generation,
+            phase,
             snapshot,
             deferred_results,
         } = update;
@@ -224,14 +237,18 @@ impl SearchController {
             return;
         }
 
-        if deferred_results.is_empty() {
-            let mut results = snapshot.immediate_results.clone();
+        set_background_processing(
+            &self.spinner,
+            background_processing_after_update(phase, !snapshot.deferred.is_empty()),
+        );
+
+        if phase == SearchUpdatePhase::Immediate {
+            let results = snapshot.immediate_results.clone();
             if snapshot.deferred.is_empty() {
                 let results = finalize_loaded_results(results, &snapshot.query);
                 self.render_results(results);
             } else {
-                results.push(loading_result(snapshot.deferred.loading_label()));
-                let results = sort_and_limit_results(results);
+                let results = pending_deferred_results(results);
                 self.render_results(results);
                 self.schedule_deferred(snapshot, generation);
             }
@@ -419,6 +436,18 @@ fn build_ui(
         entry.set_text(query);
     }
 
+    let entry_overlay = Overlay::new();
+    entry_overlay.set_child(Some(&entry));
+    let search_spinner = Spinner::builder()
+        .halign(Align::End)
+        .valign(Align::Center)
+        .margin_end(14)
+        .build();
+    search_spinner.add_css_class("launcher-search-spinner");
+    search_spinner.set_visible(false);
+    search_spinner.set_tooltip_text(Some("Background search is still running"));
+    entry_overlay.add_overlay(&search_spinner);
+
     let list = ListBox::new();
     list.set_selection_mode(SelectionMode::Single);
     list.add_css_class("launcher-results");
@@ -430,7 +459,7 @@ fn build_ui(
         .build();
     scroller.add_css_class("launcher-scroller");
 
-    outer.append(&entry);
+    outer.append(&entry_overlay);
     outer.append(&scroller);
     window.set_child(Some(&outer));
 
@@ -439,6 +468,7 @@ fn build_ui(
     let clipboard_url = Rc::new(RefCell::new(None::<String>));
     let search = SearchController::new(
         entry.clone(),
+        search_spinner.clone(),
         sources.clone(),
         list.clone(),
         scroller.clone(),
@@ -773,24 +803,29 @@ fn rebuild_results(
     }
 }
 
-fn loading_result(title: &str) -> ResultItem {
-    ResultItem {
-        prediction_key: None,
-        title: title.to_string(),
-        subtitle: "Running slower providers in the background".to_string(),
-        source: "Status",
-        icon_name: "system-search-symbolic".to_string(),
-        score: -10_000,
-        action: Action::None,
-    }
-}
-
 fn finalize_loaded_results(results: Vec<ResultItem>, query: &QueryInput) -> Vec<ResultItem> {
     let mut results = sort_and_limit_results(results);
     if results.is_empty() {
         results.push(no_results_item(query));
     }
     results
+}
+
+fn pending_deferred_results(results: Vec<ResultItem>) -> Vec<ResultItem> {
+    sort_and_limit_results(results)
+}
+
+fn background_processing_after_update(phase: SearchUpdatePhase, has_deferred_plan: bool) -> bool {
+    phase == SearchUpdatePhase::Immediate && has_deferred_plan
+}
+
+fn set_background_processing(spinner: &Spinner, active: bool) {
+    spinner.set_visible(active);
+    if active {
+        spinner.start();
+    } else {
+        spinner.stop();
+    }
 }
 
 fn build_row(item: &ResultItem) -> ListBoxRow {
@@ -2243,7 +2278,7 @@ fn launcher_css() -> &'static str {
       .launcher-entry {
         min-height: 54px;
         font-size: 1.08rem;
-        padding: 0.35rem 0.82rem;
+        padding: 0.35rem 2.55rem 0.35rem 0.82rem;
         border-radius: 12px;
         border: 1px solid rgba(255, 255, 255, 0.09);
         background: rgba(255, 255, 255, 0.07);
@@ -2256,6 +2291,12 @@ fn launcher_css() -> &'static str {
         background: rgba(255, 255, 255, 0.10);
         box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08),
                     0 0 0 3px rgba(106, 160, 255, 0.14);
+      }
+
+      .launcher-search-spinner {
+        color: rgba(190, 213, 255, 0.88);
+        min-width: 22px;
+        min-height: 22px;
       }
 
       .launcher-results {
@@ -2378,9 +2419,10 @@ fn apply_css() {
 mod tests {
     use super::{
         EmailOpenStrategy, LAUNCHER_SHADOW_BLUR_PX, LAUNCHER_SHADOW_Y_OFFSET_PX,
-        LAUNCHER_SURFACE_MARGIN_BOTTOM_PX, LAUNCHER_SURFACE_MARGIN_PX, action_failure_result,
-        default_ssh_terminal, desktop_control_commands, email_open_strategy,
-        inspected_password_results, launcher_css, layer_shell_enabled, power_confirmation_results,
+        LAUNCHER_SURFACE_MARGIN_BOTTOM_PX, LAUNCHER_SURFACE_MARGIN_PX, SearchUpdatePhase,
+        action_failure_result, background_processing_after_update, default_ssh_terminal,
+        desktop_control_commands, email_open_strategy, inspected_password_results, launcher_css,
+        layer_shell_enabled, pending_deferred_results, power_confirmation_results,
         power_requires_confirmation, preserved_selection_index, row_tooltip_text,
         wayland_available_for_session,
     };
@@ -2470,6 +2512,30 @@ mod tests {
         let merged = vec![selection_test_item("Applications", "Reddit Client")];
 
         assert_eq!(preserved_selection_index(None, &merged), 0);
+    }
+
+    #[test]
+    fn pending_deferred_search_keeps_visible_results_without_searching_row() {
+        let app = selection_test_item("Applications", "Reddit Client");
+
+        let results = pending_deferred_results(vec![app.clone()]);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].source, app.source);
+        assert_eq!(results[0].title, app.title);
+        assert!(
+            results
+                .iter()
+                .all(|item| item.source != "Status" && !item.title.starts_with("Searching"))
+        );
+    }
+
+    #[test]
+    fn deferred_update_phase_finishes_processing_even_when_no_rows_return() {
+        assert!(!background_processing_after_update(
+            SearchUpdatePhase::Deferred,
+            true
+        ));
     }
 
     #[test]
