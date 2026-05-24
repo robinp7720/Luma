@@ -1,8 +1,8 @@
 use crate::config::{ConfigStore, EmailBackendPreference, FileSearchBackendChoice, LauncherConfig};
 use crate::mail_eds_protocol::{MailEdsMessageSummary, MailEdsSearchResponse};
 use crate::model::{
-    Action, DesktopControlOperation, PowerOperation, QueryInput, ResultItem, SearchMode,
-    SourceFilter, WindowFocusTarget, browser_target, password_url_draft, score_text,
+    Action, DesktopControlOperation, EntryBadge, PowerOperation, QueryInput, ResultItem,
+    SearchMode, SourceFilter, WindowFocusTarget, browser_target, password_url_draft, score_text,
 };
 use crate::prediction::{PredictionStore, StoredPrediction};
 use anyhow::{Context, Result};
@@ -254,6 +254,9 @@ pub struct EmailEntry {
     pub sender_email: Option<String>,
     pub folder: String,
     pub date_label: String,
+    pub snippet: String,
+    pub unread: bool,
+    pub has_attachment: bool,
     pub open_url: String,
     pub reply_url: Option<String>,
     pub compose_url: Option<String>,
@@ -554,6 +557,7 @@ impl Sources {
                 icon_name: "system-search-symbolic".to_string(),
                 score: 500,
                 action: Action::None,
+                ..Default::default()
             }];
         }
 
@@ -678,6 +682,7 @@ impl Sources {
                 action: Action::LaunchApp {
                     desktop_id: app.desktop_id.clone(),
                 },
+                ..Default::default()
             }));
         }
 
@@ -751,6 +756,7 @@ impl Sources {
                 icon_name: "network-server-symbolic".to_string(),
                 score: 70,
                 action: Action::Ssh { host: host.clone() },
+                ..Default::default()
             }));
         }
 
@@ -941,6 +947,7 @@ impl Sources {
                     action: Action::LaunchApp {
                         desktop_id: app.desktop_id.clone(),
                     },
+                    ..Default::default()
                 })
             })
             .collect::<Vec<_>>();
@@ -1006,6 +1013,7 @@ impl Sources {
                     icon_name: "system-search-symbolic".to_string(),
                     score: 500,
                     action: Action::None,
+                    ..Default::default()
                 }];
             }
             return Vec::new();
@@ -1029,6 +1037,7 @@ impl Sources {
                     .and_then(|part| part.to_str())
                     .unwrap_or(path.as_str())
                     .to_string();
+                let accessory = file_modified_label(&path, now);
                 ResultItem {
                     prediction_key: Some(file_prediction_key(&path)),
                     title: file_name,
@@ -1038,6 +1047,8 @@ impl Sources {
                     score: FILE_BASE_SCORE
                         + self.prediction_boost(&file_prediction_key(&path), now),
                     action: Action::OpenFile { path },
+                    accessory,
+                    ..Default::default()
                 }
             })
             .collect()
@@ -1062,6 +1073,7 @@ impl Sources {
                     icon_name: "network-server-symbolic".to_string(),
                     score: score + 720 + self.prediction_boost(&prediction_key, now),
                     action: Action::Ssh { host: host.clone() },
+                    ..Default::default()
                 })
             })
             .collect::<Vec<_>>();
@@ -1095,6 +1107,7 @@ impl Sources {
                     icon_name: "dialog-password-symbolic".to_string(),
                     score: 500,
                     action: Action::None,
+                    ..Default::default()
                 }];
             }
             return Vec::new();
@@ -1315,6 +1328,7 @@ impl Sources {
             action: Action::RunCommand {
                 command: query.text.clone(),
             },
+            ..Default::default()
         });
 
         let mut suggestions = self
@@ -1326,13 +1340,14 @@ impl Sources {
                 Some(ResultItem {
                     prediction_key: Some(prediction_key.clone()),
                     title: command.clone(),
-                    subtitle: "Executable from $PATH".to_string(),
+                    subtitle: String::new(),
                     source: "Commands",
                     icon_name: "utilities-terminal-symbolic".to_string(),
                     score: score + 700 + self.prediction_boost(&prediction_key, now),
                     action: Action::RunCommand {
                         command: command.clone(),
                     },
+                    ..Default::default()
                 })
             })
             .collect::<Vec<_>>();
@@ -1365,6 +1380,7 @@ impl Sources {
                         operation: action.operation,
                         confirmed: false,
                     },
+                    ..Default::default()
                 }
             })
             .collect::<Vec<_>>();
@@ -1408,13 +1424,14 @@ impl Sources {
                 Some(ResultItem {
                     prediction_key: Some(prediction_key.clone()),
                     title: bookmark.title.clone(),
-                    subtitle: bookmark.url.clone(),
+                    subtitle: display_domain(&bookmark.url),
                     source: "Bookmarks",
                     icon_name: "user-bookmarks-symbolic".to_string(),
                     score: score + 830 + self.prediction_boost(&prediction_key, now),
                     action: Action::OpenUrl {
                         url: bookmark.url.clone(),
                     },
+                    ..Default::default()
                 })
             })
             .collect::<Vec<_>>();
@@ -1449,6 +1466,8 @@ impl Sources {
                     action: Action::OpenFile {
                         path: recent.path.clone(),
                     },
+                    accessory: file_modified_label(&recent.path, now),
+                    ..Default::default()
                 })
             })
             .collect::<Vec<_>>();
@@ -1481,6 +1500,7 @@ impl Sources {
             action: Action::RunCommand {
                 command: query.text.clone(),
             },
+            ..Default::default()
         })
     }
 
@@ -1520,6 +1540,7 @@ impl Sources {
             icon_name: "accessories-calculator-symbolic".to_string(),
             score: 1_100 + self.prediction_boost(&prediction_key, now),
             action: Action::CopyText { text: result },
+            ..Default::default()
         })
     }
 
@@ -1542,6 +1563,7 @@ impl Sources {
             icon_name: "web-browser-symbolic".to_string(),
             score: URL_BASE_SCORE + self.prediction_boost(&prediction_key, now),
             action: Action::OpenUrl { url },
+            ..Default::default()
         })
     }
 
@@ -1567,6 +1589,7 @@ impl Sources {
             action: Action::WebSearch {
                 query: query.text.clone(),
             },
+            ..Default::default()
         }
     }
 
@@ -1607,6 +1630,7 @@ impl Sources {
             icon_name: "preferences-system-symbolic".to_string(),
             score: score + self.prediction_boost(&prediction_key, now),
             action: Action::OpenConfigPanel,
+            ..Default::default()
         }
     }
 }
@@ -1973,6 +1997,7 @@ fn window_result_item_with_score(window: WindowEntry, score: i32) -> ResultItem 
         action: Action::FocusWindow {
             target: window.focus_target,
         },
+        ..Default::default()
     }
 }
 
@@ -2034,13 +2059,20 @@ fn email_backend_bonus(preferred: EmailBackendPreference, backend: EmailBackend)
 }
 
 fn email_result_items(entry: &EmailEntry, score: i32, include_secondary: bool) -> Vec<ResultItem> {
-    let mut rows = vec![email_result_item(
-        format!("Open email: {}", entry.subject),
-        email_subtitle(&entry.sender, &entry.folder, &entry.date_label),
-        entry.open_url.clone(),
-        score + 80,
-        Some(email_prediction_key(&entry.open_url)),
-    )];
+    let date_label = entry.date_label.trim();
+    let mut rows = vec![ResultItem {
+        prediction_key: Some(email_prediction_key(&entry.open_url)),
+        title: format!("Open email: {}", entry.subject),
+        subtitle: email_primary_subtitle(&entry.sender, &entry.folder, &entry.snippet),
+        source: "Email",
+        icon_name: "mail-unread-symbolic".to_string(),
+        score: score + 80,
+        action: Action::OpenUrl {
+            url: entry.open_url.clone(),
+        },
+        accessory: (!date_label.is_empty()).then(|| date_label.to_string()),
+        badges: email_badges(entry),
+    }];
 
     if include_secondary {
         if let Some(sender_email) = &entry.sender_email {
@@ -2082,6 +2114,7 @@ fn email_result_items(entry: &EmailEntry, score: i32, include_secondary: bool) -
                     action: Action::CopyText {
                         text: sender_email.clone(),
                     },
+                    ..Default::default()
                 },
             ]);
         }
@@ -2105,6 +2138,7 @@ fn email_result_item(
         icon_name: "mail-unread-symbolic".to_string(),
         score,
         action: Action::OpenUrl { url: open_url },
+        ..Default::default()
     }
 }
 
@@ -2120,6 +2154,33 @@ fn email_subtitle(sender: &str, folder: &str, date_label: &str) -> String {
         parts.push(date_label.trim().to_string());
     }
     parts.join(" · ")
+}
+
+/// Subtitle for the primary "Open email" row: sender, folder and a body preview. The date
+/// moves to the row accessory; the line is ellipsized so a long snippet truncates cleanly.
+fn email_primary_subtitle(sender: &str, folder: &str, snippet: &str) -> String {
+    let mut parts = Vec::new();
+    if !sender.trim().is_empty() {
+        parts.push(sender.trim().to_string());
+    }
+    if !folder.trim().is_empty() {
+        parts.push(folder.trim().to_string());
+    }
+    if !snippet.trim().is_empty() {
+        parts.push(snippet.trim().to_string());
+    }
+    parts.join(" · ")
+}
+
+fn email_badges(entry: &EmailEntry) -> Vec<EntryBadge> {
+    let mut badges = Vec::new();
+    if entry.unread {
+        badges.push(EntryBadge::Unread);
+    }
+    if entry.has_attachment {
+        badges.push(EntryBadge::Attachment);
+    }
+    badges
 }
 
 fn mailto_compose_url(sender_email: &str) -> String {
@@ -2142,7 +2203,7 @@ fn mailto_reply_url(sender_email: &str, subject: &str) -> String {
 fn thunderbird_email_search_sql(query: &str, limit: usize) -> String {
     let escaped = sql_quote(query);
     format!(
-        "select m.date, m.messageKey, l.folderURI, l.name, c.c1subject, c.c3author, c.c0body \
+        "select m.date, m.messageKey, l.folderURI, l.name, c.c1subject, c.c3author, m.flags, c.c0body \
          from messages m \
          join folderLocations l on l.id = m.folderID \
          join messagesText_content c on c.docid = m.id \
@@ -2161,6 +2222,7 @@ fn parse_thunderbird_email_row(raw: &str) -> Option<EmailEntry> {
     let folder_name = fields.next()?.trim().to_string();
     let subject = fields.next()?.trim().to_string();
     let author = fields.next()?.trim().to_string();
+    let flags = fields.next()?.trim().parse::<i64>().unwrap_or_default();
     let body = fields.next()?.trim().to_string();
 
     let subject = if subject.is_empty() {
@@ -2188,6 +2250,9 @@ fn parse_thunderbird_email_row(raw: &str) -> Option<EmailEntry> {
         sender_email,
         folder: folder_label,
         date_label,
+        snippet: email_snippet(&body),
+        unread: flags & THUNDERBIRD_FLAG_READ == 0,
+        has_attachment: flags & THUNDERBIRD_FLAG_ATTACHMENT != 0,
         open_url,
         reply_url: None,
         compose_url: None,
@@ -2195,9 +2260,31 @@ fn parse_thunderbird_email_row(raw: &str) -> Option<EmailEntry> {
     })
 }
 
+/// `nsMsgMessageFlags::Read` — set once a Thunderbird message has been read.
+const THUNDERBIRD_FLAG_READ: i64 = 0x0000_0001;
+/// `nsMsgMessageFlags::Attachment` — set when a Thunderbird message has attachments.
+const THUNDERBIRD_FLAG_ATTACHMENT: i64 = 0x1000_0000;
+
+/// Collapse a message body to a short, single-line preview for display.
+fn email_snippet(body: &str) -> String {
+    const MAX_SNIPPET_CHARS: usize = 120;
+    let collapsed = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() > MAX_SNIPPET_CHARS {
+        let truncated: String = collapsed.chars().take(MAX_SNIPPET_CHARS).collect();
+        format!("{}…", truncated.trim_end())
+    } else {
+        collapsed
+    }
+}
+
 fn email_date_label(message_date_micros: u64, now: u64) -> String {
     let message_seconds = message_date_micros / 1_000_000;
-    let age_seconds = now.saturating_sub(message_seconds);
+    relative_age_label(message_seconds, now)
+}
+
+/// Render a compact relative date for a timestamp in epoch seconds.
+fn relative_age_label(timestamp_seconds: u64, now: u64) -> String {
+    let age_seconds = now.saturating_sub(timestamp_seconds);
     if age_seconds < 60 {
         "just now".to_string()
     } else if age_seconds < 3_600 {
@@ -2209,6 +2296,32 @@ fn email_date_label(message_date_micros: u64, now: u64) -> String {
     } else {
         format!("{}d ago", age_seconds / 86_400)
     }
+}
+
+/// The bare host of a URL for compact display (scheme, userinfo, port, path and a
+/// leading `www.` stripped). Falls back to the original string when there is no host.
+fn display_domain(url: &str) -> String {
+    let without_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let authority = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(without_scheme);
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let host = host.split(':').next().unwrap_or(host);
+    let host = host.trim().trim_end_matches('.');
+    let host = host.strip_prefix("www.").unwrap_or(host);
+    if host.is_empty() {
+        url.trim().to_string()
+    } else {
+        host.to_string()
+    }
+}
+
+/// Relative modified-time label for a file on disk, or `None` if it can't be read.
+fn file_modified_label(path: &str, now: u64) -> Option<String> {
+    let modified = fs::metadata(path).ok()?.modified().ok()?;
+    let seconds = modified.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    Some(relative_age_label(seconds, now))
 }
 
 fn current_unix_seconds() -> u64 {
@@ -2289,13 +2402,14 @@ fn password_entry_result(entry: &str, score: i32) -> ResultItem {
     ResultItem {
         prediction_key: Some(pass_prediction_key(entry)),
         title: entry.to_string(),
-        subtitle: "Open password actions".to_string(),
+        subtitle: String::new(),
         source: "Passwords",
         icon_name: "dialog-password-symbolic".to_string(),
         score,
         action: Action::PasswordActions {
             entry: entry.to_string(),
         },
+        ..Default::default()
     }
 }
 
@@ -2311,6 +2425,7 @@ fn add_password_result(entry: &str, url: Option<String>) -> ResultItem {
             entry: entry.to_string(),
             url,
         },
+        ..Default::default()
     }
 }
 
@@ -2735,6 +2850,7 @@ fn control_results_from_snapshot(
                 action: Action::DesktopControl {
                     operation: DesktopControlOperation::NotificationHistoryPop,
                 },
+                ..Default::default()
             });
         }
     }
@@ -2783,6 +2899,7 @@ fn push_control_action(
         action: Action::DesktopControl {
             operation: spec.operation,
         },
+        ..Default::default()
     });
 }
 
@@ -3210,6 +3327,9 @@ fn evolution_summary_to_entry(summary: MailEdsMessageSummary, now: u64) -> Optio
         sender_email: summary.sender_email,
         folder,
         date_label,
+        snippet: email_snippet(&summary.snippet),
+        unread: summary.unread,
+        has_attachment: summary.has_attachment,
         open_url,
         reply_url,
         compose_url,
@@ -3443,6 +3563,9 @@ fn parse_local_email_file(path: &Path) -> Option<EmailEntry> {
         .unwrap_or_default();
     let search_blob = format!("{subject} {sender} {folder} {body}").to_ascii_lowercase();
     let open_url = gio::File::for_path(path).uri();
+    let headers_lower = headers.to_ascii_lowercase();
+    let has_attachment = headers_lower.contains("multipart/mixed")
+        || headers_lower.contains("content-disposition: attachment");
 
     Some(EmailEntry {
         subject,
@@ -3450,11 +3573,33 @@ fn parse_local_email_file(path: &Path) -> Option<EmailEntry> {
         sender_email,
         folder,
         date_label,
+        snippet: email_snippet(body),
+        unread: maildir_is_unread(path),
+        has_attachment,
         open_url: open_url.to_string(),
         reply_url: None,
         compose_url: None,
         search_blob,
     })
+}
+
+/// Infer whether a Maildir message is unread from its filename flags / folder.
+fn maildir_is_unread(path: &Path) -> bool {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    match file_name.rsplit_once(":2,") {
+        // The info section after ":2," holds flags; 'S' (Seen) means the message is read.
+        Some((_, flags)) => !flags.contains('S'),
+        // No info section: messages in `new/` are unread, anything else is assumed read.
+        None => path
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            .map(|name| name == "new")
+            .unwrap_or(false),
+    }
 }
 
 fn split_email_headers_and_body(raw: &str) -> Option<(&str, &str)> {
@@ -3692,12 +3837,14 @@ mod tests {
     use super::{
         AppEntry, BluetoothStatus, BookmarkEntry, ControlSnapshot, EmailEntry, FileSearchBackend,
         MediaStatus, NetworkStatus, NotificationEntry, RecentFileEntry, Sources, VolumeStatus,
-        append_deferred_results, control_results_from_snapshot, email_result_items,
+        append_deferred_results, control_results_from_snapshot, display_domain, email_badges,
+        email_primary_subtitle, email_result_items, email_snippet, maildir_is_unread,
         no_results_item, parse_bluetooth_status, parse_chromium_bookmarks_json,
         parse_dunst_history, parse_file_search_line, parse_firefox_bookmark_rows,
         parse_hypr_windows_json, parse_niri_windows_json, parse_nmcli_device_status,
-        parse_playerctl_metadata, parse_recent_files_xbel, parse_wpctl_volume, pass_entry_name,
-        thunderbird_database_uri, thunderbird_message_uri, window_focus_command,
+        parse_playerctl_metadata, parse_recent_files_xbel, parse_thunderbird_email_row,
+        parse_wpctl_volume, pass_entry_name, relative_age_label, thunderbird_database_uri,
+        thunderbird_message_uri, window_focus_command,
     };
     use crate::model::{
         Action, DesktopControlOperation, PowerOperation, QueryInput, ResultItem, SearchMode,
@@ -3709,6 +3856,118 @@ mod tests {
 
     fn empty_prediction_store() -> Arc<Mutex<PredictionStore>> {
         Arc::new(Mutex::new(PredictionStore::disabled()))
+    }
+
+    #[test]
+    fn relative_age_label_buckets_by_elapsed_time() {
+        let now = 1_000_000;
+        assert_eq!(relative_age_label(now - 10, now), "just now");
+        assert_eq!(relative_age_label(now - 120, now), "2m ago");
+        assert_eq!(relative_age_label(now - 7_200, now), "2h ago");
+        assert_eq!(relative_age_label(now - 90_000, now), "yesterday");
+        assert_eq!(relative_age_label(now - 300_000, now), "3d ago");
+        // A timestamp in the future must not underflow.
+        assert_eq!(relative_age_label(now + 500, now), "just now");
+    }
+
+    #[test]
+    fn display_domain_strips_scheme_port_path_and_www() {
+        assert_eq!(
+            display_domain("https://www.example.com/path?q=1"),
+            "example.com"
+        );
+        assert_eq!(display_domain("http://docs.rs:8080/crate"), "docs.rs");
+        assert_eq!(
+            display_domain("https://user@host.example.org/"),
+            "host.example.org"
+        );
+        // Non-URL input falls back to the original string.
+        assert_eq!(display_domain("just a keyword"), "just a keyword");
+    }
+
+    #[test]
+    fn email_snippet_collapses_whitespace_and_truncates() {
+        assert_eq!(
+            email_snippet("  hello\n\tthere  world "),
+            "hello there world"
+        );
+        let long = "word ".repeat(60);
+        let snippet = email_snippet(&long);
+        assert!(snippet.ends_with('…'));
+        assert!(snippet.chars().count() <= 121);
+    }
+
+    #[test]
+    fn email_primary_subtitle_joins_sender_folder_and_snippet() {
+        assert_eq!(
+            email_primary_subtitle("Robin", "INBOX", "Quarterly numbers"),
+            "Robin · INBOX · Quarterly numbers"
+        );
+        assert_eq!(
+            email_primary_subtitle("Robin", "INBOX", "   "),
+            "Robin · INBOX"
+        );
+    }
+
+    #[test]
+    fn email_badges_reflect_unread_and_attachment_flags() {
+        use crate::model::EntryBadge;
+        let mut entry = sample_email_entry();
+        entry.unread = true;
+        entry.has_attachment = true;
+        assert_eq!(
+            email_badges(&entry),
+            vec![EntryBadge::Unread, EntryBadge::Attachment]
+        );
+
+        entry.unread = false;
+        entry.has_attachment = false;
+        assert!(email_badges(&entry).is_empty());
+    }
+
+    #[test]
+    fn maildir_is_unread_reads_seen_flag_and_folder() {
+        assert!(maildir_is_unread(Path::new("/mail/cur/123.host:2,FR")));
+        assert!(!maildir_is_unread(Path::new("/mail/cur/123.host:2,RS")));
+        assert!(maildir_is_unread(Path::new("/mail/new/123.host")));
+        assert!(!maildir_is_unread(Path::new("/mail/cur/123.host")));
+    }
+
+    #[test]
+    fn thunderbird_rows_derive_unread_and_attachment_from_flags() {
+        // flags 0 → unread, no attachment.
+        let unread = parse_thunderbird_email_row(
+            "1700000000000000\t42\timap://h/INBOX\tInbox\tHi\tAlice <a@b.com>\t0\tHello there",
+        )
+        .expect("row parses");
+        assert!(unread.unread);
+        assert!(!unread.has_attachment);
+        assert_eq!(unread.snippet, "Hello there");
+
+        // Read (0x1) + Attachment (0x10000000) = 268435457.
+        let read = parse_thunderbird_email_row(
+            "1700000000000000\t42\timap://h/INBOX\tInbox\tHi\tAlice <a@b.com>\t268435457\tBody",
+        )
+        .expect("row parses");
+        assert!(!read.unread);
+        assert!(read.has_attachment);
+    }
+
+    fn sample_email_entry() -> EmailEntry {
+        EmailEntry {
+            subject: "Subject".to_string(),
+            sender: "Robin".to_string(),
+            sender_email: Some("robin@example.com".to_string()),
+            folder: "INBOX".to_string(),
+            date_label: "2h ago".to_string(),
+            snippet: "snippet".to_string(),
+            unread: false,
+            has_attachment: false,
+            open_url: "imap-message://imap://h/INBOX#1".to_string(),
+            reply_url: None,
+            compose_url: None,
+            search_blob: "subject robin".to_string(),
+        }
     }
 
     fn prediction_store_with(
@@ -3779,6 +4038,9 @@ mod tests {
             open_url: "imap-message://imap://example.com/INBOX#123".to_string(),
             reply_url: None,
             compose_url: None,
+            snippet: String::new(),
+            unread: false,
+            has_attachment: false,
             search_blob: "quarterly update robin inbox".to_string(),
         };
 
@@ -3802,6 +4064,9 @@ mod tests {
             open_url: "imap-message://imap://example.com/INBOX#123".to_string(),
             reply_url: None,
             compose_url: None,
+            snippet: String::new(),
+            unread: false,
+            has_attachment: false,
             search_blob: "quarterly update robin inbox".to_string(),
         }];
 
@@ -4032,6 +4297,9 @@ mod tests {
             open_url: "imap-message://imap://example.com/INBOX#1".to_string(),
             reply_url: None,
             compose_url: None,
+            snippet: String::new(),
+            unread: false,
+            has_attachment: false,
             search_blob: "report".to_string(),
         }];
 
@@ -4103,6 +4371,7 @@ mod tests {
             icon_name: String::new(),
             score,
             action: Action::None,
+            ..Default::default()
         }
     }
 
@@ -4712,6 +4981,9 @@ mod tests {
             open_url: "mailbox-message://mailbox://Local Folders/Inbox#1".to_string(),
             reply_url: None,
             compose_url: None,
+            snippet: String::new(),
+            unread: false,
+            has_attachment: false,
             search_blob: "reddit digest inbox".to_string(),
         }];
 
@@ -5066,6 +5338,7 @@ pub(crate) fn no_results_item(query: &QueryInput) -> ResultItem {
         icon_name: "system-search-symbolic".to_string(),
         score: 0,
         action: Action::None,
+        ..Default::default()
     }
 }
 
@@ -5139,5 +5412,6 @@ fn instruction_result(
         icon_name: icon_name.to_string(),
         score,
         action: Action::None,
+        ..Default::default()
     }
 }

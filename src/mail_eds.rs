@@ -6,13 +6,13 @@ use crate::mail_eds_ffi::{
     camel_folder_get_message_sync, camel_folder_info_free, camel_folder_search_body_sync,
     camel_folder_search_header_sync, camel_folder_summary_get, camel_internet_address_get,
     camel_message_info_get_date_received, camel_message_info_get_date_sent,
-    camel_message_info_get_from, camel_message_info_get_preview, camel_message_info_get_subject,
-    camel_mime_message_get_from, camel_mime_message_get_subject, camel_session_ref_service,
-    camel_store_get_folder_info_sync, camel_store_get_folder_sync, e_mail_folder_uri_build,
-    e_mail_session_get_local_store, e_mail_session_new, e_mail_session_uri_to_folder_sync,
-    e_source_backend_get_backend_name, e_source_get_extension, e_source_get_uid,
-    e_source_registry_list_enabled, e_source_registry_new_sync, g_free, g_list_free,
-    g_object_unref, g_ptr_array_add, g_ptr_array_free, g_ptr_array_new,
+    camel_message_info_get_flags, camel_message_info_get_from, camel_message_info_get_preview,
+    camel_message_info_get_subject, camel_mime_message_get_from, camel_mime_message_get_subject,
+    camel_session_ref_service, camel_store_get_folder_info_sync, camel_store_get_folder_sync,
+    e_mail_folder_uri_build, e_mail_session_get_local_store, e_mail_session_new,
+    e_mail_session_uri_to_folder_sync, e_source_backend_get_backend_name, e_source_get_extension,
+    e_source_get_uid, e_source_registry_list_enabled, e_source_registry_new_sync, g_free,
+    g_list_free, g_object_unref, g_ptr_array_add, g_ptr_array_free, g_ptr_array_new,
 };
 use crate::mail_eds_protocol::{
     MailEdsActionRequest, MailEdsActionResponse, MailEdsMessageSummary, MailEdsSearchRequest,
@@ -33,6 +33,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::ptr;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// `CAMEL_MESSAGE_SEEN` — set once a message has been read.
+const CAMEL_MESSAGE_SEEN: u32 = 1 << 4;
+/// `CAMEL_MESSAGE_ATTACHMENTS` — set when a message carries attachments.
+const CAMEL_MESSAGE_ATTACHMENTS: u32 = 1 << 8;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MailEdsFolder {
@@ -123,6 +128,7 @@ struct CacheMessageRow {
     mail_to: Option<String>,
     mail_cc: Option<String>,
     userheaders: Option<String>,
+    flags: Option<i64>,
 }
 
 fn search_cached_mail(
@@ -197,6 +203,7 @@ fn search_cached_mail(
                     current_unix_seconds(),
                 );
                 let snippet = row.preview.clone().unwrap_or_default();
+                let flags = row.flags.unwrap_or_default() as u32;
 
                 results.push(MailEdsMessageSummary {
                     message_id,
@@ -206,6 +213,8 @@ fn search_cached_mail(
                     sender_email: sender_email.clone(),
                     date_label,
                     snippet,
+                    unread: flags & CAMEL_MESSAGE_SEEN == 0,
+                    has_attachment: flags & CAMEL_MESSAGE_ATTACHMENTS != 0,
                     openable: true,
                     replyable: sender_email.is_some(),
                     composable: sender_email.is_some(),
@@ -229,7 +238,7 @@ fn build_cache_message_query(tokens: &[String], folder_id: i64) -> String {
 
     let where_clause = clauses.join(" AND ");
     format!(
-        "SELECT uid, subject, mail_from, dsent, dreceived, preview, mail_to, mail_cc, userheaders FROM messages_{folder_id} WHERE {where_clause}"
+        "SELECT uid, subject, mail_from, dsent, dreceived, preview, mail_to, mail_cc, userheaders, flags FROM messages_{folder_id} WHERE {where_clause}"
     )
 }
 
@@ -496,6 +505,7 @@ impl EdsMailBackend {
         let date_label = email_date_label(date_received.max(date_sent), current_unix_seconds());
         let snippet =
             unsafe { c_string_from_ptr(camel_message_info_get_preview(info)) }.unwrap_or_default();
+        let flags = unsafe { camel_message_info_get_flags(info) };
 
         let message_id = encode_message_id(folder_uri, uid.to_str().unwrap_or_default());
         let replyable = sender_email.is_some();
@@ -507,6 +517,8 @@ impl EdsMailBackend {
             sender_email,
             date_label,
             snippet,
+            unread: flags & CAMEL_MESSAGE_SEEN == 0,
+            has_attachment: flags & CAMEL_MESSAGE_ATTACHMENTS != 0,
             openable: true,
             replyable,
             composable: replyable,
@@ -1078,6 +1090,8 @@ mod tests {
                 sender_email: Some("noreply@github.com".to_string()),
                 date_label: "1d ago".to_string(),
                 snippet: "Your weekly summary".to_string(),
+                unread: true,
+                has_attachment: false,
                 openable: true,
                 replyable: true,
                 composable: true,
@@ -1114,6 +1128,8 @@ mod tests {
                 sender_email: Some("noreply@github.com".to_string()),
                 date_label: "2d ago".to_string(),
                 snippet: "A broken folder should not stop the search".to_string(),
+                unread: false,
+                has_attachment: true,
                 openable: true,
                 replyable: true,
                 composable: true,

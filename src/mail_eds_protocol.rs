@@ -22,6 +22,8 @@ pub struct MailEdsMessageSummary {
     pub sender_email: Option<String>,
     pub date_label: String,
     pub snippet: String,
+    pub unread: bool,
+    pub has_attachment: bool,
     pub openable: bool,
     pub replyable: bool,
     pub composable: bool,

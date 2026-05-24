@@ -8,7 +8,9 @@ mod sources;
 
 use crate::config::{ConfigStore, EmailBackendPreference, EmailConfig};
 use crate::model::PowerOperation;
-use crate::model::{Action, DesktopControlOperation, QueryInput, ResultItem, SearchMode};
+use crate::model::{
+    Action, DesktopControlOperation, EntryBadge, QueryInput, ResultItem, SearchMode,
+};
 use crate::model::{PasswordOperation, WindowFocusTarget};
 use crate::password::{
     Credential, TypeStep, default_login_steps, format_generated_pass_entry, generate_password,
@@ -861,6 +863,12 @@ fn build_row(item: &ResultItem) -> ListBoxRow {
     icon_wrap.set_halign(Align::Center);
     icon_wrap.append(&icon);
 
+    let text_col = GtkBox::new(Orientation::Vertical, 2);
+    text_col.set_hexpand(true);
+    text_col.set_valign(Align::Center);
+
+    let title_row = GtkBox::new(Orientation::Horizontal, 6);
+
     let title = Label::new(Some(&item.title));
     title.add_css_class("launcher-title");
     title.set_halign(Align::Start);
@@ -868,15 +876,64 @@ fn build_row(item: &ResultItem) -> ListBoxRow {
     title.set_xalign(0.0);
     title.set_wrap(false);
     title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    title_row.append(&title);
+
+    for badge in &item.badges {
+        title_row.append(&badge_widget(*badge));
+    }
+
+    if let Some(accessory) = item
+        .accessory
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let accessory_label = Label::new(Some(accessory));
+        accessory_label.add_css_class("launcher-accessory");
+        accessory_label.set_halign(Align::End);
+        accessory_label.set_valign(Align::Center);
+        accessory_label.set_wrap(false);
+        title_row.append(&accessory_label);
+    }
+
+    text_col.append(&title_row);
+
+    let subtitle = item.subtitle.trim();
+    if !subtitle.is_empty() {
+        let subtitle_label = Label::new(Some(subtitle));
+        subtitle_label.add_css_class("launcher-subtitle");
+        subtitle_label.set_halign(Align::Start);
+        subtitle_label.set_hexpand(true);
+        subtitle_label.set_xalign(0.0);
+        subtitle_label.set_wrap(false);
+        subtitle_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        text_col.append(&subtitle_label);
+    }
 
     if let Some(tooltip) = row_tooltip_text(item) {
         row.set_tooltip_text(Some(&tooltip));
     }
 
     layout.append(&icon_wrap);
-    layout.append(&title);
+    layout.append(&text_col);
     row.set_child(Some(&layout));
     row
+}
+
+fn badge_widget(badge: EntryBadge) -> Image {
+    let icon_name = match badge {
+        EntryBadge::Unread => "mail-unread-symbolic",
+        EntryBadge::Attachment => "mail-attachment-symbolic",
+    };
+    let image = Image::from_icon_name(icon_name);
+    image.set_pixel_size(14);
+    image.set_valign(Align::Center);
+    image.add_css_class("launcher-badge");
+    image.add_css_class(match badge {
+        EntryBadge::Unread => "launcher-badge-unread",
+        EntryBadge::Attachment => "launcher-badge-attachment",
+    });
+    image
 }
 
 fn row_tooltip_text(item: &ResultItem) -> Option<String> {
@@ -1218,6 +1275,7 @@ fn add_password_prompt_result(title: &str, subtitle: &str) -> ResultItem {
         icon_name: "dialog-password-symbolic".to_string(),
         score: 0,
         action: Action::None,
+        ..Default::default()
     }
 }
 
@@ -1241,6 +1299,7 @@ fn action_failure_result(message: &str) -> ResultItem {
         icon_name: "dialog-error-symbolic".to_string(),
         score: 0,
         action: Action::None,
+        ..Default::default()
     }
 }
 
@@ -1324,6 +1383,7 @@ fn power_confirmation_results(operation: PowerOperation) -> Vec<ResultItem> {
                 operation,
                 confirmed: true,
             },
+            ..Default::default()
         },
         ResultItem {
             prediction_key: None,
@@ -1333,6 +1393,7 @@ fn power_confirmation_results(operation: PowerOperation) -> Vec<ResultItem> {
             icon_name: "process-stop-symbolic".to_string(),
             score: 90,
             action: Action::None,
+            ..Default::default()
         },
     ]
 }
@@ -1955,6 +2016,7 @@ fn password_action_result(
             entry: entry.to_string(),
             operation,
         },
+        ..Default::default()
     }
 }
 
@@ -2373,6 +2435,24 @@ fn launcher_css() -> &'static str {
         font-weight: 650;
       }
 
+      .launcher-subtitle {
+        font-size: 0.86rem;
+        color: rgba(210, 219, 237, 0.70);
+      }
+
+      .launcher-accessory {
+        font-size: 0.82rem;
+        color: rgba(190, 213, 255, 0.78);
+      }
+
+      .launcher-badge {
+        color: rgba(210, 219, 237, 0.80);
+      }
+
+      .launcher-badge-unread {
+        color: rgba(120, 168, 255, 0.95);
+      }
+
       .settings-shell {
         background: linear-gradient(180deg, rgba(18, 22, 31, 0.94), rgba(10, 13, 21, 0.98));
         border: 1px solid rgba(255, 255, 255, 0.10);
@@ -2512,6 +2592,7 @@ mod tests {
             icon_name: String::new(),
             score: 0,
             action: Action::None,
+            ..Default::default()
         }
     }
 
@@ -2590,6 +2671,7 @@ mod tests {
             icon_name: "firefox".to_string(),
             score: 100,
             action: Action::None,
+            ..Default::default()
         };
 
         assert_eq!(

@@ -22,7 +22,7 @@ impl SearchMode {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ResultItem {
     pub title: String,
     pub subtitle: String,
@@ -31,6 +31,16 @@ pub struct ResultItem {
     pub score: i32,
     pub action: Action,
     pub prediction_key: Option<String>,
+    /// Short, right-aligned text shown on the title row (e.g. a relative date).
+    pub accessory: Option<String>,
+    /// Small status markers rendered next to the accessory on the title row.
+    pub badges: Vec<EntryBadge>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EntryBadge {
+    Unread,
+    Attachment,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -72,7 +82,7 @@ pub enum DesktopControlOperation {
     NotificationPauseToggle,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub enum Action {
     LaunchApp {
         desktop_id: String,
@@ -120,6 +130,7 @@ pub enum Action {
     CopyText {
         text: String,
     },
+    #[default]
     None,
 }
 

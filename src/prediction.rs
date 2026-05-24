@@ -172,6 +172,7 @@ fn prediction_result_item(prediction: &StoredPrediction, score: i32) -> ResultIt
                 entry: entry.to_string(),
             },
             prediction_key: Some(prediction.key.clone()),
+            ..Default::default()
         };
     }
 
@@ -183,6 +184,7 @@ fn prediction_result_item(prediction: &StoredPrediction, score: i32) -> ResultIt
         score,
         action: prediction.action.clone(),
         prediction_key: Some(prediction.key.clone()),
+        ..Default::default()
     }
 }
 

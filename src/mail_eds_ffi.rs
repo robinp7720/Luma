@@ -189,6 +189,7 @@ unsafe extern "C" {
     pub fn camel_message_info_get_subject(info: *const CamelMessageInfo) -> *const c_char;
     pub fn camel_message_info_get_from(info: *const CamelMessageInfo) -> *const c_char;
     pub fn camel_message_info_get_preview(info: *const CamelMessageInfo) -> *const c_char;
+    pub fn camel_message_info_get_flags(info: *const CamelMessageInfo) -> u32;
     pub fn camel_message_info_get_date_received(info: *const CamelMessageInfo) -> i64;
     pub fn camel_message_info_get_date_sent(info: *const CamelMessageInfo) -> i64;
     pub fn camel_mime_message_get_subject(message: *mut CamelMimeMessage) -> *const c_char;
