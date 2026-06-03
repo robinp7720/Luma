@@ -54,11 +54,13 @@ const URL_BASE_SCORE: i32 = 10_000;
 pub(crate) struct DeferredSearchPlan {
     pub files: bool,
     pub email: bool,
+    pub windows: bool,
+    pub controls: bool,
 }
 
 impl DeferredSearchPlan {
     pub fn is_empty(self) -> bool {
-        !self.files && !self.email
+        !self.files && !self.email && !self.windows && !self.controls
     }
 }
 
@@ -397,7 +399,8 @@ impl Sources {
             results.extend(self.search_apps(&query, now));
         }
 
-        if query.mode.includes(SearchMode::Windows) {
+        let windows_search_deferred = self.should_defer_windows_search(&query);
+        if !windows_search_deferred && query.mode.includes(SearchMode::Windows) {
             results.extend(self.search_windows(&query, now));
         }
 
@@ -413,7 +416,8 @@ impl Sources {
             results.extend(self.search_power(&query, now));
         }
 
-        if query.mode.includes(SearchMode::Controls) {
+        let controls_search_deferred = self.should_defer_controls_search(&query);
+        if !controls_search_deferred && query.mode.includes(SearchMode::Controls) {
             results.extend(self.search_controls(&query, now));
         }
 
@@ -464,6 +468,8 @@ impl Sources {
             deferred: DeferredSearchPlan {
                 files: file_search_deferred,
                 email: email_search_deferred,
+                windows: windows_search_deferred,
+                controls: controls_search_deferred,
             },
         }
     }
@@ -478,6 +484,14 @@ impl Sources {
 
         if snapshot.deferred.email {
             results.extend(self.search_email(&snapshot.query, now));
+        }
+
+        if snapshot.deferred.windows {
+            results.extend(self.search_windows(&snapshot.query, now));
+        }
+
+        if snapshot.deferred.controls {
+            results.extend(self.search_controls(&snapshot.query, now));
         }
 
         results
@@ -520,6 +534,14 @@ impl Sources {
                 && !self.thunderbird_email_database_paths.is_empty())
                 || evolution_helper_available
                 || (email_config.local_mail_enabled && !self.local_email_entries.is_empty()))
+    }
+
+    fn should_defer_windows_search(&self, query: &QueryInput) -> bool {
+        query.mode == SearchMode::All && self.current_config().sources.windows
+    }
+
+    fn should_defer_controls_search(&self, query: &QueryInput) -> bool {
+        query.mode == SearchMode::All && self.current_config().sources.controls
     }
 
     fn file_search_status_result(&self, query: &QueryInput) -> Vec<ResultItem> {
@@ -4740,6 +4762,24 @@ mod tests {
                 .immediate_results
                 .iter()
                 .all(|item| item.source != "Files" && item.source != "Email")
+        );
+    }
+
+    #[test]
+    fn all_mode_defers_desktop_status_sources_before_immediate_results() {
+        let sources = empty_sources();
+
+        let snapshot = sources.search_snapshot("reddit", SearchMode::All, None);
+
+        assert!(
+            !snapshot.deferred.is_empty(),
+            "all-mode desktop status work should not block immediate app results"
+        );
+        assert!(
+            snapshot
+                .immediate_results
+                .iter()
+                .all(|item| item.source != "Windows" && item.source != "Controls")
         );
     }
 
