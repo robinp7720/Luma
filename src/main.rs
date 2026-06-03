@@ -1,3 +1,4 @@
+mod actions;
 mod config;
 mod mail_eds_protocol;
 mod model;
@@ -5,23 +6,29 @@ mod password;
 mod prediction;
 mod settings;
 mod sources;
+mod ui;
 
-use crate::config::{ConfigStore, EmailBackendPreference, EmailConfig};
-use crate::model::PowerOperation;
-use crate::model::{
-    Action, DesktopControlOperation, EntryBadge, QueryInput, ResultItem, SearchMode,
+use crate::actions::{
+    copy_pass_entry, execute_desktop_control_operation, execute_password_operation,
+    execute_power_operation, inspected_password_results, load_pass_credential,
+    power_confirmation_results, power_requires_confirmation,
 };
+use crate::config::{ConfigStore, EmailBackendPreference, EmailConfig};
+use crate::model::{Action, ResultItem, SearchMode};
 use crate::model::{PasswordOperation, WindowFocusTarget};
 use crate::password::{
-    Credential, TypeStep, default_login_steps, format_generated_pass_entry, generate_password,
-    parse_credential, pass_insert_command, run_program_input, wl_copy_command,
-    wtype_commands_for_steps, xclip_command, xdotool_commands_for_steps,
+    Credential, format_generated_pass_entry, generate_password, parse_credential,
+    pass_insert_command, run_program_input,
 };
 use crate::settings::open_config_panel;
 use crate::sources::{
     SearchSnapshot, Sources, append_deferred_results, evolution_helper_command, focus_window,
-    focused_window_target, no_results_item, pass_prediction_key, run_mail_helper_action,
-    sort_and_limit_results,
+    focused_window_target, no_results_item, run_mail_helper_action,
+};
+use crate::ui::results::{
+    background_processing_after_update, finalize_loaded_results, install_frame_profiler,
+    move_selection, pending_deferred_results, profiling_enabled, rebuild_results,
+    set_background_processing,
 };
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -31,8 +38,8 @@ use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Application, ApplicationWindow, Box as GtkBox, Entry, EventControllerKey, Image, Label,
-    ListBox, ListBoxRow, Orientation, Overlay, ScrolledWindow, SelectionMode, Spinner,
+    Align, Application, ApplicationWindow, Box as GtkBox, Entry, EventControllerKey, ListBox,
+    Orientation, Overlay, ScrolledWindow, SelectionMode, Spinner,
 };
 use gtk4_layer_shell::LayerShell;
 use std::cell::Cell;
@@ -42,7 +49,6 @@ use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
-use std::time::Instant;
 
 static APP_CONFIG: OnceLock<Arc<ConfigStore>> = OnceLock::new();
 
@@ -65,8 +71,6 @@ const LAUNCHER_SHADOW_Y_OFFSET_PX: i32 = 18;
 const LAUNCHER_SHADOW_BLUR_PX: i32 = 44;
 const LAUNCHER_SURFACE_MARGIN_BOTTOM_PX: i32 =
     LAUNCHER_SHADOW_BLUR_PX + LAUNCHER_SHADOW_Y_OFFSET_PX + 8;
-const AUTOTYPE_AFTER_CLOSE_DELAY_MS: u64 = 180;
-
 #[derive(Clone, Debug)]
 struct AddPasswordDraft {
     entry: String,
@@ -694,295 +698,6 @@ fn request_initial_focus(window: &ApplicationWindow, entry: &Entry) {
     }
 }
 
-fn profiling_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("LUMA_PROFILE").is_some())
-}
-
-fn ms(value: Duration) -> f64 {
-    value.as_secs_f64() * 1000.0
-}
-
-thread_local! {
-    static ICON_LOOKUP_TIME: Cell<Duration> = const { Cell::new(Duration::ZERO) };
-    // GLib monotonic-clock timestamps (microseconds) so the frame profiler can
-    // line each rebuild up against the frame the compositor actually presents.
-    static LAST_REBUILD_DONE_US: Cell<i64> = const { Cell::new(0) };
-    static LAST_FRAME_TIME_US: Cell<i64> = const { Cell::new(0) };
-}
-
-// Logs how long the compositor takes to turn a finished rebuild into a
-// presented frame, isolating window-manager/present latency from the
-// main-thread rebuild cost measured in `rebuild_results`.
-fn install_frame_profiler(window: &ApplicationWindow) {
-    let id = window.add_tick_callback(|_widget, clock| {
-        let frame_time = clock.frame_time();
-        let previous = LAST_FRAME_TIME_US.replace(frame_time);
-        let rebuild_us = LAST_REBUILD_DONE_US.replace(0);
-        if rebuild_us != 0 {
-            let to_frame = (frame_time - rebuild_us) as f64 / 1000.0;
-            let interval = if previous != 0 {
-                (frame_time - previous) as f64 / 1000.0
-            } else {
-                f64::NAN
-            };
-            let present = clock
-                .current_timings()
-                .map(|timings| timings.presentation_time())
-                .filter(|value| *value != 0)
-                .map(|value| (value - frame_time) as f64 / 1000.0);
-            match present {
-                Some(present) => eprintln!(
-                    "[luma-profile] present  rebuild->frame={to_frame:>6.2}ms  frame_interval={interval:>6.2}ms  present_latency={present:>6.2}ms"
-                ),
-                None => eprintln!(
-                    "[luma-profile] present  rebuild->frame={to_frame:>6.2}ms  frame_interval={interval:>6.2}ms  present_latency=unavailable(x11)"
-                ),
-            }
-        }
-        glib::ControlFlow::Continue
-    });
-    // Keep the callback alive for the (short) process lifetime regardless of
-    // whether TickCallbackId behaves as an RAII guard.
-    std::mem::forget(id);
-}
-
-// Two result rows refer to the same logical entry when their source and visible
-// text match. Used to keep a row selected across rebuilds (e.g. when deferred
-// search results arrive) instead of snapping back to the top.
-fn same_result(left: &ResultItem, right: &ResultItem) -> bool {
-    left.source == right.source && left.title == right.title && left.subtitle == right.subtitle
-}
-
-fn preserved_selection_index(previous: Option<&ResultItem>, results: &[ResultItem]) -> usize {
-    previous
-        .and_then(|prev| results.iter().position(|item| same_result(item, prev)))
-        .unwrap_or(0)
-}
-
-fn rebuild_results(
-    list: &ListBox,
-    scroller: &ScrolledWindow,
-    results: &[ResultItem],
-    previous_selection: Option<&ResultItem>,
-) {
-    let profile = profiling_enabled();
-    if profile {
-        ICON_LOOKUP_TIME.with(|cell| cell.set(Duration::ZERO));
-    }
-    let total_start = Instant::now();
-
-    let teardown_start = Instant::now();
-    while let Some(child) = list.first_child() {
-        list.remove(&child);
-    }
-    let teardown = teardown_start.elapsed();
-
-    let build_start = Instant::now();
-    for item in results {
-        let row = build_row(item);
-        list.append(&row);
-    }
-    let build = build_start.elapsed();
-
-    let selected = preserved_selection_index(previous_selection, results) as i32;
-    if let Some(row) = list.row_at_index(selected) {
-        list.select_row(Some(&row));
-        scroll_row_into_view(list, scroller, &row);
-    }
-
-    if profile {
-        let icon = ICON_LOOKUP_TIME.with(Cell::get);
-        let total = total_start.elapsed();
-        LAST_REBUILD_DONE_US.with(|cell| cell.set(glib::monotonic_time()));
-        eprintln!(
-            "[luma-profile] rebuild  rows={:>2}  total={:>6.2}ms  teardown={:>6.2}ms  build={:>6.2}ms  icon_lookup={:>6.2}ms",
-            results.len(),
-            ms(total),
-            ms(teardown),
-            ms(build),
-            ms(icon),
-        );
-    }
-}
-
-fn finalize_loaded_results(results: Vec<ResultItem>, query: &QueryInput) -> Vec<ResultItem> {
-    let mut results = sort_and_limit_results(results);
-    if results.is_empty() {
-        results.push(no_results_item(query));
-    }
-    results
-}
-
-fn pending_deferred_results(results: Vec<ResultItem>) -> Vec<ResultItem> {
-    sort_and_limit_results(results)
-}
-
-fn background_processing_after_update(phase: SearchUpdatePhase, has_deferred_plan: bool) -> bool {
-    phase == SearchUpdatePhase::Immediate && has_deferred_plan
-}
-
-fn set_background_processing(spinner: &Spinner, active: bool) {
-    spinner.set_visible(active);
-    if active {
-        spinner.start();
-    } else {
-        spinner.stop();
-    }
-}
-
-fn build_row(item: &ResultItem) -> ListBoxRow {
-    let row = ListBoxRow::new();
-    row.add_css_class("launcher-row");
-    if matches!(&item.action, Action::None) {
-        row.add_css_class("launcher-row-status");
-    }
-
-    let layout = GtkBox::new(Orientation::Horizontal, 14);
-    layout.set_margin_top(8);
-    layout.set_margin_bottom(8);
-    layout.set_margin_start(10);
-    layout.set_margin_end(10);
-
-    let icon = if profiling_enabled() {
-        let start = Instant::now();
-        let icon = Image::from_icon_name(&item.icon_name);
-        ICON_LOOKUP_TIME.with(|cell| cell.set(cell.get() + start.elapsed()));
-        icon
-    } else {
-        Image::from_icon_name(&item.icon_name)
-    };
-    icon.set_pixel_size(24);
-    icon.add_css_class("launcher-icon");
-    icon.set_halign(Align::Center);
-    icon.set_valign(Align::Center);
-
-    let icon_wrap = GtkBox::new(Orientation::Vertical, 0);
-    icon_wrap.add_css_class("launcher-icon-wrap");
-    icon_wrap.set_valign(Align::Center);
-    icon_wrap.set_halign(Align::Center);
-    icon_wrap.append(&icon);
-
-    let text_col = GtkBox::new(Orientation::Vertical, 2);
-    text_col.set_hexpand(true);
-    text_col.set_valign(Align::Center);
-
-    let title_row = GtkBox::new(Orientation::Horizontal, 6);
-
-    let title = Label::new(Some(&item.title));
-    title.add_css_class("launcher-title");
-    title.set_halign(Align::Start);
-    title.set_hexpand(true);
-    title.set_xalign(0.0);
-    title.set_wrap(false);
-    title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-    title_row.append(&title);
-
-    for badge in &item.badges {
-        title_row.append(&badge_widget(*badge));
-    }
-
-    if let Some(accessory) = item
-        .accessory
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        let accessory_label = Label::new(Some(accessory));
-        accessory_label.add_css_class("launcher-accessory");
-        accessory_label.set_halign(Align::End);
-        accessory_label.set_valign(Align::Center);
-        accessory_label.set_wrap(false);
-        title_row.append(&accessory_label);
-    }
-
-    text_col.append(&title_row);
-
-    let subtitle = item.subtitle.trim();
-    if !subtitle.is_empty() {
-        let subtitle_label = Label::new(Some(subtitle));
-        subtitle_label.add_css_class("launcher-subtitle");
-        subtitle_label.set_halign(Align::Start);
-        subtitle_label.set_hexpand(true);
-        subtitle_label.set_xalign(0.0);
-        subtitle_label.set_wrap(false);
-        subtitle_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        text_col.append(&subtitle_label);
-    }
-
-    if let Some(tooltip) = row_tooltip_text(item) {
-        row.set_tooltip_text(Some(&tooltip));
-    }
-
-    layout.append(&icon_wrap);
-    layout.append(&text_col);
-    row.set_child(Some(&layout));
-    row
-}
-
-fn badge_widget(badge: EntryBadge) -> Image {
-    let icon_name = match badge {
-        EntryBadge::Unread => "mail-unread-symbolic",
-        EntryBadge::Attachment => "mail-attachment-symbolic",
-    };
-    let image = Image::from_icon_name(icon_name);
-    image.set_pixel_size(14);
-    image.set_valign(Align::Center);
-    image.add_css_class("launcher-badge");
-    image.add_css_class(match badge {
-        EntryBadge::Unread => "launcher-badge-unread",
-        EntryBadge::Attachment => "launcher-badge-attachment",
-    });
-    image
-}
-
-fn row_tooltip_text(item: &ResultItem) -> Option<String> {
-    let subtitle = item.subtitle.trim();
-    let source = item.source.trim();
-
-    match (subtitle.is_empty(), source.is_empty()) {
-        (true, true) => None,
-        (false, true) => Some(subtitle.to_string()),
-        (true, false) => Some(source.to_string()),
-        (false, false) => Some(format!("{subtitle}\n{source}")),
-    }
-}
-
-fn move_selection(list: &ListBox, scroller: &ScrolledWindow, delta: i32, result_count: i32) {
-    if result_count <= 0 {
-        return;
-    }
-
-    let current = list.selected_row().map(|row| row.index()).unwrap_or(0);
-    let next = (current + delta).clamp(0, result_count - 1);
-    if let Some(row) = list.row_at_index(next) {
-        list.select_row(Some(&row));
-        scroll_row_into_view(list, scroller, &row);
-    }
-}
-
-fn scroll_row_into_view(list: &ListBox, scroller: &ScrolledWindow, row: &ListBoxRow) {
-    let adjustment = scroller.vadjustment();
-    let visible_top = adjustment.value();
-    let visible_bottom = visible_top + adjustment.page_size();
-    let Some(bounds) = row.compute_bounds(list) else {
-        return;
-    };
-    let row_top = f64::from(bounds.y());
-    let row_bottom = row_top + f64::from(bounds.height());
-
-    let next_value = if row_top < visible_top {
-        row_top
-    } else if row_bottom > visible_bottom {
-        row_bottom - adjustment.page_size()
-    } else {
-        return;
-    };
-
-    let max_value = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
-    adjustment.set_value(next_value.clamp(adjustment.lower(), max_value));
-}
-
 fn activate_item(
     window: &ApplicationWindow,
     sources: &Sources,
@@ -1324,8 +1039,7 @@ fn execute_action(
         Action::Ssh { host } => launch_ssh(&host)?,
         Action::OpenConfigPanel => open_config_panel(window)?,
         Action::CopyPass { entry } => {
-            let secret = load_pass_secret(&entry)?;
-            copy_secret(&secret)?;
+            copy_pass_entry(&entry)?;
             window.close();
             return Ok(());
         }
@@ -1370,513 +1084,12 @@ fn execute_action(
     Ok(())
 }
 
-fn power_confirmation_results(operation: PowerOperation) -> Vec<ResultItem> {
-    vec![
-        ResultItem {
-            prediction_key: None,
-            title: format!("Confirm {}", power_operation_title(operation)),
-            subtitle: power_operation_confirmation(operation).to_string(),
-            source: "Power",
-            icon_name: power_operation_icon(operation).to_string(),
-            score: 100,
-            action: Action::Power {
-                operation,
-                confirmed: true,
-            },
-            ..Default::default()
-        },
-        ResultItem {
-            prediction_key: None,
-            title: "Cancel".to_string(),
-            subtitle: "Keep the current session untouched".to_string(),
-            source: "Power",
-            icon_name: "process-stop-symbolic".to_string(),
-            score: 90,
-            action: Action::None,
-            ..Default::default()
-        },
-    ]
-}
-
-fn power_requires_confirmation(operation: PowerOperation) -> bool {
-    !matches!(operation, PowerOperation::Lock)
-}
-
-fn power_operation_title(operation: PowerOperation) -> &'static str {
-    match operation {
-        PowerOperation::Lock => "Lock",
-        PowerOperation::Suspend => "Suspend",
-        PowerOperation::Logout => "Logout",
-        PowerOperation::Reboot => "Reboot",
-        PowerOperation::Shutdown => "Shutdown",
-    }
-}
-
-fn power_operation_confirmation(operation: PowerOperation) -> &'static str {
-    match operation {
-        PowerOperation::Lock => "Blank the screen and keep the session running",
-        PowerOperation::Suspend => "Lock first, then suspend the machine",
-        PowerOperation::Logout => "Close the current desktop session now",
-        PowerOperation::Reboot => "Restart the system now",
-        PowerOperation::Shutdown => "Power off the system now",
-    }
-}
-
-fn power_operation_icon(operation: PowerOperation) -> &'static str {
-    match operation {
-        PowerOperation::Lock => "system-lock-screen-symbolic",
-        PowerOperation::Suspend => "media-playback-pause-symbolic",
-        PowerOperation::Logout => "system-log-out-symbolic",
-        PowerOperation::Reboot => "system-reboot-symbolic",
-        PowerOperation::Shutdown => "system-shutdown-symbolic",
-    }
-}
-
-fn execute_power_operation(operation: PowerOperation) -> Result<()> {
-    match operation {
-        PowerOperation::Lock => lock_session(),
-        PowerOperation::Suspend => {
-            let _ = lock_session();
-            thread::sleep(Duration::from_secs(1));
-            spawn_system_command("systemctl", &["suspend"], "failed to suspend")
-        }
-        PowerOperation::Logout => logout_session(),
-        PowerOperation::Reboot => {
-            spawn_system_command("systemctl", &["reboot"], "failed to reboot")
-        }
-        PowerOperation::Shutdown => {
-            spawn_system_command("systemctl", &["poweroff"], "failed to power off")
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct DesktopControlCommand {
-    program: &'static str,
-    args: Vec<String>,
-}
-
-impl DesktopControlCommand {
-    fn new(program: &'static str, args: &[&str]) -> Self {
-        Self {
-            program,
-            args: args.iter().map(|arg| (*arg).to_string()).collect(),
-        }
-    }
-}
-
-fn desktop_control_commands(operation: &DesktopControlOperation) -> Vec<DesktopControlCommand> {
-    match operation {
-        DesktopControlOperation::MediaPlayPause => {
-            vec![DesktopControlCommand::new("playerctl", &["play-pause"])]
-        }
-        DesktopControlOperation::MediaNext => {
-            vec![DesktopControlCommand::new("playerctl", &["next"])]
-        }
-        DesktopControlOperation::MediaPrevious => {
-            vec![DesktopControlCommand::new("playerctl", &["previous"])]
-        }
-        DesktopControlOperation::VolumeUp => vec![DesktopControlCommand::new(
-            "wpctl",
-            &["set-volume", "@DEFAULT_AUDIO_SINK@", "5%+"],
-        )],
-        DesktopControlOperation::VolumeDown => vec![DesktopControlCommand::new(
-            "wpctl",
-            &["set-volume", "@DEFAULT_AUDIO_SINK@", "5%-"],
-        )],
-        DesktopControlOperation::VolumeMute => vec![DesktopControlCommand::new(
-            "wpctl",
-            &["set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"],
-        )],
-        DesktopControlOperation::BrightnessUp => vec![DesktopControlCommand::new(
-            "brightnessctl",
-            &["--class=backlight", "set", "+10%"],
-        )],
-        DesktopControlOperation::BrightnessDown => vec![DesktopControlCommand::new(
-            "brightnessctl",
-            &["--class=backlight", "set", "10%-"],
-        )],
-        DesktopControlOperation::AudioSettings => {
-            vec![DesktopControlCommand::new("pavucontrol", &[])]
-        }
-        DesktopControlOperation::BluetoothTogglePower => vec![DesktopControlCommand::new(
-            "sh",
-            &[
-                "-lc",
-                "state=$(bluetoothctl show | awk '/Powered:/ {print $2}'); if [ \"$state\" = yes ]; then bluetoothctl power off; else bluetoothctl power on; fi",
-            ],
-        )],
-        DesktopControlOperation::NetworkSettings => {
-            vec![DesktopControlCommand::new("nm-connection-editor", &[])]
-        }
-        DesktopControlOperation::PowerProfileCycle => vec![DesktopControlCommand::new(
-            "sh",
-            &[
-                "-lc",
-                "current=$(powerprofilesctl get); case \"$current\" in performance) next=balanced ;; balanced) next=power-saver ;; *) next=performance ;; esac; powerprofilesctl set \"$next\"",
-            ],
-        )],
-        DesktopControlOperation::PowerProfileSet { profile } => vec![DesktopControlCommand {
-            program: "powerprofilesctl",
-            args: vec!["set".to_string(), profile.clone()],
-        }],
-        DesktopControlOperation::ScreenshotArea => vec![DesktopControlCommand::new(
-            "sh",
-            &[
-                "-lc",
-                "dir=\"$HOME/Pictures/Screenshots\"; mkdir -p \"$dir\"; ts=$(date +'%Y-%m-%d %H-%M-%S'); file=\"$dir/Screenshot from $ts.png\"; region=$(slurp) || exit 1; grim -g \"$region\" \"$file\" && wl-copy -t image/png < \"$file\"; notify-send \"Screenshot\" \"Saved to $file\" >/dev/null 2>&1 || true",
-            ],
-        )],
-        DesktopControlOperation::ScreenshotScreen => vec![DesktopControlCommand::new(
-            "sh",
-            &[
-                "-lc",
-                "dir=\"$HOME/Pictures/Screenshots\"; mkdir -p \"$dir\"; ts=$(date +'%Y-%m-%d %H-%M-%S'); file=\"$dir/Screenshot from $ts.png\"; grim \"$file\" && wl-copy -t image/png < \"$file\"; notify-send \"Screenshot\" \"Saved to $file\" >/dev/null 2>&1 || true",
-            ],
-        )],
-        DesktopControlOperation::ColorPicker => {
-            vec![DesktopControlCommand::new("hyprpicker", &["-a"])]
-        }
-        DesktopControlOperation::NotificationHistoryPop => {
-            vec![DesktopControlCommand::new("dunstctl", &["history-pop"])]
-        }
-        DesktopControlOperation::NotificationCloseAll => {
-            vec![DesktopControlCommand::new("dunstctl", &["close-all"])]
-        }
-        DesktopControlOperation::NotificationPauseToggle => vec![DesktopControlCommand::new(
-            "sh",
-            &[
-                "-lc",
-                "paused=$(dunstctl is-paused); if [ \"$paused\" = true ]; then dunstctl set-paused false; else dunstctl set-paused true; fi",
-            ],
-        )],
-    }
-}
-
-fn execute_desktop_control_operation(operation: &DesktopControlOperation) -> Result<()> {
-    for command in desktop_control_commands(operation) {
-        Command::new(command.program)
-            .args(&command.args)
-            .spawn()
-            .with_context(|| format!("failed to spawn {}", command.program))?;
-    }
-    Ok(())
-}
-
-fn lock_session() -> Result<()> {
-    if is_hyprland_session() && !process_running_for_user("hyprlock") {
-        if spawn_optional_command("hyprlock", &[])?.is_some() {
-            return Ok(());
-        }
-    }
-
-    if lock_current_logind_session()? {
-        return Ok(());
-    }
-
-    if !process_running_for_user("hyprlock") && spawn_optional_command("hyprlock", &[])?.is_some() {
-        return Ok(());
-    }
-
-    anyhow::bail!("no lock command is available for the current session");
-}
-
-fn logout_session() -> Result<()> {
-    if is_hyprland_session() && spawn_optional_command("hyprctl", &["dispatch", "exit"])?.is_some()
-    {
-        return Ok(());
-    }
-
-    if is_niri_session()
-        && spawn_optional_command("niri", &["msg", "action", "quit", "--skip-confirmation"])?
-            .is_some()
-    {
-        return Ok(());
-    }
-
-    if is_bspwm_session() && spawn_optional_command("bspc", &["quit"])?.is_some() {
-        return Ok(());
-    }
-
-    if let Some(session_id) = current_logind_session_id() {
-        spawn_system_command(
-            "loginctl",
-            &["terminate-session", &session_id],
-            "failed to terminate current session",
-        )?;
-        return Ok(());
-    }
-
-    anyhow::bail!("no safe logout method found for the current session");
-}
-
-fn lock_current_logind_session() -> Result<bool> {
-    if let Some(session_id) = current_logind_session_id() {
-        return spawn_optional_command("loginctl", &["lock-session", &session_id])
-            .map(|child| child.is_some());
-    }
-
-    spawn_optional_command("loginctl", &["lock-session"]).map(|child| child.is_some())
-}
-
-fn current_logind_session_id() -> Option<String> {
-    if let Ok(session_id) = std::env::var("XDG_SESSION_ID") {
-        if !session_id.trim().is_empty() {
-            return Some(session_id);
-        }
-    }
-
-    let user = std::env::var("USER").ok()?;
-    let output = Command::new("loginctl")
-        .args(["show-user", &user, "--property=Display", "--value"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let session_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if session_id.is_empty() || session_id == "n/a" {
-        None
-    } else {
-        Some(session_id)
-    }
-}
-
-fn is_hyprland_session() -> bool {
-    std::env::var("HYPRLAND_INSTANCE_SIGNATURE").is_ok() || desktop_matches("hyprland")
-}
-
-fn is_niri_session() -> bool {
-    std::env::var("NIRI_SOCKET").is_ok() || desktop_matches("niri")
-}
-
-fn is_bspwm_session() -> bool {
-    std::env::var("BSPWM_SOCKET").is_ok() || desktop_matches("bspwm")
-}
-
-fn desktop_matches(wanted: &str) -> bool {
-    let raw = std::env::var("XDG_CURRENT_DESKTOP")
-        .or_else(|_| std::env::var("XDG_SESSION_DESKTOP"))
-        .or_else(|_| std::env::var("DESKTOP_SESSION"))
-        .unwrap_or_default();
-
-    raw.split([':', ';'])
-        .any(|token| token.eq_ignore_ascii_case(wanted))
-}
-
-fn process_running_for_user(process_name: &str) -> bool {
-    let Ok(uid) = std::env::var("UID") else {
-        return false;
-    };
-    if uid.trim().is_empty() {
-        return false;
-    }
-
-    Command::new("pgrep")
-        .args(["-u", &uid, "-x", process_name])
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
 fn spawn_optional_command(program: &str, args: &[&str]) -> Result<Option<std::process::Child>> {
     match Command::new(program).args(args).spawn() {
         Ok(child) => Ok(Some(child)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error).with_context(|| format!("failed to spawn {program}")),
     }
-}
-
-fn spawn_system_command(program: &str, args: &[&str], message: &str) -> Result<()> {
-    spawn_optional_command(program, args)
-        .with_context(|| message.to_string())?
-        .with_context(|| format!("{program} is not installed"))?;
-    Ok(())
-}
-
-fn execute_password_operation(
-    window: &ApplicationWindow,
-    entry: &str,
-    operation: PasswordOperation,
-    previous_focus_target: Option<&WindowFocusTarget>,
-) -> Result<()> {
-    let credential = load_pass_credential(entry)?;
-
-    match operation {
-        PasswordOperation::AutotypeLogin => {
-            type_secret_steps(
-                window,
-                previous_focus_target,
-                default_login_steps(&credential),
-            )?;
-        }
-        PasswordOperation::CopyPassword => {
-            copy_secret(&credential.password)?;
-            window.close();
-        }
-        PasswordOperation::CopyUsername => {
-            copy_secret(&credential.username)?;
-            window.close();
-        }
-        PasswordOperation::TypePassword => {
-            type_secret_steps(
-                window,
-                previous_focus_target,
-                vec![TypeStep::Text(credential.password)],
-            )?;
-        }
-        PasswordOperation::TypeUsername => {
-            type_secret_steps(
-                window,
-                previous_focus_target,
-                vec![TypeStep::Text(credential.username)],
-            )?;
-        }
-        PasswordOperation::OpenUrl => {
-            let url = credential
-                .url
-                .context("pass entry does not contain a URL")?;
-            gio::AppInfo::launch_default_for_uri(&url, gio::AppLaunchContext::NONE)
-                .context("failed to open URL")?;
-            window.close();
-        }
-        PasswordOperation::CopyUrl => {
-            let url = credential
-                .url
-                .context("pass entry does not contain a URL")?;
-            copy_secret(&url)?;
-            window.close();
-        }
-        PasswordOperation::CopyOtp => {
-            let otp = load_pass_otp(entry)?;
-            copy_secret(&otp)?;
-            window.close();
-        }
-        PasswordOperation::TypeOtp => {
-            let otp = load_pass_otp(entry)?;
-            type_secret_steps(window, previous_focus_target, vec![TypeStep::Text(otp)])?;
-        }
-        PasswordOperation::CustomAutotype => {
-            let steps = custom_autotype_steps(entry, &credential)?;
-            type_secret_steps(window, previous_focus_target, steps)?;
-        }
-        PasswordOperation::Inspect => unreachable!("inspect is handled before action execution"),
-    }
-
-    Ok(())
-}
-
-fn type_secret_steps(
-    window: &ApplicationWindow,
-    previous_focus_target: Option<&WindowFocusTarget>,
-    steps: Vec<TypeStep>,
-) -> Result<()> {
-    let target = previous_focus_target
-        .context("no previously focused window was captured")?
-        .clone();
-    if !type_backend_available() {
-        anyhow::bail!("wtype or xdotool is required for password autotype");
-    }
-
-    let application_hold = window.application().map(|app| app.hold());
-    window.close();
-
-    glib::timeout_add_local_once(
-        Duration::from_millis(AUTOTYPE_AFTER_CLOSE_DELAY_MS),
-        move || {
-            if let Err(error) = run_type_secret_steps(&target, steps) {
-                eprintln!("password autotype failed: {error:?}");
-            }
-            drop(application_hold);
-        },
-    );
-
-    Ok(())
-}
-
-fn run_type_secret_steps(target: &WindowFocusTarget, steps: Vec<TypeStep>) -> Result<()> {
-    let status = focus_window(target).context("failed to refocus previous window")?;
-    if !status.success() {
-        anyhow::bail!("failed to refocus previous window");
-    }
-
-    let use_x11_backend = use_x11_type_backend(target) && command_exists("xdotool");
-    thread::sleep(Duration::from_millis(if use_x11_backend {
-        500
-    } else {
-        80
-    }));
-
-    let commands = if use_x11_backend {
-        xdotool_commands_for_steps(&steps)
-    } else if wayland_available() && command_exists("wtype") {
-        wtype_commands_for_steps(&steps)
-    } else {
-        xdotool_commands_for_steps(&steps)
-    };
-
-    for command in commands {
-        run_program_input(command)?;
-    }
-
-    Ok(())
-}
-
-fn type_backend_available() -> bool {
-    (wayland_available() && command_exists("wtype")) || command_exists("xdotool")
-}
-
-fn use_x11_type_backend(target: &WindowFocusTarget) -> bool {
-    matches!(
-        target,
-        WindowFocusTarget::Hyprland { xwayland: true, .. } | WindowFocusTarget::X11 { .. }
-    )
-}
-
-fn copy_secret(text: &str) -> Result<()> {
-    if wayland_available() && command_exists("wl-copy") {
-        run_program_input(wl_copy_command(text, password_clip_timeout_seconds()))
-    } else if command_exists("xclip") {
-        run_program_input(xclip_command(text))?;
-        clear_xclip_clipboard_after(password_clip_timeout_seconds());
-        Ok(())
-    } else {
-        anyhow::bail!("wl-copy or xclip is required to copy password data");
-    }
-}
-
-fn clear_xclip_clipboard_after(timeout_seconds: u64) {
-    thread::spawn(move || {
-        thread::sleep(Duration::from_secs(timeout_seconds));
-        let _ = Command::new("xclip")
-            .args(["-selection", "clipboard", "-in"])
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .and_then(|mut child| {
-                if let Some(stdin) = child.stdin.take() {
-                    drop(stdin);
-                }
-                child.wait().map(|_| ())
-            });
-    });
-}
-
-fn wayland_available() -> bool {
-    wayland_available_for_session(
-        std::env::var("XDG_SESSION_TYPE").ok().as_deref(),
-        std::env::var_os("WAYLAND_DISPLAY").is_some(),
-        is_hyprland_session() || is_niri_session(),
-    )
-}
-
-fn wayland_available_for_session(
-    session_type: Option<&str>,
-    wayland_display_set: bool,
-    known_wayland_compositor: bool,
-) -> bool {
-    wayland_display_set
-        && (known_wayland_compositor
-            || !session_type.is_some_and(|session| session.eq_ignore_ascii_case("x11")))
 }
 
 fn command_exists(program: &str) -> bool {
@@ -1886,176 +1099,6 @@ fn command_exists(program: &str) -> bool {
             path.is_file() && is_executable(&path)
         })
     })
-}
-
-fn password_clip_timeout_seconds() -> u64 {
-    app_config()
-        .map(|config| config.current().integrations.password_clip_timeout_seconds)
-        .filter(|seconds| *seconds > 0)
-        .unwrap_or_else(|| {
-            std::env::var("PASSWORD_STORE_CLIP_TIME")
-                .ok()
-                .and_then(|value| value.parse::<u64>().ok())
-                .filter(|seconds| *seconds > 0)
-                .unwrap_or(15)
-        })
-}
-
-fn inspected_password_results(credential: &Credential) -> Vec<ResultItem> {
-    let mut rows = vec![
-        password_action_result(
-            &credential.entry,
-            "Autotype login",
-            "Type username, Tab, and password without submitting",
-            PasswordOperation::AutotypeLogin,
-            1_000,
-            Some(pass_prediction_key(&credential.entry)),
-        ),
-        password_action_result(
-            &credential.entry,
-            "Copy password",
-            "Copy password and clear it after the password-store timeout",
-            PasswordOperation::CopyPassword,
-            950,
-            None,
-        ),
-        password_action_result(
-            &credential.entry,
-            "Copy username",
-            "Copy username metadata or the entry basename",
-            PasswordOperation::CopyUsername,
-            940,
-            None,
-        ),
-        password_action_result(
-            &credential.entry,
-            "Type password",
-            "Type only the password into the focused window",
-            PasswordOperation::TypePassword,
-            930,
-            None,
-        ),
-        password_action_result(
-            &credential.entry,
-            "Type username",
-            "Type only the username into the focused window",
-            PasswordOperation::TypeUsername,
-            920,
-            None,
-        ),
-    ];
-
-    if credential.url.is_some() {
-        rows.push(password_action_result(
-            &credential.entry,
-            "Open URL",
-            "Open this entry's URL in the default browser",
-            PasswordOperation::OpenUrl,
-            910,
-            None,
-        ));
-        rows.push(password_action_result(
-            &credential.entry,
-            "Copy URL",
-            "Copy this entry's URL",
-            PasswordOperation::CopyUrl,
-            900,
-            None,
-        ));
-    }
-
-    if credential.otp_uri.is_some() {
-        rows.push(password_action_result(
-            &credential.entry,
-            "Copy OTP",
-            "Generate and copy a one-time password with pass-otp",
-            PasswordOperation::CopyOtp,
-            890,
-            None,
-        ));
-        rows.push(password_action_result(
-            &credential.entry,
-            "Type OTP",
-            "Generate and type a one-time password with pass-otp",
-            PasswordOperation::TypeOtp,
-            880,
-            None,
-        ));
-    }
-
-    if credential.autotype.is_some() {
-        rows.push(password_action_result(
-            &credential.entry,
-            "Custom autotype",
-            "Run this entry's autotype template",
-            PasswordOperation::CustomAutotype,
-            870,
-            None,
-        ));
-    }
-
-    rows
-}
-
-fn password_action_result(
-    entry: &str,
-    title: &str,
-    subtitle: &str,
-    operation: PasswordOperation,
-    score: i32,
-    prediction_key: Option<String>,
-) -> ResultItem {
-    ResultItem {
-        prediction_key,
-        title: format!("{title}: {entry}"),
-        subtitle: subtitle.to_string(),
-        source: "Passwords",
-        icon_name: "dialog-password-symbolic".to_string(),
-        score,
-        action: Action::Password {
-            entry: entry.to_string(),
-            operation,
-        },
-        ..Default::default()
-    }
-}
-
-fn custom_autotype_steps(entry: &str, credential: &Credential) -> Result<Vec<TypeStep>> {
-    let template = credential
-        .autotype
-        .as_deref()
-        .context("pass entry does not contain an autotype template")?;
-    let mut steps = Vec::new();
-
-    let mut tokens = template.split_whitespace().peekable();
-    while let Some(token) = tokens.next() {
-        match token {
-            ":tab" => steps.push(TypeStep::Key("Tab")),
-            ":space" => steps.push(TypeStep::Text(" ".to_string())),
-            ":enter" => steps.push(TypeStep::Key("Return")),
-            ":delay" => steps.push(TypeStep::Delay(1_000)),
-            "pass" | "password" => steps.push(TypeStep::Text(credential.password.clone())),
-            "user" | "username" => steps.push(TypeStep::Text(credential.username.clone())),
-            "path" => steps.push(TypeStep::Text(entry.to_string())),
-            "basename" | "filename" => {
-                steps.push(TypeStep::Text(crate::password::fallback_username(entry)));
-            }
-            ":otp" => {
-                if matches!(tokens.peek(), Some(&"pass") | Some(&"gopass")) {
-                    tokens.next();
-                }
-                steps.push(TypeStep::Text(load_pass_otp(entry)?));
-            }
-            key => {
-                let Some(value) = credential.fields.get(&key.to_ascii_lowercase()) else {
-                    anyhow::bail!("unknown autotype token: {key}");
-                };
-                steps.push(TypeStep::Text(value.clone()));
-            }
-        }
-    }
-
-    Ok(steps)
 }
 
 fn launch_desktop_app(desktop_id: &str) -> Result<()> {
@@ -2290,39 +1333,6 @@ fn copy_to_clipboard(text: &str) {
     }
 }
 
-fn load_pass_secret(entry: &str) -> Result<String> {
-    parse_credential(entry, &load_pass_output(&["show", entry])?)
-        .map(|credential| credential.password)
-}
-
-fn load_pass_credential(entry: &str) -> Result<Credential> {
-    parse_credential(entry, &load_pass_output(&["show", entry])?)
-}
-
-fn load_pass_otp(entry: &str) -> Result<String> {
-    load_pass_output(&["otp", entry]).map(|output| output.trim().to_string())
-}
-
-fn load_pass_output(args: &[&str]) -> Result<String> {
-    let output = Command::new("pass")
-        .args(args)
-        .output()
-        .context("failed to run pass")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        anyhow::bail!(
-            "{}",
-            if stderr.is_empty() {
-                "pass failed"
-            } else {
-                stderr.as_str()
-            }
-        );
-    }
-
-    String::from_utf8(output.stdout).context("pass returned non-UTF-8 output")
-}
-
 fn default_ssh_terminal(home: Option<&std::path::Path>) -> String {
     if let Some(home) = home {
         let launcher = home.join(".dotfiles/scripts/launch_kitty.sh");
@@ -2532,11 +1542,13 @@ mod tests {
     use super::{
         EmailOpenStrategy, LAUNCHER_SHADOW_BLUR_PX, LAUNCHER_SHADOW_Y_OFFSET_PX,
         LAUNCHER_SURFACE_MARGIN_BOTTOM_PX, LAUNCHER_SURFACE_MARGIN_PX, SearchUpdatePhase,
-        action_failure_result, background_processing_after_update, default_ssh_terminal,
-        desktop_control_commands, email_open_strategy, inspected_password_results, launcher_css,
-        layer_shell_enabled, pending_deferred_results, power_confirmation_results,
-        power_requires_confirmation, preserved_selection_index, row_tooltip_text,
-        wayland_available_for_session,
+        action_failure_result, default_ssh_terminal, email_open_strategy,
+        inspected_password_results, launcher_css, layer_shell_enabled, power_confirmation_results,
+        power_requires_confirmation,
+    };
+    use crate::actions::{
+        desktop_controls::desktop_control_commands, password::use_x11_type_backend,
+        password::wayland_available_for_session,
     };
     use crate::config::{EmailBackendPreference, EmailConfig};
     use crate::model::{
@@ -2544,6 +1556,10 @@ mod tests {
         WindowFocusTarget,
     };
     use crate::password::parse_credential;
+    use crate::ui::results::{
+        background_processing_after_update, pending_deferred_results, preserved_selection_index,
+        row_tooltip_text,
+    };
     use std::fs::{self, File};
 
     #[test]
@@ -2726,11 +1742,11 @@ mod tests {
 
     #[test]
     fn xwayland_hyprland_targets_use_the_x11_type_backend() {
-        assert!(super::use_x11_type_backend(&WindowFocusTarget::Hyprland {
+        assert!(use_x11_type_backend(&WindowFocusTarget::Hyprland {
             address: "0xabc".to_string(),
             xwayland: true,
         }));
-        assert!(!super::use_x11_type_backend(&WindowFocusTarget::Hyprland {
+        assert!(!use_x11_type_backend(&WindowFocusTarget::Hyprland {
             address: "0xabc".to_string(),
             xwayland: false,
         }));
