@@ -56,11 +56,13 @@ pub(crate) struct DeferredSearchPlan {
     pub email: bool,
     pub windows: bool,
     pub controls: bool,
+    pub recents: bool,
+    pub calc: bool,
 }
 
 impl DeferredSearchPlan {
     pub fn is_empty(self) -> bool {
-        !self.files && !self.email && !self.windows && !self.controls
+        !self.files && !self.email && !self.windows && !self.controls && !self.recents && !self.calc
     }
 }
 
@@ -423,7 +425,9 @@ impl Sources {
 
         if query.mode == SearchMode::All {
             results.extend(self.search_bookmarks(&query, now));
-            results.extend(self.search_recent_files(&query, now));
+            if !self.should_defer_recent_files_search(&query) {
+                results.extend(self.search_recent_files(&query, now));
+            }
         }
 
         if query.mode == SearchMode::Commands {
@@ -438,7 +442,8 @@ impl Sources {
             results.push(result);
         }
 
-        if query.mode.includes(SearchMode::Calc) {
+        let calc_search_deferred = self.should_defer_calc_search(&query);
+        if !calc_search_deferred && query.mode.includes(SearchMode::Calc) {
             if let Some(result) = self.search_calc(&query, now) {
                 results.push(result);
             }
@@ -462,6 +467,8 @@ impl Sources {
             results.extend(self.email_search_status_result(&query));
         }
 
+        let recent_files_deferred = self.should_defer_recent_files_search(&query);
+
         SearchSnapshot {
             query,
             immediate_results: results,
@@ -470,6 +477,8 @@ impl Sources {
                 email: email_search_deferred,
                 windows: windows_search_deferred,
                 controls: controls_search_deferred,
+                recents: recent_files_deferred,
+                calc: calc_search_deferred,
             },
         }
     }
@@ -492,6 +501,16 @@ impl Sources {
 
         if snapshot.deferred.controls {
             results.extend(self.search_controls(&snapshot.query, now));
+        }
+
+        if snapshot.deferred.recents {
+            results.extend(self.search_recent_files(&snapshot.query, now));
+        }
+
+        if snapshot.deferred.calc {
+            if let Some(result) = self.search_calc(&snapshot.query, now) {
+                results.push(result);
+            }
         }
 
         results
@@ -542,6 +561,17 @@ impl Sources {
 
     fn should_defer_controls_search(&self, query: &QueryInput) -> bool {
         query.mode == SearchMode::All && self.current_config().sources.controls
+    }
+
+    fn should_defer_recent_files_search(&self, query: &QueryInput) -> bool {
+        query.mode == SearchMode::All && self.current_config().sources.recents
+    }
+
+    fn should_defer_calc_search(&self, query: &QueryInput) -> bool {
+        query.mode == SearchMode::All
+            && self.current_config().sources.calc
+            && self.qalc_available
+            && looks_like_math(&query.text)
     }
 
     fn file_search_status_result(&self, query: &QueryInput) -> Vec<ResultItem> {
@@ -4780,6 +4810,42 @@ mod tests {
                 .immediate_results
                 .iter()
                 .all(|item| item.source != "Windows" && item.source != "Controls")
+        );
+    }
+
+    #[test]
+    fn all_mode_keeps_app_results_immediate_while_deferring_recent_files() {
+        let mut sources = empty_sources();
+        sources.apps = vec![AppEntry {
+            desktop_id: "firefox.desktop".to_string(),
+            name: "Firefox".to_string(),
+            description: "Web Browser".to_string(),
+            executable: "firefox".to_string(),
+            icon_name: "firefox".to_string(),
+            search_blob: "firefox web browser".to_string(),
+        }];
+        sources.recent_files = vec![RecentFileEntry {
+            title: "Firefox Notes".to_string(),
+            path: "/tmp/firefox-notes.txt".to_string(),
+            modified: 0,
+            search_blob: "firefox notes".to_string(),
+        }];
+
+        let snapshot = sources.search_snapshot("firefox", SearchMode::All, None);
+
+        assert!(
+            snapshot
+                .immediate_results
+                .iter()
+                .any(|item| item.source == "Applications" && item.title == "Firefox"),
+            "application matches should be available in the first render"
+        );
+        assert!(
+            snapshot
+                .immediate_results
+                .iter()
+                .all(|item| item.source != "Recent Files"),
+            "recent-file metadata should not block the first render"
         );
     }
 
