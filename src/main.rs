@@ -123,6 +123,25 @@ enum SearchUpdatePhase {
     Deferred,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SearchWork {
+    ImmediateSnapshot,
+    DeferredProviders,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SearchWorkExecution {
+    Inline,
+    BackgroundThread,
+}
+
+fn search_work_execution(work: SearchWork) -> SearchWorkExecution {
+    match work {
+        SearchWork::ImmediateSnapshot => SearchWorkExecution::Inline,
+        SearchWork::DeferredProviders => SearchWorkExecution::BackgroundThread,
+    }
+}
+
 impl SearchController {
     fn new(
         entry: Entry,
@@ -168,20 +187,33 @@ impl SearchController {
         let query = self.entry.text().to_string();
         let clipboard_url = self.clipboard_url.borrow().clone();
         let generation = self.bump_generation();
-        set_background_processing(&self.spinner, true);
 
         let sources = self.sources.clone();
-        let tx = self.update_tx.clone();
         let mode = self.mode;
-        thread::spawn(move || {
-            let snapshot = sources.search_snapshot(&query, mode, clipboard_url.as_deref());
-            let _ = tx.send(SearchUpdate {
-                generation,
-                phase: SearchUpdatePhase::Immediate,
-                snapshot,
-                deferred_results: Vec::new(),
-            });
-        });
+        match search_work_execution(SearchWork::ImmediateSnapshot) {
+            SearchWorkExecution::Inline => {
+                let snapshot = sources.search_snapshot(&query, mode, clipboard_url.as_deref());
+                self.apply_search_update(SearchUpdate {
+                    generation,
+                    phase: SearchUpdatePhase::Immediate,
+                    snapshot,
+                    deferred_results: Vec::new(),
+                });
+            }
+            SearchWorkExecution::BackgroundThread => {
+                set_background_processing(&self.spinner, true);
+                let tx = self.update_tx.clone();
+                thread::spawn(move || {
+                    let snapshot = sources.search_snapshot(&query, mode, clipboard_url.as_deref());
+                    let _ = tx.send(SearchUpdate {
+                        generation,
+                        phase: SearchUpdatePhase::Immediate,
+                        snapshot,
+                        deferred_results: Vec::new(),
+                    });
+                });
+            }
+        }
     }
 
     fn drain_updates(&self) {
@@ -189,7 +221,7 @@ impl SearchController {
             let update = { self.update_rx.borrow_mut().try_recv() };
 
             match update {
-                Ok(update) => self.apply_deferred_results(update),
+                Ok(update) => self.apply_search_update(update),
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
             }
@@ -218,21 +250,34 @@ impl SearchController {
                 let sources = controller.sources.clone();
                 let snapshot = snapshot_for_timeout.clone();
                 let tx = controller.update_tx.clone();
-                thread::spawn(move || {
-                    let deferred_results = sources.search_deferred_results(&snapshot);
-                    let _ = tx.send(SearchUpdate {
-                        generation,
-                        phase: SearchUpdatePhase::Deferred,
-                        snapshot,
-                        deferred_results,
-                    });
-                });
+                match search_work_execution(SearchWork::DeferredProviders) {
+                    SearchWorkExecution::Inline => {
+                        let deferred_results = sources.search_deferred_results(&snapshot);
+                        let _ = tx.send(SearchUpdate {
+                            generation,
+                            phase: SearchUpdatePhase::Deferred,
+                            snapshot,
+                            deferred_results,
+                        });
+                    }
+                    SearchWorkExecution::BackgroundThread => {
+                        thread::spawn(move || {
+                            let deferred_results = sources.search_deferred_results(&snapshot);
+                            let _ = tx.send(SearchUpdate {
+                                generation,
+                                phase: SearchUpdatePhase::Deferred,
+                                snapshot,
+                                deferred_results,
+                            });
+                        });
+                    }
+                }
             },
         );
         self.state.borrow_mut().pending_timeout = Some(source_id);
     }
 
-    fn apply_deferred_results(&self, update: SearchUpdate) {
+    fn apply_search_update(&self, update: SearchUpdate) {
         let SearchUpdate {
             generation,
             phase,
@@ -1542,9 +1587,9 @@ mod tests {
     use super::{
         EmailOpenStrategy, LAUNCHER_SHADOW_BLUR_PX, LAUNCHER_SHADOW_Y_OFFSET_PX,
         LAUNCHER_SURFACE_MARGIN_BOTTOM_PX, LAUNCHER_SURFACE_MARGIN_PX, SearchUpdatePhase,
-        action_failure_result, default_ssh_terminal, email_open_strategy,
-        inspected_password_results, launcher_css, layer_shell_enabled, power_confirmation_results,
-        power_requires_confirmation,
+        SearchWork, SearchWorkExecution, action_failure_result, default_ssh_terminal,
+        email_open_strategy, inspected_password_results, launcher_css, layer_shell_enabled,
+        power_confirmation_results, power_requires_confirmation, search_work_execution,
     };
     use crate::actions::{
         desktop_controls::desktop_control_commands, password::use_x11_type_backend,
@@ -1665,6 +1710,18 @@ mod tests {
             SearchUpdatePhase::Deferred,
             true
         ));
+    }
+
+    #[test]
+    fn immediate_search_snapshots_are_applied_inline() {
+        assert_eq!(
+            search_work_execution(SearchWork::ImmediateSnapshot),
+            SearchWorkExecution::Inline
+        );
+        assert_eq!(
+            search_work_execution(SearchWork::DeferredProviders),
+            SearchWorkExecution::BackgroundThread
+        );
     }
 
     #[test]
