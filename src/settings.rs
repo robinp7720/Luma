@@ -123,12 +123,19 @@ pub fn open_config_panel(parent: &ApplicationWindow) -> Result<()> {
     let calc_switch = build_switch(config.sources.calc);
     let power_switch = build_switch(config.sources.power);
     let controls_switch = build_switch(config.sources.controls);
+    let packages_switch = build_switch(config.sources.packages);
 
     append_setting_row(
         &sources_card,
         "Applications",
         "Search desktop entries and launch apps.",
         &apps_switch,
+    );
+    append_setting_row(
+        &sources_card,
+        "Packages",
+        "Search pacman/paru packages and open installs in a terminal.",
+        &packages_switch,
     );
     append_setting_row(
         &sources_card,
@@ -382,6 +389,7 @@ pub fn open_config_panel(parent: &ApplicationWindow) -> Result<()> {
             next.sources.calc = calc_switch.is_active();
             next.sources.power = power_switch.is_active();
             next.sources.controls = controls_switch.is_active();
+            next.sources.packages = packages_switch.is_active();
 
             next.integrations.email.preferred_backend =
                 email_backend_from_dropdown(email_backend.selected());
@@ -536,6 +544,7 @@ fn build_mode_dropdown(current: SearchMode) -> DropDown {
         "Web",
         "Calculator",
         "Controls",
+        "Packages",
     ]);
     dropdown.set_selected(search_mode_index(current) as u32);
     dropdown
@@ -565,7 +574,8 @@ fn mode_from_dropdown(index: u32) -> SearchMode {
         7 => SearchMode::Commands,
         8 => SearchMode::Web,
         9 => SearchMode::Calc,
-        _ => SearchMode::Controls,
+        10 => SearchMode::Controls,
+        _ => SearchMode::Packages,
     }
 }
 
@@ -582,6 +592,7 @@ fn search_mode_index(mode: SearchMode) -> usize {
         SearchMode::Web => 8,
         SearchMode::Calc => 9,
         SearchMode::Controls => 10,
+        SearchMode::Packages => 11,
     }
 }
 

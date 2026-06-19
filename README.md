@@ -9,6 +9,7 @@ Luma also includes a built-in settings panel for interactive configuration. Type
 ## Features
 
 - Application launcher with icon-theme support
+- Pacman/paru package search with terminal-backed installs
 - Active window switching on Hyprland and Niri
 - Predictive ranking based on local activation history
 - File search through `localsearch`
@@ -31,6 +32,7 @@ Luma is a desktop utility for Linux and expects a working GTK 4 environment.
 Optional integrations:
 
 - `localsearch` for file search
+- `pacman` or `paru` for package search and installs
 - `pass` for password search and creation
 - `pass-otp` for OTP inspection actions
 - `wtype` on Wayland or `xdotool` on X11 for password autotype
@@ -84,6 +86,7 @@ Optional dedicated modes:
 
 ```bash
 Luma --mode commands
+Luma --mode packages
 Luma --mode windows
 Luma --mode files
 Luma --mode pass
@@ -99,6 +102,7 @@ Luma understands a few lightweight prefixes:
 ```text
 bookmark: rust docs
 recent: report
+pkg: firefox
 pass: github/work
 mail: invoices
 ssh: web-server
@@ -168,6 +172,7 @@ Control rows expose local desktop actions for:
 - File search requires `localsearch` to be installed and indexed.
 - Bookmark search reads Firefox `places.sqlite` through `sqlite3` when available and Chromium-family `Bookmarks` JSON directly.
 - Recent file search reads local `file://` entries from `recently-used.xbel`.
+- Package search prefers `paru -Ss` when paru is installed, falls back to `pacman -Ss`, and opens installs in a terminal with `paru -S` or `sudo pacman -S`.
 - Email search reads Thunderbird's `global-messages-db.sqlite` when available and can also search the Evolution helper plus local `.eml` / maildir-style message files.
 - Evolution is opt-in in settings so Luma does not talk to EDS unless you enable it and point it at a helper command if needed.
 - The default helper command is `luma-mail-eds`; override it in settings if your build lives elsewhere.

@@ -14,6 +14,7 @@ pub enum SearchMode {
     Web,
     Calc,
     Controls,
+    Packages,
 }
 
 impl SearchMode {
@@ -82,6 +83,13 @@ pub enum DesktopControlOperation {
     NotificationPauseToggle,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum PackageManager {
+    Pacman,
+    #[serde(alias = "Yay")]
+    Paru,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub enum Action {
     LaunchApp {
@@ -119,6 +127,10 @@ pub enum Action {
     },
     DesktopControl {
         operation: DesktopControlOperation,
+    },
+    InstallPackage {
+        package: String,
+        manager: PackageManager,
     },
     OpenUrl {
         url: String,
@@ -159,6 +171,7 @@ pub enum PasswordOperation {
 pub struct QueryInput {
     pub mode: SearchMode,
     pub source_filter: SourceFilter,
+    pub package_manager: Option<PackageManager>,
     pub text: String,
 }
 
@@ -172,17 +185,20 @@ pub enum SourceFilter {
 impl QueryInput {
     pub fn parse(raw: &str, cli_mode: SearchMode) -> Self {
         let trimmed = raw.trim();
-        let (mode, source_filter, text) =
-            parse_prefixed_query(trimmed).unwrap_or((cli_mode, SourceFilter::All, trimmed));
+        let (mode, source_filter, package_manager, text) =
+            parse_prefixed_query(trimmed).unwrap_or((cli_mode, SourceFilter::All, None, trimmed));
         Self {
             mode,
             source_filter,
+            package_manager,
             text: text.to_string(),
         }
     }
 }
 
-fn parse_prefixed_query(raw: &str) -> Option<(SearchMode, SourceFilter, &str)> {
+fn parse_prefixed_query(
+    raw: &str,
+) -> Option<(SearchMode, SourceFilter, Option<PackageManager>, &str)> {
     if raw.is_empty() {
         return None;
     }
@@ -192,53 +208,94 @@ fn parse_prefixed_query(raw: &str) -> Option<(SearchMode, SourceFilter, &str)> {
     let rest = &raw[first.len_utf8()..];
 
     match first {
-        '>' => return Some((SearchMode::Commands, SourceFilter::All, rest.trim_start())),
-        '~' => return Some((SearchMode::Windows, SourceFilter::All, rest.trim_start())),
-        '@' => return Some((SearchMode::Ssh, SourceFilter::All, rest.trim_start())),
-        '!' => return Some((SearchMode::Pass, SourceFilter::All, rest.trim_start())),
-        '?' => return Some((SearchMode::Web, SourceFilter::All, rest.trim_start())),
-        '=' => return Some((SearchMode::Calc, SourceFilter::All, rest.trim_start())),
+        '>' => {
+            return Some((
+                SearchMode::Commands,
+                SourceFilter::All,
+                None,
+                rest.trim_start(),
+            ));
+        }
+        '~' => {
+            return Some((
+                SearchMode::Windows,
+                SourceFilter::All,
+                None,
+                rest.trim_start(),
+            ));
+        }
+        '@' => return Some((SearchMode::Ssh, SourceFilter::All, None, rest.trim_start())),
+        '!' => return Some((SearchMode::Pass, SourceFilter::All, None, rest.trim_start())),
+        '?' => return Some((SearchMode::Web, SourceFilter::All, None, rest.trim_start())),
+        '=' => return Some((SearchMode::Calc, SourceFilter::All, None, rest.trim_start())),
         '/' => {
             let whitespace_prefixed = rest.chars().next().is_none_or(char::is_whitespace);
             if whitespace_prefixed {
-                return Some((SearchMode::Files, SourceFilter::All, rest.trim_start()));
+                return Some((
+                    SearchMode::Files,
+                    SourceFilter::All,
+                    None,
+                    rest.trim_start(),
+                ));
             }
         }
         _ => {}
     }
 
     let lowered = raw.to_ascii_lowercase();
-    const PREFIXES: [(&str, SearchMode, SourceFilter); 23] = [
-        ("apps:", SearchMode::Apps, SourceFilter::All),
-        ("app:", SearchMode::Apps, SourceFilter::All),
-        ("windows:", SearchMode::Windows, SourceFilter::All),
-        ("window:", SearchMode::Windows, SourceFilter::All),
-        ("win:", SearchMode::Windows, SourceFilter::All),
-        ("files:", SearchMode::Files, SourceFilter::All),
-        ("file:", SearchMode::Files, SourceFilter::All),
-        ("ssh:", SearchMode::Ssh, SourceFilter::All),
-        ("pass:", SearchMode::Pass, SourceFilter::All),
-        ("password:", SearchMode::Pass, SourceFilter::All),
-        ("email:", SearchMode::Email, SourceFilter::All),
-        ("mail:", SearchMode::Email, SourceFilter::All),
-        ("cmd:", SearchMode::Commands, SourceFilter::All),
-        ("command:", SearchMode::Commands, SourceFilter::All),
-        ("web:", SearchMode::Web, SourceFilter::All),
-        ("calc:", SearchMode::Calc, SourceFilter::All),
-        ("controls:", SearchMode::Controls, SourceFilter::All),
-        ("control:", SearchMode::Controls, SourceFilter::All),
-        ("ctl:", SearchMode::Controls, SourceFilter::All),
-        ("bookmarks:", SearchMode::All, SourceFilter::Bookmarks),
-        ("bookmark:", SearchMode::All, SourceFilter::Bookmarks),
-        ("recents:", SearchMode::All, SourceFilter::Recents),
-        ("recent:", SearchMode::All, SourceFilter::Recents),
+    const PREFIXES: [(&str, SearchMode, SourceFilter, Option<PackageManager>); 28] = [
+        ("apps:", SearchMode::Apps, SourceFilter::All, None),
+        ("app:", SearchMode::Apps, SourceFilter::All, None),
+        ("windows:", SearchMode::Windows, SourceFilter::All, None),
+        ("window:", SearchMode::Windows, SourceFilter::All, None),
+        ("win:", SearchMode::Windows, SourceFilter::All, None),
+        ("files:", SearchMode::Files, SourceFilter::All, None),
+        ("file:", SearchMode::Files, SourceFilter::All, None),
+        ("ssh:", SearchMode::Ssh, SourceFilter::All, None),
+        ("pass:", SearchMode::Pass, SourceFilter::All, None),
+        ("password:", SearchMode::Pass, SourceFilter::All, None),
+        ("email:", SearchMode::Email, SourceFilter::All, None),
+        ("mail:", SearchMode::Email, SourceFilter::All, None),
+        ("cmd:", SearchMode::Commands, SourceFilter::All, None),
+        ("command:", SearchMode::Commands, SourceFilter::All, None),
+        ("web:", SearchMode::Web, SourceFilter::All, None),
+        ("calc:", SearchMode::Calc, SourceFilter::All, None),
+        ("controls:", SearchMode::Controls, SourceFilter::All, None),
+        ("control:", SearchMode::Controls, SourceFilter::All, None),
+        ("ctl:", SearchMode::Controls, SourceFilter::All, None),
+        ("packages:", SearchMode::Packages, SourceFilter::All, None),
+        ("package:", SearchMode::Packages, SourceFilter::All, None),
+        ("pkg:", SearchMode::Packages, SourceFilter::All, None),
+        (
+            "pacman:",
+            SearchMode::Packages,
+            SourceFilter::All,
+            Some(PackageManager::Pacman),
+        ),
+        (
+            "paru:",
+            SearchMode::Packages,
+            SourceFilter::All,
+            Some(PackageManager::Paru),
+        ),
+        ("bookmarks:", SearchMode::All, SourceFilter::Bookmarks, None),
+        ("bookmark:", SearchMode::All, SourceFilter::Bookmarks, None),
+        ("recents:", SearchMode::All, SourceFilter::Recents, None),
+        ("recent:", SearchMode::All, SourceFilter::Recents, None),
     ];
 
-    PREFIXES.iter().find_map(|(prefix, mode, source_filter)| {
-        lowered
-            .strip_prefix(prefix)
-            .map(|_| (*mode, *source_filter, raw[prefix.len()..].trim_start()))
-    })
+    PREFIXES
+        .iter()
+        .find_map(|(prefix, mode, source_filter, package_manager)| {
+            lowered.strip_prefix(prefix).map(|_| {
+                (
+                    *mode,
+                    *source_filter,
+                    *package_manager,
+                    raw[prefix.len()..].trim_start(),
+                )
+            })
+        })
 }
 
 pub fn score_text(haystack: &str, query: &str) -> Option<i32> {
@@ -431,6 +488,33 @@ mod tests {
         let short = QueryInput::parse("ctl: screenshot", SearchMode::All);
         assert_eq!(short.mode, SearchMode::Controls);
         assert_eq!(short.text, "screenshot");
+    }
+
+    #[test]
+    fn textual_prefixes_can_select_packages_mode() {
+        let package = QueryInput::parse("package: firefox", SearchMode::Apps);
+        assert_eq!(package.mode, SearchMode::Packages);
+        assert_eq!(package.text, "firefox");
+
+        let short = QueryInput::parse("pkg: obsidian", SearchMode::All);
+        assert_eq!(short.mode, SearchMode::Packages);
+        assert_eq!(short.text, "obsidian");
+    }
+
+    #[test]
+    fn package_manager_prefixes_force_the_matching_backend() {
+        let paru = QueryInput::parse("paru: veloren", SearchMode::All);
+        assert_eq!(paru.mode, SearchMode::Packages);
+        assert_eq!(paru.package_manager, Some(super::PackageManager::Paru));
+        assert_eq!(paru.text, "veloren");
+
+        let pacman = QueryInput::parse("pacman: firefox", SearchMode::All);
+        assert_eq!(pacman.mode, SearchMode::Packages);
+        assert_eq!(pacman.package_manager, Some(super::PackageManager::Pacman));
+        assert_eq!(pacman.text, "firefox");
+
+        let auto = QueryInput::parse("pkg: firefox", SearchMode::All);
+        assert_eq!(auto.package_manager, None);
     }
 
     #[test]

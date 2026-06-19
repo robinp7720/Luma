@@ -1,8 +1,8 @@
 use crate::config::{ConfigStore, EmailBackendPreference, FileSearchBackendChoice, LauncherConfig};
 use crate::mail_eds_protocol::{MailEdsMessageSummary, MailEdsSearchResponse};
 use crate::model::{
-    Action, DesktopControlOperation, EntryBadge, PowerOperation, QueryInput, ResultItem,
-    SearchMode, SourceFilter, browser_target, password_url_draft, score_text,
+    Action, DesktopControlOperation, EntryBadge, PackageManager, PowerOperation, QueryInput,
+    ResultItem, SearchMode, SourceFilter, browser_target, password_url_draft, score_text,
 };
 use crate::prediction::{PredictionStore, StoredPrediction};
 use anyhow::{Context, Result};
@@ -34,7 +34,10 @@ const MAX_POWER_ACTIONS: usize = 5;
 const MAX_BOOKMARKS: usize = 8;
 const MAX_RECENTS: usize = 8;
 const MAX_CONTROLS: usize = 12;
+const MAX_PACKAGES: usize = 8;
+const MAX_RESULTS: usize = 24;
 const MIN_FILE_QUERY_CHARS: usize = 2;
+const MIN_PACKAGE_QUERY_CHARS: usize = 2;
 
 // Base scores per source sit below the primary launcher categories (apps 900,
 // pass 880, bookmarks 830) so a strong text match on a deferred result cannot
@@ -58,11 +61,18 @@ pub(crate) struct DeferredSearchPlan {
     pub controls: bool,
     pub recents: bool,
     pub calc: bool,
+    pub packages: bool,
 }
 
 impl DeferredSearchPlan {
     pub fn is_empty(self) -> bool {
-        !self.files && !self.email && !self.windows && !self.controls && !self.recents && !self.calc
+        !self.files
+            && !self.email
+            && !self.windows
+            && !self.controls
+            && !self.recents
+            && !self.calc
+            && !self.packages
     }
 }
 
@@ -216,6 +226,46 @@ impl FileSearchBackend {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PackageSearchBackend {
+    Pacman,
+    Paru,
+}
+
+impl PackageSearchBackend {
+    fn detect() -> Option<Self> {
+        if package_command_path("paru").is_some() {
+            Some(Self::Paru)
+        } else if package_command_path("pacman").is_some() {
+            Some(Self::Pacman)
+        } else {
+            None
+        }
+    }
+
+    fn manager(self) -> PackageManager {
+        match self {
+            Self::Pacman => PackageManager::Pacman,
+            Self::Paru => PackageManager::Paru,
+        }
+    }
+
+    fn run_search(self, query: &str) -> std::io::Result<std::process::Output> {
+        match self {
+            Self::Pacman => {
+                Command::new(package_command_path("pacman").unwrap_or_else(|| "pacman".into()))
+                    .args(["-Ss", query])
+                    .output()
+            }
+            Self::Paru => {
+                Command::new(package_command_path("paru").unwrap_or_else(|| "paru".into()))
+                    .args(["-Ss", query])
+                    .output()
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct AppEntry {
     pub desktop_id: String,
@@ -245,6 +295,15 @@ pub struct RecentFileEntry {
     pub path: String,
     pub modified: i64,
     pub search_blob: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PackageEntry {
+    pub repository: String,
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub installed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -279,6 +338,7 @@ pub struct Sources {
     commands: Vec<String>,
     bookmarks: Vec<BookmarkEntry>,
     recent_files: Vec<RecentFileEntry>,
+    package_search_backend: Option<PackageSearchBackend>,
     thunderbird_email_database_paths: Vec<PathBuf>,
     local_email_entries: Vec<EmailEntry>,
     file_search_backend: Option<FileSearchBackend>,
@@ -297,6 +357,7 @@ impl Sources {
             commands: load_commands(),
             bookmarks: load_browser_bookmarks(),
             recent_files: load_recent_files(),
+            package_search_backend: PackageSearchBackend::detect(),
             thunderbird_email_database_paths: load_thunderbird_email_databases(
                 &config.current().integrations.email,
             ),
@@ -401,6 +462,8 @@ impl Sources {
             results.extend(self.search_apps(&query, now));
         }
 
+        let package_search_deferred = self.should_defer_package_search(&query);
+
         let windows_search_deferred = self.should_defer_windows_search(&query);
         if !windows_search_deferred && query.mode.includes(SearchMode::Windows) {
             results.extend(self.search_windows(&query, now));
@@ -449,6 +512,10 @@ impl Sources {
             }
         }
 
+        if !package_search_deferred && query.mode == SearchMode::Packages {
+            results.extend(self.package_search_status_result(&query));
+        }
+
         if let Some(result) = self.search_url(&query, now) {
             results.push(result);
         }
@@ -479,6 +546,7 @@ impl Sources {
                 controls: controls_search_deferred,
                 recents: recent_files_deferred,
                 calc: calc_search_deferred,
+                packages: package_search_deferred,
             },
         }
     }
@@ -511,6 +579,10 @@ impl Sources {
             if let Some(result) = self.search_calc(&snapshot.query, now) {
                 results.push(result);
             }
+        }
+
+        if snapshot.deferred.packages {
+            results.extend(self.search_packages(&snapshot.query, now));
         }
 
         results
@@ -574,6 +646,16 @@ impl Sources {
             && looks_like_math(&query.text)
     }
 
+    fn should_defer_package_search(&self, query: &QueryInput) -> bool {
+        if !query.mode.includes(SearchMode::Packages) {
+            return false;
+        }
+
+        self.current_config().sources.packages
+            && package_backend_for_query(query, self.package_search_backend).is_some()
+            && query.text.chars().count() >= MIN_PACKAGE_QUERY_CHARS
+    }
+
     fn file_search_status_result(&self, query: &QueryInput) -> Vec<ResultItem> {
         let config = self.current_config();
         if !config.sources.files {
@@ -607,6 +689,41 @@ impl Sources {
                 action: Action::None,
                 ..Default::default()
             }];
+        }
+
+        Vec::new()
+    }
+
+    fn package_search_status_result(&self, query: &QueryInput) -> Vec<ResultItem> {
+        let config = self.current_config();
+        if !config.sources.packages {
+            return vec![instruction_result(
+                "Package search is disabled",
+                "Open settings to re-enable pacman/paru package results",
+                "Packages",
+                "system-software-install-symbolic",
+                520,
+            )];
+        }
+
+        if query.text.chars().count() < MIN_PACKAGE_QUERY_CHARS {
+            return vec![instruction_result(
+                "Keep typing to search packages",
+                "Type at least 2 characters before querying pacman or paru",
+                "Packages",
+                "system-software-install-symbolic",
+                520,
+            )];
+        }
+
+        if package_backend_for_query(query, self.package_search_backend).is_none() {
+            return vec![instruction_result(
+                "Package search unavailable",
+                "Install pacman or paru to search installable packages",
+                "Packages",
+                "system-software-install-symbolic",
+                520,
+            )];
         }
 
         Vec::new()
@@ -948,6 +1065,10 @@ impl Sources {
             }
         }
 
+        if mode == SearchMode::Packages {
+            results.extend(self.package_search_status_result(&query));
+        }
+
         if mode == SearchMode::Controls {
             if !config.sources.controls {
                 results.push(instruction_result(
@@ -961,6 +1082,7 @@ impl Sources {
                 let query = QueryInput {
                     mode,
                     source_filter: query.source_filter,
+                    package_manager: query.package_manager,
                     text: String::new(),
                 };
                 results.extend(self.search_controls(&query, now));
@@ -1100,6 +1222,46 @@ impl Sources {
                 }
             })
             .collect()
+    }
+
+    fn search_packages(&self, query: &QueryInput, now: u64) -> Vec<ResultItem> {
+        let config = self.current_config();
+        if !config.sources.packages {
+            if query.mode == SearchMode::Packages {
+                return vec![instruction_result(
+                    "Package search is disabled",
+                    "Open settings to re-enable pacman/paru package results",
+                    "Packages",
+                    "system-software-install-symbolic",
+                    500,
+                )];
+            }
+            return Vec::new();
+        }
+
+        if query.text.chars().count() < MIN_PACKAGE_QUERY_CHARS {
+            if query.mode == SearchMode::Packages {
+                return self.package_search_status_result(query);
+            }
+            return Vec::new();
+        }
+
+        let Some(backend) = package_backend_for_query(query, self.package_search_backend) else {
+            if query.mode == SearchMode::Packages {
+                return self.package_search_status_result(query);
+            }
+            return Vec::new();
+        };
+
+        let Ok(output) = backend.run_search(&query.text) else {
+            return Vec::new();
+        };
+
+        if !output.status.success() && output.stdout.is_empty() {
+            return Vec::new();
+        }
+
+        package_search_results_from_output(&String::from_utf8_lossy(&output.stdout), backend, now)
     }
 
     fn search_ssh(&self, query: &QueryInput, now: u64) -> Vec<ResultItem> {
@@ -1820,6 +1982,66 @@ fn app_prediction_key(desktop_id: &str) -> String {
     format!("app:{desktop_id}")
 }
 
+fn package_prediction_key(repository: &str, name: &str) -> String {
+    format!("package:{repository}/{name}")
+}
+
+fn package_backend_for_query(
+    query: &QueryInput,
+    detected: Option<PackageSearchBackend>,
+) -> Option<PackageSearchBackend> {
+    match query.package_manager {
+        Some(PackageManager::Pacman) => Some(PackageSearchBackend::Pacman),
+        Some(PackageManager::Paru) => Some(PackageSearchBackend::Paru),
+        None => detected,
+    }
+}
+
+fn package_command_path(binary: &str) -> Option<PathBuf> {
+    let path = env::var_os("PATH");
+    let path = path.as_ref().map(|value| value.to_string_lossy());
+    let fallback_dirs = [
+        Path::new("/usr/bin"),
+        Path::new("/usr/local/bin"),
+        Path::new("/bin"),
+    ];
+    package_command_path_with_fallbacks(binary, path.as_deref(), &fallback_dirs)
+}
+
+fn package_command_path_with_fallbacks(
+    binary: &str,
+    path: Option<&str>,
+    fallback_dirs: &[&Path],
+) -> Option<PathBuf> {
+    path.unwrap_or_default()
+        .split(':')
+        .filter(|dir| !dir.is_empty())
+        .map(Path::new)
+        .chain(fallback_dirs.iter().copied())
+        .map(|dir| dir.join(binary))
+        .find(|candidate| path_is_executable(candidate))
+}
+
+fn path_is_executable(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 fn file_prediction_key(path: &str) -> String {
     format!("file:{path}")
 }
@@ -1948,6 +2170,112 @@ fn email_result_item(
         action: Action::OpenUrl { url: open_url },
         ..Default::default()
     }
+}
+
+pub(crate) fn parse_package_search_output(output: &str) -> Vec<PackageEntry> {
+    let mut entries = Vec::new();
+    let mut current: Option<PackageEntry> = None;
+
+    for line in output.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        if line.starts_with(char::is_whitespace) {
+            if let Some(entry) = current.as_mut() {
+                let description = line.trim();
+                if !description.is_empty() {
+                    entry.description = description.to_string();
+                }
+            }
+            continue;
+        }
+
+        if let Some(entry) = current.take() {
+            entries.push(entry);
+        }
+
+        let Some((repository, rest)) = line.split_once('/') else {
+            continue;
+        };
+        let mut parts = rest.split_whitespace();
+        let Some(name) = parts.next() else {
+            continue;
+        };
+        let Some(version) = parts.next() else {
+            continue;
+        };
+        let installed = rest.contains("[installed]");
+
+        current = Some(PackageEntry {
+            repository: repository.to_string(),
+            name: name.to_string(),
+            version: version.to_string(),
+            description: String::new(),
+            installed,
+        });
+    }
+
+    if let Some(entry) = current {
+        entries.push(entry);
+    }
+
+    entries
+}
+
+pub(crate) fn package_search_results_from_output(
+    output: &str,
+    backend: PackageSearchBackend,
+    _now: u64,
+) -> Vec<ResultItem> {
+    let mut items = parse_package_search_output(output)
+        .into_iter()
+        .enumerate()
+        .take(MAX_PACKAGES)
+        .map(|(index, entry)| {
+            let order_score = (MAX_PACKAGES.saturating_sub(index) as i32) * 10;
+            package_result_item(entry, backend, order_score)
+        })
+        .collect::<Vec<_>>();
+    sort_results(&mut items, MAX_PACKAGES);
+    items
+}
+
+fn package_result_item(
+    entry: PackageEntry,
+    backend: PackageSearchBackend,
+    order_score: i32,
+) -> ResultItem {
+    let prediction_key = package_prediction_key(&entry.repository, &entry.name);
+    let status = if entry.installed { " installed" } else { "" };
+    let subtitle = if entry.description.is_empty() {
+        format!("{} {}{}", entry.repository, entry.version, status)
+    } else {
+        format!(
+            "{} {}{} - {}",
+            entry.repository, entry.version, status, entry.description
+        )
+    };
+
+    ResultItem {
+        prediction_key: Some(prediction_key),
+        title: entry.name.clone(),
+        subtitle,
+        source: "Packages",
+        icon_name: "system-software-install-symbolic".to_string(),
+        score: 160 + order_score + package_rank_adjustment(&entry),
+        action: Action::InstallPackage {
+            package: entry.name,
+            manager: backend.manager(),
+        },
+        ..Default::default()
+    }
+}
+
+fn package_rank_adjustment(entry: &PackageEntry) -> i32 {
+    let installed_penalty = if entry.installed { -100 } else { 0 };
+    let repo_bonus = if entry.repository == "aur" { 0 } else { 20 };
+    repo_bonus + installed_penalty
 }
 
 fn email_subtitle(sender: &str, folder: &str, date_label: &str) -> String {
@@ -3633,12 +3961,14 @@ mod tests {
     use super::windows::{parse_hypr_windows_json, parse_niri_windows_json, window_focus_command};
     use super::{
         AppEntry, BluetoothStatus, BookmarkEntry, ControlSnapshot, EmailEntry, FileSearchBackend,
-        MediaStatus, NetworkStatus, NotificationEntry, RecentFileEntry, Sources, VolumeStatus,
-        append_deferred_results, control_results_from_snapshot, display_domain, email_badges,
-        email_primary_subtitle, email_result_items, email_snippet, maildir_is_unread,
-        no_results_item, parse_bluetooth_status, parse_chromium_bookmarks_json,
-        parse_dunst_history, parse_file_search_line, parse_firefox_bookmark_rows,
-        parse_nmcli_device_status, parse_playerctl_metadata, parse_recent_files_xbel,
+        MediaStatus, NetworkStatus, NotificationEntry, PackageSearchBackend, RecentFileEntry,
+        Sources, VolumeStatus, append_deferred_results, control_results_from_snapshot,
+        display_domain, email_badges, email_primary_subtitle, email_result_items, email_snippet,
+        maildir_is_unread, no_results_item, package_backend_for_query,
+        package_command_path_with_fallbacks, package_search_results_from_output,
+        parse_bluetooth_status, parse_chromium_bookmarks_json, parse_dunst_history,
+        parse_file_search_line, parse_firefox_bookmark_rows, parse_nmcli_device_status,
+        parse_package_search_output, parse_playerctl_metadata, parse_recent_files_xbel,
         parse_thunderbird_email_row, parse_wpctl_volume, pass_entry_name, relative_age_label,
         thunderbird_database_uri, thunderbird_message_uri,
     };
@@ -3647,6 +3977,7 @@ mod tests {
         SourceFilter, WindowFocusTarget,
     };
     use crate::prediction::{PredictionStore, StoredPrediction};
+    use std::fs::{self, File};
     use std::path::Path;
     use std::sync::{Arc, Mutex};
 
@@ -3786,6 +4117,7 @@ mod tests {
         sources.thunderbird_email_database_paths = Vec::new();
         sources.local_email_entries = Vec::new();
         sources.file_search_backend = None;
+        sources.package_search_backend = None;
         sources.pass_available = false;
         sources.qalc_available = false;
         sources.predictions = empty_prediction_store();
@@ -3803,6 +4135,159 @@ mod tests {
             parse_file_search_line(line).as_deref(),
             Some("/tmp/with space#hash.txt")
         );
+    }
+
+    #[test]
+    fn pacman_and_paru_search_output_parses_package_rows() {
+        let output = "\
+extra/firefox 139.0-1 [installed]
+    Standalone web browser from Mozilla
+aur/visual-studio-code-bin 1.101.0-1 (+1925 8.44)
+    Visual Studio Code editor
+";
+
+        let entries = parse_package_search_output(output);
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].repository, "extra");
+        assert_eq!(entries[0].name, "firefox");
+        assert_eq!(entries[0].version, "139.0-1");
+        assert_eq!(
+            entries[0].description,
+            "Standalone web browser from Mozilla"
+        );
+        assert!(entries[0].installed);
+        assert_eq!(entries[1].repository, "aur");
+        assert_eq!(entries[1].name, "visual-studio-code-bin");
+        assert!(!entries[1].installed);
+    }
+
+    #[test]
+    fn package_search_is_deferred_for_all_and_package_modes() {
+        let mut sources = empty_sources();
+        sources.package_search_backend = Some(PackageSearchBackend::Pacman);
+
+        let all_snapshot = sources.search_snapshot("firefox", SearchMode::All, None);
+        assert!(all_snapshot.deferred.packages);
+        assert!(
+            all_snapshot
+                .immediate_results
+                .iter()
+                .all(|item| item.source != "Packages")
+        );
+
+        let package_snapshot = sources.search_snapshot("pkg: firefox", SearchMode::All, None);
+        assert_eq!(package_snapshot.query.mode, SearchMode::Packages);
+        assert!(package_snapshot.deferred.packages);
+    }
+
+    #[test]
+    fn package_manager_prefix_overrides_detected_backend() {
+        let paru_query = QueryInput::parse("paru: veloren", SearchMode::All);
+        assert_eq!(
+            package_backend_for_query(&paru_query, Some(PackageSearchBackend::Pacman)),
+            Some(PackageSearchBackend::Paru)
+        );
+
+        let pacman_query = QueryInput::parse("pacman: firefox", SearchMode::All);
+        assert_eq!(
+            package_backend_for_query(&pacman_query, Some(PackageSearchBackend::Paru)),
+            Some(PackageSearchBackend::Pacman)
+        );
+
+        let auto_query = QueryInput::parse("pkg: firefox", SearchMode::All);
+        assert_eq!(
+            package_backend_for_query(&auto_query, Some(PackageSearchBackend::Paru)),
+            Some(PackageSearchBackend::Paru)
+        );
+    }
+
+    #[test]
+    fn package_command_lookup_uses_fallback_dirs_when_path_is_empty() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "Luma-package-command-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&temp_dir).expect("create fake command dir");
+        let paru = temp_dir.join("paru");
+        File::create(&paru).expect("create fake paru");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&paru)
+                .expect("fake paru metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&paru, permissions).expect("make fake paru executable");
+        }
+
+        assert_eq!(
+            package_command_path_with_fallbacks("paru", Some(""), &[temp_dir.as_path()]),
+            Some(paru)
+        );
+
+        fs::remove_dir_all(&temp_dir).expect("cleanup fake command dir");
+    }
+
+    #[test]
+    fn package_search_output_becomes_install_actions() {
+        let output = "\
+extra/firefox 139.0-1
+    Standalone web browser from Mozilla
+";
+
+        let results = package_search_results_from_output(output, PackageSearchBackend::Paru, 1_000);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].source, "Packages");
+        assert_eq!(results[0].title, "firefox");
+        assert_eq!(
+            results[0].subtitle,
+            "extra 139.0-1 - Standalone web browser from Mozilla"
+        );
+        assert_eq!(
+            results[0].prediction_key.as_deref(),
+            Some("package:extra/firefox")
+        );
+        assert!(matches!(
+            &results[0].action,
+            Action::InstallPackage { package, manager }
+                if package == "firefox" && *manager == crate::model::PackageManager::Paru
+        ));
+    }
+
+    #[test]
+    fn package_results_are_low_priority_independent_of_query_mode() {
+        let output = "\
+aur/veloren 0.18.0-1 [+21 ~0.00]
+    The last stable release of an open-world, open-source multiplayer voxel RPG.
+";
+        let results = package_search_results_from_output(output, PackageSearchBackend::Paru, 1_000);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "veloren");
+        assert!(
+            results[0].score < 280,
+            "unprefixed package score {} should stay below normal deferred sources",
+            results[0].score
+        );
+    }
+
+    #[test]
+    fn deferred_package_results_remain_visible_when_immediate_results_fill_the_limit() {
+        let immediate = (0..24)
+            .map(|index| scored_item("Applications", &format!("App {index}"), 2_000 - index))
+            .collect::<Vec<_>>();
+        let deferred = vec![scored_item("Packages", "veloren", 180)];
+
+        let merged = append_deferred_results(immediate, deferred);
+
+        assert_eq!(merged.last().map(|item| item.source), Some("Packages"));
+        assert!(merged.iter().any(|item| item.title == "veloren"));
     }
 
     #[test]
@@ -4335,6 +4820,7 @@ mod tests {
         let item = no_results_item(&QueryInput {
             mode: SearchMode::Files,
             source_filter: SourceFilter::All,
+            package_manager: None,
             text: "report".to_string(),
         });
 
@@ -5177,6 +5663,9 @@ pub(crate) fn no_results_item(query: &QueryInput) -> ResultItem {
                 "Try media, volume, Bluetooth, network, screenshot, color, or notifications."
                     .to_string()
             }
+            SearchMode::Packages => {
+                "Try a different package name or install pacman/paru first.".to_string()
+            }
         },
     };
 
@@ -5209,7 +5698,7 @@ pub(crate) fn sort_and_limit_results(mut results: Vec<ResultItem>) -> Vec<Result
             .cmp(&left.score)
             .then_with(|| left.title.cmp(&right.title))
     });
-    results.truncate(24);
+    results.truncate(MAX_RESULTS);
     results
 }
 
@@ -5223,13 +5712,33 @@ pub(crate) fn append_deferred_results(
     deferred: Vec<ResultItem>,
 ) -> Vec<ResultItem> {
     let mut results = sort_and_limit_results(immediate);
-    let remaining = 24usize.saturating_sub(results.len());
+    let mut deferred = sort_and_limit_results(deferred);
+    let package_rows = deferred
+        .iter()
+        .filter(|item| item.source == "Packages")
+        .cloned()
+        .collect::<Vec<_>>();
+    let remaining = MAX_RESULTS.saturating_sub(results.len());
     if remaining > 0 {
-        let mut deferred = sort_and_limit_results(deferred);
         deferred.truncate(remaining);
         results.extend(deferred);
     }
+    for package in package_rows {
+        if !results
+            .iter()
+            .any(|item| same_result_identity(item, &package))
+        {
+            results.push(package);
+        }
+    }
     results
+}
+
+fn same_result_identity(left: &ResultItem, right: &ResultItem) -> bool {
+    match (&left.prediction_key, &right.prediction_key) {
+        (Some(left), Some(right)) => left == right,
+        _ => left.source == right.source && left.title == right.title,
+    }
 }
 
 pub(crate) fn finalize_search_results(

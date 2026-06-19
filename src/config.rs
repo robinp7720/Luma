@@ -35,6 +35,7 @@ pub struct SourceToggles {
     pub calc: bool,
     pub power: bool,
     pub controls: bool,
+    pub packages: bool,
 }
 
 impl Default for SourceToggles {
@@ -53,6 +54,7 @@ impl Default for SourceToggles {
             calc: true,
             power: true,
             controls: true,
+            packages: true,
         }
     }
 }
@@ -268,6 +270,7 @@ mod tests {
         assert!(config.sources.pass);
         assert!(config.sources.email);
         assert!(config.sources.controls);
+        assert!(config.sources.packages);
         assert_eq!(
             config.integrations.web_search_url,
             "https://duckduckgo.com/?q="

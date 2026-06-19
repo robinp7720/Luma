@@ -191,6 +191,7 @@ fn prediction_result_item(prediction: &StoredPrediction, score: i32) -> ResultIt
 fn source_label(source: &str) -> &'static str {
     match source {
         "Applications" => "Applications",
+        "Packages" => "Packages",
         "Windows" => "Windows",
         "Files" => "Files",
         "SSH" => "SSH",
@@ -406,5 +407,30 @@ mod tests {
         let results = store.top_results(1, 1_100);
 
         assert_eq!(results[0].source, "Controls");
+    }
+
+    #[test]
+    fn top_predictions_preserve_package_source_label() {
+        let mut store = PredictionStore::disabled();
+        store
+            .record(
+                StoredPrediction {
+                    key: "package:extra/firefox".to_string(),
+                    title: "firefox".to_string(),
+                    subtitle: "extra 139.0-1 - Standalone web browser".to_string(),
+                    source: "Packages".to_string(),
+                    icon_name: "system-software-install-symbolic".to_string(),
+                    action: Action::InstallPackage {
+                        package: "firefox".to_string(),
+                        manager: crate::model::PackageManager::Pacman,
+                    },
+                },
+                1_000,
+            )
+            .expect("record prediction");
+
+        let results = store.top_results(1, 1_100);
+
+        assert_eq!(results[0].source, "Packages");
     }
 }

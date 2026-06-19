@@ -14,7 +14,7 @@ use crate::actions::{
     power_confirmation_results, power_requires_confirmation,
 };
 use crate::config::{ConfigStore, EmailBackendPreference, EmailConfig};
-use crate::model::{Action, ResultItem, SearchMode};
+use crate::model::{Action, PackageManager, ResultItem, SearchMode};
 use crate::model::{PasswordOperation, WindowFocusTarget};
 use crate::password::{
     Credential, format_generated_pass_entry, generate_password, parse_credential,
@@ -1110,6 +1110,9 @@ fn execute_action(
         Action::DesktopControl { operation } => {
             execute_desktop_control_operation(&operation)?;
         }
+        Action::InstallPackage { package, manager } => {
+            launch_package_install(manager, &package)?;
+        }
         Action::WebSearch { query } => {
             let base = web_search_url();
             let url = format!("{base}{}", urlencoding::encode(&query));
@@ -1163,7 +1166,17 @@ fn launch_desktop_app(desktop_id: &str) -> Result<()> {
 }
 
 fn launch_ssh(host: &str) -> Result<()> {
-    let terminal = app_config()
+    let terminal = launcher_terminal();
+
+    Command::new(&terminal)
+        .args(["-e", "ssh", host])
+        .spawn()
+        .context("failed to launch ssh session")?;
+    Ok(())
+}
+
+fn launcher_terminal() -> String {
+    app_config()
         .and_then(|config| {
             let value = config.current().integrations.ssh_terminal;
             let trimmed = value.trim().to_string();
@@ -1178,13 +1191,25 @@ fn launch_ssh(host: &str) -> Result<()> {
                 .ok()
                 .filter(|value| !value.trim().is_empty())
         })
-        .unwrap_or_else(|| default_ssh_terminal(dirs::home_dir().as_deref()));
+        .unwrap_or_else(|| default_ssh_terminal(dirs::home_dir().as_deref()))
+}
 
+fn launch_package_install(manager: PackageManager, package: &str) -> Result<()> {
+    let terminal = launcher_terminal();
+    let install_args = package_install_command(manager, package);
     Command::new(&terminal)
-        .args(["-e", "ssh", host])
+        .arg("-e")
+        .args(install_args)
         .spawn()
-        .context("failed to launch ssh session")?;
+        .context("failed to launch package install")?;
     Ok(())
+}
+
+fn package_install_command(manager: PackageManager, package: &str) -> Vec<&str> {
+    match manager {
+        PackageManager::Pacman => vec!["sudo", "pacman", "-S", package],
+        PackageManager::Paru => vec!["paru", "-S", package],
+    }
 }
 
 fn web_search_url() -> String {
@@ -1369,6 +1394,7 @@ fn placeholder_for_mode(mode: SearchMode) -> &'static str {
         SearchMode::Web => "Search the web or open a URL",
         SearchMode::Calc => "Evaluate a libqalculate expression",
         SearchMode::Controls => "Search desktop controls",
+        SearchMode::Packages => "Search pacman/paru packages",
     }
 }
 
@@ -1589,7 +1615,8 @@ mod tests {
         LAUNCHER_SURFACE_MARGIN_BOTTOM_PX, LAUNCHER_SURFACE_MARGIN_PX, SearchUpdatePhase,
         SearchWork, SearchWorkExecution, action_failure_result, default_ssh_terminal,
         email_open_strategy, inspected_password_results, launcher_css, layer_shell_enabled,
-        power_confirmation_results, power_requires_confirmation, search_work_execution,
+        package_install_command, power_confirmation_results, power_requires_confirmation,
+        search_work_execution,
     };
     use crate::actions::{
         desktop_controls::desktop_control_commands, password::use_x11_type_backend,
@@ -1597,8 +1624,8 @@ mod tests {
     };
     use crate::config::{EmailBackendPreference, EmailConfig};
     use crate::model::{
-        Action, DesktopControlOperation, PasswordOperation, PowerOperation, ResultItem,
-        WindowFocusTarget,
+        Action, DesktopControlOperation, PackageManager, PasswordOperation, PowerOperation,
+        ResultItem, WindowFocusTarget,
     };
     use crate::password::parse_credential;
     use crate::ui::results::{
@@ -1642,6 +1669,18 @@ mod tests {
     #[test]
     fn falls_back_to_kitty_without_wrapper() {
         assert_eq!(default_ssh_terminal(None), "kitty");
+    }
+
+    #[test]
+    fn package_install_command_uses_the_selected_manager() {
+        assert_eq!(
+            package_install_command(PackageManager::Paru, "visual-studio-code-bin"),
+            vec!["paru", "-S", "visual-studio-code-bin"]
+        );
+        assert_eq!(
+            package_install_command(PackageManager::Pacman, "firefox"),
+            vec!["sudo", "pacman", "-S", "firefox"]
+        );
     }
 
     fn selection_test_item(source: &'static str, title: &str) -> ResultItem {
