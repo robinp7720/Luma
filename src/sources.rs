@@ -508,8 +508,7 @@ impl Sources {
             results.push(result);
         }
 
-        let calc_search_deferred = self.should_defer_calc_search(&query);
-        if !calc_search_deferred && query.mode.includes(SearchMode::Calc) {
+        if query.mode.includes(SearchMode::Calc) {
             if let Some(result) = self.search_calc(&query, now) {
                 results.push(result);
             }
@@ -548,7 +547,7 @@ impl Sources {
                 windows: windows_search_deferred,
                 controls: controls_search_deferred,
                 recents: recent_files_deferred,
-                calc: calc_search_deferred,
+                calc: false,
                 packages: package_search_deferred,
             },
         }
@@ -576,12 +575,6 @@ impl Sources {
 
         if snapshot.deferred.recents {
             results.extend(self.search_recent_files(&snapshot.query, now));
-        }
-
-        if snapshot.deferred.calc {
-            if let Some(result) = self.search_calc(&snapshot.query, now) {
-                results.push(result);
-            }
         }
 
         if snapshot.deferred.packages {
@@ -640,13 +633,6 @@ impl Sources {
 
     fn should_defer_recent_files_search(&self, query: &QueryInput) -> bool {
         query.mode == SearchMode::All && self.current_config().sources.recents
-    }
-
-    fn should_defer_calc_search(&self, query: &QueryInput) -> bool {
-        query.mode == SearchMode::All
-            && self.current_config().sources.calc
-            && self.qalc_available
-            && looks_like_math(&query.text)
     }
 
     fn should_defer_package_search(&self, query: &QueryInput) -> bool {
@@ -5305,6 +5291,19 @@ aur/veloren 0.18.0-1 [+21 ~0.00]
                 .immediate_results
                 .iter()
                 .all(|item| item.source != "Files" && item.source != "Email")
+        );
+    }
+
+    #[test]
+    fn all_mode_calculator_search_is_immediate() {
+        let mut sources = empty_sources();
+        sources.qalc_available = true;
+
+        let snapshot = sources.search_snapshot("2+2", SearchMode::All, None);
+
+        assert!(
+            !snapshot.deferred.calc,
+            "calculator results should be produced with the immediate snapshot"
         );
     }
 
