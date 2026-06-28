@@ -38,11 +38,14 @@ const MAX_PACKAGES: usize = 8;
 const MAX_RESULTS: usize = 24;
 const MIN_FILE_QUERY_CHARS: usize = 2;
 const MIN_PACKAGE_QUERY_CHARS: usize = 2;
+const APP_DIRECT_MATCH_BONUS: i32 = 500;
 
 // Base scores per source sit below the primary launcher categories (apps 900,
 // pass 880, bookmarks 830) so a strong text match on a deferred result cannot
 // leapfrog a normal app/bookmark match. score_text (0..=1000) still orders
-// results within and across these lower bands.
+// results within and across these lower bands. Applications get a direct
+// name/executable bonus so a learned bookmark cannot hide the installed app
+// for a direct app-name query such as "firefox".
 const EMAIL_BASE_SCORE: i32 = 300;
 const FILE_BASE_SCORE: i32 = 280;
 
@@ -1103,6 +1106,7 @@ impl Sources {
             .filter_map(|app| {
                 let score = score_text(&app.search_blob, &query.text)?;
                 let prediction_key = app_prediction_key(&app.desktop_id);
+                let direct_match_bonus = app_direct_match_bonus(app, &query.text);
                 Some(ResultItem {
                     prediction_key: Some(prediction_key.clone()),
                     title: app.name.clone(),
@@ -1113,7 +1117,10 @@ impl Sources {
                     },
                     source: "Applications",
                     icon_name: app.icon_name.clone(),
-                    score: score + 900 + self.prediction_boost(&prediction_key, now),
+                    score: score
+                        + 900
+                        + direct_match_bonus
+                        + self.prediction_boost(&prediction_key, now),
                     action: Action::LaunchApp {
                         desktop_id: app.desktop_id.clone(),
                     },
@@ -3956,6 +3963,26 @@ fn parse_file_search_line(line: &str) -> Option<String> {
     Some(candidate.to_string())
 }
 
+fn app_direct_match_bonus(app: &AppEntry, query: &str) -> i32 {
+    let normalized_query = query.trim().to_ascii_lowercase();
+    if normalized_query.is_empty() {
+        return 0;
+    }
+
+    let name_matches = app.name.trim().eq_ignore_ascii_case(&normalized_query);
+    let executable_matches = app
+        .executable
+        .split_whitespace()
+        .next()
+        .is_some_and(|executable| executable.eq_ignore_ascii_case(&normalized_query));
+
+    if name_matches || executable_matches {
+        APP_DIRECT_MATCH_BONUS
+    } else {
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::windows::{parse_hypr_windows_json, parse_niri_windows_json, window_focus_command};
@@ -5333,6 +5360,42 @@ aur/veloren 0.18.0-1 [+21 ~0.00]
                 .all(|item| item.source != "Recent Files"),
             "recent-file metadata should not block the first render"
         );
+    }
+
+    #[test]
+    fn all_mode_ranks_application_before_matching_bookmark() {
+        let mut sources = empty_sources();
+        sources.apps = vec![AppEntry {
+            desktop_id: "firefox.desktop".to_string(),
+            name: "Firefox".to_string(),
+            description: "Web Browser".to_string(),
+            executable: "firefox".to_string(),
+            icon_name: "firefox".to_string(),
+            search_blob: "firefox web browser".to_string(),
+        }];
+        sources.bookmarks = vec![BookmarkEntry {
+            title: "Firefox".to_string(),
+            url: "https://www.mozilla.org/firefox/".to_string(),
+            search_blob: "firefox https://www.mozilla.org/firefox/".to_string(),
+        }];
+        sources.predictions = prediction_store_with(
+            StoredPrediction {
+                key: "bookmark:https://www.mozilla.org/firefox/".to_string(),
+                title: "Firefox".to_string(),
+                subtitle: "mozilla.org".to_string(),
+                source: "Bookmarks".to_string(),
+                icon_name: "user-bookmarks-symbolic".to_string(),
+                action: Action::OpenUrl {
+                    url: "https://www.mozilla.org/firefox/".to_string(),
+                },
+            },
+            super::current_unix_time().saturating_sub(60),
+        );
+
+        let results = sources.search("firefox", SearchMode::All);
+
+        assert_eq!(results[0].source, "Applications");
+        assert_eq!(results[0].title, "Firefox");
     }
 
     #[test]
