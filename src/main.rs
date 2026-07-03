@@ -30,6 +30,7 @@ use crate::ui::results::{
     move_selection, pending_deferred_results, profiling_enabled, rebuild_results,
     set_background_processing,
 };
+use crate::ui::theme::apply_css;
 use anyhow::{Context, Result};
 use clap::Parser;
 use gtk4::gdk;
@@ -1436,185 +1437,13 @@ fn is_executable(path: &std::path::Path) -> bool {
     }
 }
 
-fn launcher_css() -> &'static str {
-    r#"
-      window {
-        background: transparent;
-      }
-
-      .launcher-shell {
-        background: linear-gradient(180deg, rgba(19, 23, 33, 0.78), rgba(12, 15, 24, 0.92));
-        border: 1px solid rgba(255, 255, 255, 0.10);
-        border-radius: 18px;
-        box-shadow: 0 18px 44px rgba(0, 0, 0, 0.32);
-        padding: 0.8rem;
-      }
-
-      .launcher-entry {
-        min-height: 54px;
-        font-size: 1.08rem;
-        padding: 0.35rem 2.55rem 0.35rem 0.82rem;
-        border-radius: 12px;
-        border: 1px solid rgba(255, 255, 255, 0.09);
-        background: rgba(255, 255, 255, 0.07);
-        color: rgba(247, 249, 255, 0.98);
-        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
-      }
-
-      .launcher-entry:focus-within {
-        border-color: rgba(142, 188, 255, 0.55);
-        background: rgba(255, 255, 255, 0.10);
-        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08),
-                    0 0 0 3px rgba(106, 160, 255, 0.14);
-      }
-
-      .launcher-search-spinner {
-        color: rgba(190, 213, 255, 0.88);
-        min-width: 22px;
-        min-height: 22px;
-      }
-
-      .launcher-results {
-        background: transparent;
-      }
-
-      .launcher-row {
-        margin-bottom: 5px;
-        border-radius: 12px;
-        border: 1px solid rgba(255, 255, 255, 0.02);
-        background: rgba(255, 255, 255, 0.02);
-      }
-
-      .launcher-row:selected {
-        background: linear-gradient(90deg, rgba(120, 168, 255, 0.16), rgba(255, 255, 255, 0.08));
-        border-color: rgba(142, 188, 255, 0.22);
-      }
-
-      .launcher-row-status {
-        background: rgba(255, 255, 255, 0.04);
-        border: 1px dashed rgba(255, 255, 255, 0.08);
-      }
-
-      .launcher-row-status:selected {
-        background: rgba(255, 255, 255, 0.07);
-      }
-
-      .launcher-icon-wrap {
-        min-width: 34px;
-        border-radius: 10px;
-        background: rgba(255, 255, 255, 0.07);
-        border: 1px solid rgba(255, 255, 255, 0.04);
-        padding: 6px;
-      }
-
-      .launcher-icon {
-        color: rgba(240, 244, 255, 0.96);
-      }
-
-      .launcher-title {
-        font-size: 1rem;
-        font-weight: 650;
-      }
-
-      .launcher-subtitle {
-        font-size: 0.86rem;
-        color: rgba(210, 219, 237, 0.70);
-      }
-
-      .launcher-accessory {
-        font-size: 0.82rem;
-        color: rgba(190, 213, 255, 0.78);
-      }
-
-      .launcher-badge {
-        color: rgba(210, 219, 237, 0.80);
-      }
-
-      .launcher-badge-unread {
-        color: rgba(120, 168, 255, 0.95);
-      }
-
-      .settings-shell {
-        background: linear-gradient(180deg, rgba(18, 22, 31, 0.94), rgba(10, 13, 21, 0.98));
-        border: 1px solid rgba(255, 255, 255, 0.10);
-        border-radius: 22px;
-        box-shadow: 0 22px 58px rgba(0, 0, 0, 0.40);
-      }
-
-      .settings-scroller {
-        background: transparent;
-      }
-
-      .settings-header {
-        padding-bottom: 4px;
-      }
-
-      .settings-title {
-        font-size: 1.55rem;
-        font-weight: 720;
-        color: rgba(247, 249, 255, 0.98);
-      }
-
-      .settings-subtitle {
-        color: rgba(210, 219, 237, 0.78);
-      }
-
-      .settings-card {
-        background: rgba(255, 255, 255, 0.04);
-        border: 1px solid rgba(255, 255, 255, 0.08);
-        border-radius: 18px;
-        padding: 16px;
-      }
-
-      .settings-card-title {
-        font-size: 1.05rem;
-        font-weight: 680;
-        color: rgba(247, 249, 255, 0.98);
-      }
-
-      .settings-card-subtitle {
-        color: rgba(210, 219, 237, 0.76);
-      }
-
-      .settings-row {
-        min-height: 46px;
-        padding-top: 4px;
-        padding-bottom: 4px;
-      }
-
-      .settings-row-title {
-        font-weight: 600;
-        color: rgba(247, 249, 255, 0.96);
-      }
-
-      .settings-row-subtitle {
-        color: rgba(210, 219, 237, 0.72);
-      }
-
-      .settings-status {
-        color: rgba(210, 219, 237, 0.76);
-      }
-    "#
-}
-
-fn apply_css() {
-    let css = launcher_css();
-    let provider = gtk4::CssProvider::new();
-    provider.load_from_string(css);
-    gtk4::style_context_add_provider_for_display(
-        &gdk::Display::default().expect("display"),
-        &provider,
-        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         EmailOpenStrategy, LAUNCHER_SHADOW_BLUR_PX, LAUNCHER_SHADOW_Y_OFFSET_PX,
         LAUNCHER_SURFACE_MARGIN_BOTTOM_PX, LAUNCHER_SURFACE_MARGIN_PX, SearchUpdatePhase,
         SearchWork, SearchWorkExecution, action_failure_result, default_ssh_terminal,
-        email_open_strategy, inspected_password_results, launcher_css, layer_shell_enabled,
+        email_open_strategy, inspected_password_results, layer_shell_enabled,
         package_install_command, power_confirmation_results, power_requires_confirmation,
         search_work_execution,
     };
@@ -1632,6 +1461,7 @@ mod tests {
         background_processing_after_update, pending_deferred_results, preserved_selection_index,
         row_tooltip_text,
     };
+    use crate::ui::theme::fallback_css;
     use std::fs::{self, File};
 
     #[test]
@@ -1799,7 +1629,7 @@ mod tests {
             LAUNCHER_SURFACE_MARGIN_BOTTOM_PX
                 >= LAUNCHER_SHADOW_BLUR_PX + LAUNCHER_SHADOW_Y_OFFSET_PX
         );
-        assert!(launcher_css().contains("box-shadow: 0 18px 44px rgba(0, 0, 0, 0.32);"));
+        assert!(fallback_css().contains("box-shadow: 0 18px 44px rgba(0, 0, 0, 0.32);"));
     }
 
     #[test]
