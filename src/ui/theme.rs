@@ -52,6 +52,81 @@ pub(crate) fn fallback_css() -> &'static str {
         padding: 0.8rem;
       }
 
+      @keyframes launcher-context-enter {
+        0% { opacity: 0; transform: translate(14px, -12px) scale(0.96); }
+        62% { opacity: 1; transform: translate(-2px, 2px) scale(1.008); }
+        100% { opacity: 1; transform: none; }
+      }
+
+      .launcher-from-bar {
+        transform-origin: 100% 0;
+      }
+
+      .launcher-from-bar.launcher-entering {
+        animation: launcher-context-enter 320ms cubic-bezier(0.16, 1, 0.3, 1) both;
+      }
+
+      .launcher-context {
+        min-height: 58px;
+        padding: 10px 12px;
+        border-radius: 14px;
+        background: rgba(255, 255, 255, 0.045);
+        border: 1px solid rgba(255, 255, 255, 0.06);
+      }
+
+      .launcher-context-icon {
+        color: rgba(190, 213, 255, 0.94);
+      }
+
+      .launcher-context-title {
+        font-size: 0.78rem;
+        font-weight: 720;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: rgba(210, 219, 237, 0.72);
+      }
+
+      .launcher-context-summary {
+        font-size: 1.02rem;
+        font-weight: 650;
+        color: rgba(247, 249, 255, 0.98);
+      }
+
+      .launcher-context-detail {
+        font-size: 0.84rem;
+        color: rgba(210, 219, 237, 0.70);
+      }
+
+      .launcher-context-health {
+        padding: 4px 8px;
+        border-radius: 999px;
+        background: rgba(120, 168, 255, 0.12);
+        color: rgba(190, 213, 255, 0.90);
+      }
+
+      .launcher-context-open {
+        min-width: 30px;
+        min-height: 30px;
+        padding: 0;
+        border: 0;
+        border-radius: 10px;
+        background: rgba(255, 255, 255, 0.055);
+        color: rgba(247, 249, 255, 0.90);
+      }
+
+      .launcher-context-open:hover {
+        background: rgba(120, 168, 255, 0.16);
+      }
+
+      .launcher-context.is-unavailable .launcher-context-health {
+        background: rgba(255, 170, 120, 0.12);
+        color: rgba(255, 198, 162, 0.92);
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .launcher-from-bar.launcher-entering { animation: none; }
+      }
+
       .launcher-entry {
         min-height: 54px;
         font-size: 1.08rem;

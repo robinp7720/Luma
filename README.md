@@ -95,6 +95,16 @@ Luma --mode ssh
 Luma --mode controls
 ```
 
+Cockpit-bar can open Luma on the originating monitor with live quick-settings context:
+
+```bash
+Luma --context audio --output DP-5 --placement bar
+```
+
+Context launches initially show the bar's live state and typed actions. Typing broadens back to
+the normal unified search while keeping related controls ranked prominently. When cockpit-bar is
+not running, Luma keeps its local desktop controls and marks bar-only features unavailable.
+
 ## Search Syntax
 
 Luma understands a few lightweight prefixes:

@@ -1,4 +1,5 @@
 mod actions;
+mod cockpit;
 mod config;
 mod mail_eds_protocol;
 mod model;
@@ -13,6 +14,7 @@ use crate::actions::{
     execute_power_operation, inspected_password_results, load_pass_credential,
     power_confirmation_results, power_requires_confirmation,
 };
+use crate::cockpit::{CockpitClient, ContextSnapshot, DesktopContext, merge_context_results};
 use crate::config::{ConfigStore, EmailBackendPreference, EmailConfig};
 use crate::model::{Action, PackageManager, ResultItem, SearchMode};
 use crate::model::{PasswordOperation, WindowFocusTarget};
@@ -32,28 +34,38 @@ use crate::ui::results::{
 };
 use crate::ui::theme::apply_css;
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use gtk4::gdk;
 use gtk4::gdk::prelude::*;
 use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Application, ApplicationWindow, Box as GtkBox, Entry, EventControllerKey, ListBox,
-    Orientation, Overlay, ScrolledWindow, SelectionMode, Spinner,
+    Align, Application, ApplicationWindow, Box as GtkBox, Button, Entry, EventControllerKey, Image,
+    Label, ListBox, Orientation, Overlay, ScrolledWindow, SelectionMode, Spinner,
 };
 use gtk4_layer_shell::LayerShell;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::process::Command;
 use std::rc::Rc;
-use std::sync::{Arc, OnceLock};
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 use std::time::Duration;
 
 static APP_CONFIG: OnceLock<Arc<ConfigStore>> = OnceLock::new();
 
-#[derive(Parser, Debug)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum LauncherPlacement {
+    #[default]
+    Center,
+    Bar,
+}
+
+#[derive(Parser, Clone, Debug)]
 #[command(name = "Luma")]
 #[command(
     about = "Unified predictive desktop launcher for apps, windows, files, passwords, email, SSH, commands, web, and libqalculate"
@@ -64,6 +76,15 @@ struct Cli {
 
     #[arg(long)]
     query: Option<String>,
+
+    #[arg(long, value_enum)]
+    context: Option<DesktopContext>,
+
+    #[arg(long)]
+    output: Option<String>,
+
+    #[arg(long, value_enum, default_value_t)]
+    placement: LauncherPlacement,
 }
 
 #[cfg(test)]
@@ -90,6 +111,7 @@ const DEFERRED_SEARCH_IDLE_DELAY_MS: u64 = 180;
 
 #[derive(Clone)]
 struct SearchController {
+    window: ApplicationWindow,
     entry: Entry,
     spinner: Spinner,
     sources: Arc<Sources>,
@@ -99,9 +121,35 @@ struct SearchController {
     clipboard_url: Rc<RefCell<Option<String>>>,
     add_password_draft: Rc<RefCell<Option<AddPasswordDraft>>>,
     mode: SearchMode,
+    cockpit_context: Option<DesktopContext>,
+    cockpit_output: Option<String>,
+    cockpit_contexts: Rc<RefCell<Vec<ContextSnapshot>>>,
+    cockpit_available: Rc<Cell<bool>>,
+    cockpit_header: ContextHeader,
+    cockpit_update_tx: std::sync::mpsc::Sender<Result<Vec<ContextSnapshot>, String>>,
+    cockpit_update_rx: Rc<RefCell<std::sync::mpsc::Receiver<Result<Vec<ContextSnapshot>, String>>>>,
+    cockpit_command_tx: std::sync::mpsc::Sender<CockpitCommandResult>,
+    cockpit_command_rx: Rc<RefCell<std::sync::mpsc::Receiver<CockpitCommandResult>>>,
+    cockpit_refresh_in_flight: Arc<AtomicBool>,
     state: Rc<RefCell<SearchAsyncState>>,
     update_tx: std::sync::mpsc::Sender<SearchUpdate>,
     update_rx: Rc<RefCell<std::sync::mpsc::Receiver<SearchUpdate>>>,
+}
+
+#[derive(Clone)]
+struct ContextHeader {
+    root: GtkBox,
+    icon: Image,
+    title: Label,
+    summary: Label,
+    detail: Label,
+    health: Label,
+    open_button: Button,
+}
+
+enum CockpitCommandResult {
+    Action(std::result::Result<(), String>),
+    Open(std::result::Result<(), String>),
 }
 
 #[derive(Debug, Default)]
@@ -145,6 +193,7 @@ fn search_work_execution(work: SearchWork) -> SearchWorkExecution {
 
 impl SearchController {
     fn new(
+        window: ApplicationWindow,
         entry: Entry,
         spinner: Spinner,
         sources: Arc<Sources>,
@@ -154,9 +203,15 @@ impl SearchController {
         clipboard_url: Rc<RefCell<Option<String>>>,
         add_password_draft: Rc<RefCell<Option<AddPasswordDraft>>>,
         mode: SearchMode,
+        cockpit_context: Option<DesktopContext>,
+        cockpit_output: Option<String>,
+        cockpit_header: ContextHeader,
     ) -> Self {
         let (update_tx, update_rx) = std::sync::mpsc::channel();
+        let (cockpit_update_tx, cockpit_update_rx) = std::sync::mpsc::channel();
+        let (cockpit_command_tx, cockpit_command_rx) = std::sync::mpsc::channel();
         Self {
+            window,
             entry,
             spinner,
             sources,
@@ -166,6 +221,16 @@ impl SearchController {
             clipboard_url,
             add_password_draft,
             mode,
+            cockpit_context,
+            cockpit_output,
+            cockpit_contexts: Rc::new(RefCell::new(Vec::new())),
+            cockpit_available: Rc::new(Cell::new(false)),
+            cockpit_header,
+            cockpit_update_tx,
+            cockpit_update_rx: Rc::new(RefCell::new(cockpit_update_rx)),
+            cockpit_command_tx,
+            cockpit_command_rx: Rc::new(RefCell::new(cockpit_command_rx)),
+            cockpit_refresh_in_flight: Arc::new(AtomicBool::new(false)),
             state: Rc::new(RefCell::new(SearchAsyncState::default())),
             update_tx,
             update_rx: Rc::new(RefCell::new(update_rx)),
@@ -176,8 +241,19 @@ impl SearchController {
         let controller = self.clone();
         glib::timeout_add_local(Duration::from_millis(16), move || {
             controller.drain_updates();
+            controller.drain_cockpit_updates();
             glib::ControlFlow::Continue
         });
+
+        let controller = self.clone();
+        glib::timeout_add_local(Duration::from_millis(750), move || {
+            if !controller.window.is_visible() {
+                return glib::ControlFlow::Break;
+            }
+            controller.request_cockpit_refresh();
+            glib::ControlFlow::Continue
+        });
+        self.request_cockpit_refresh();
     }
 
     fn refresh(&self) {
@@ -190,7 +266,11 @@ impl SearchController {
         let generation = self.bump_generation();
 
         let sources = self.sources.clone();
-        let mode = self.mode;
+        let mode = if self.cockpit_context.is_some() && !query.trim().is_empty() {
+            SearchMode::All
+        } else {
+            self.mode
+        };
         match search_work_execution(SearchWork::ImmediateSnapshot) {
             SearchWorkExecution::Inline => {
                 let snapshot = sources.search_snapshot(&query, mode, clipboard_url.as_deref());
@@ -296,7 +376,10 @@ impl SearchController {
         );
 
         if phase == SearchUpdatePhase::Immediate {
-            let results = snapshot.immediate_results.clone();
+            let results = self.integrate_cockpit_results(
+                snapshot.immediate_results.clone(),
+                &snapshot.query.text,
+            );
             if snapshot.deferred.is_empty() {
                 let results = finalize_loaded_results(results, &snapshot.query);
                 self.render_results(results);
@@ -308,12 +391,130 @@ impl SearchController {
             return;
         }
 
-        let mut results =
-            append_deferred_results(snapshot.immediate_results.clone(), deferred_results);
+        let results = append_deferred_results(snapshot.immediate_results.clone(), deferred_results);
+        let mut results = self.integrate_cockpit_results(results, &snapshot.query.text);
         if results.is_empty() {
             results.push(no_results_item(&snapshot.query));
         }
         self.render_results(results);
+    }
+
+    fn integrate_cockpit_results(&self, results: Vec<ResultItem>, query: &str) -> Vec<ResultItem> {
+        if self.cockpit_context.is_none()
+            && (!matches!(self.mode, SearchMode::All | SearchMode::Controls)
+                || (self.mode == SearchMode::All && query.trim().is_empty()))
+        {
+            return results;
+        }
+        merge_context_results(
+            results,
+            &self.cockpit_contexts.borrow(),
+            self.cockpit_context,
+            query,
+            self.cockpit_available.get(),
+        )
+    }
+
+    fn request_cockpit_refresh(&self) {
+        if self.cockpit_refresh_in_flight.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let tx = self.cockpit_update_tx.clone();
+        let in_flight = self.cockpit_refresh_in_flight.clone();
+        thread::spawn(move || {
+            let result = CockpitClient::from_env()
+                .and_then(|client| client.contexts(None))
+                .map_err(|error| error.to_string());
+            let _ = tx.send(result);
+            in_flight.store(false, Ordering::Release);
+        });
+    }
+
+    fn drain_cockpit_updates(&self) {
+        let mut changed = false;
+        loop {
+            match self.cockpit_update_rx.borrow_mut().try_recv() {
+                Ok(Ok(contexts)) => {
+                    self.cockpit_available.set(true);
+                    self.cockpit_contexts.replace(contexts);
+                    changed = true;
+                }
+                Ok(Err(_)) => {
+                    self.cockpit_available.set(false);
+                    self.cockpit_contexts.borrow_mut().clear();
+                    changed = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+        if changed {
+            self.update_context_header();
+            self.refresh();
+        }
+
+        loop {
+            match self.cockpit_command_rx.borrow_mut().try_recv() {
+                Ok(CockpitCommandResult::Action(Ok(()))) => {
+                    self.request_cockpit_refresh();
+                }
+                Ok(CockpitCommandResult::Open(Ok(()))) => {
+                    self.window.close();
+                }
+                Ok(CockpitCommandResult::Action(Err(message)))
+                | Ok(CockpitCommandResult::Open(Err(message))) => {
+                    show_status_result(
+                        &self.list,
+                        &self.scroller,
+                        &self.current_results,
+                        action_failure_result(&message),
+                    );
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+    }
+
+    fn update_context_header(&self) {
+        if let Some(selected) = self.cockpit_context {
+            let contexts = self.cockpit_contexts.borrow();
+            self.cockpit_header
+                .update(contexts.iter().find(|context| context.context == selected));
+        }
+    }
+
+    fn execute_cockpit_action(&self, action: crate::cockpit::ContextAction) {
+        show_status_result(
+            &self.list,
+            &self.scroller,
+            &self.current_results,
+            ResultItem {
+                title: "Applying control…".to_string(),
+                subtitle: "Waiting for cockpit-bar".to_string(),
+                source: "Cockpit",
+                icon_name: "emblem-synchronizing-symbolic".to_string(),
+                ..Default::default()
+            },
+        );
+        let tx = self.cockpit_command_tx.clone();
+        thread::spawn(move || {
+            let result = CockpitClient::from_env()
+                .and_then(|client| client.execute(action))
+                .map_err(|error| error.to_string());
+            let _ = tx.send(CockpitCommandResult::Action(result));
+        });
+    }
+
+    fn open_cockpit_context(&self, context: DesktopContext) {
+        let tx = self.cockpit_command_tx.clone();
+        let output = self.cockpit_output.clone();
+        thread::spawn(move || {
+            let result = CockpitClient::from_env()
+                .and_then(|client| client.open_context(context, output))
+                .map_err(|error| error.to_string());
+            let _ = tx.send(CockpitCommandResult::Open(result));
+        });
     }
 
     fn render_results(&self, results: Vec<ResultItem>) {
@@ -333,6 +534,106 @@ impl SearchController {
         );
         self.current_results.replace(results);
     }
+}
+
+impl ContextHeader {
+    fn new(context: Option<DesktopContext>) -> Self {
+        let root = GtkBox::new(Orientation::Horizontal, 12);
+        root.add_css_class("launcher-context");
+        root.set_visible(context.is_some());
+
+        let icon = Image::from_icon_name("preferences-system-symbolic");
+        icon.set_pixel_size(24);
+        icon.add_css_class("launcher-context-icon");
+
+        let text = GtkBox::new(Orientation::Vertical, 2);
+        text.set_hexpand(true);
+        let title = Label::new(Some(
+            context.map(DesktopContext::as_str).unwrap_or("Cockpit"),
+        ));
+        title.add_css_class("launcher-context-title");
+        title.set_xalign(0.0);
+        let summary = Label::new(Some("Connecting to cockpit-bar…"));
+        summary.add_css_class("launcher-context-summary");
+        summary.set_xalign(0.0);
+        let detail = Label::new(Some("Live desktop state"));
+        detail.add_css_class("launcher-context-detail");
+        detail.set_xalign(0.0);
+        text.append(&title);
+        text.append(&summary);
+        text.append(&detail);
+
+        let health = Label::new(Some("Connecting"));
+        health.add_css_class("launcher-context-health");
+        health.set_valign(Align::Center);
+        let open_button = Button::from_icon_name("go-next-symbolic");
+        open_button.add_css_class("launcher-context-open");
+        open_button.set_tooltip_text(Some("Open detailed quick settings"));
+
+        root.append(&icon);
+        root.append(&text);
+        root.append(&health);
+        root.append(&open_button);
+        Self {
+            root,
+            icon,
+            title,
+            summary,
+            detail,
+            health,
+            open_button,
+        }
+    }
+
+    fn update(&self, context: Option<&ContextSnapshot>) {
+        for class in ["is-healthy", "is-degraded", "is-unavailable"] {
+            self.root.remove_css_class(class);
+        }
+        if let Some(context) = context {
+            self.open_button.set_sensitive(true);
+            self.icon.set_icon_name(Some(&context.icon_name));
+            self.title.set_label(&context.title);
+            self.summary.set_label(&context.summary);
+            self.detail.set_label(&context.detail);
+            let (label, class) = match context.health {
+                crate::cockpit::ContextHealth::Healthy => ("Live", "is-healthy"),
+                crate::cockpit::ContextHealth::Degraded => ("Stale", "is-degraded"),
+                crate::cockpit::ContextHealth::Unavailable => ("Unavailable", "is-unavailable"),
+            };
+            self.health.set_label(label);
+            self.root.add_css_class(class);
+        } else {
+            self.open_button.set_sensitive(false);
+            self.icon.set_icon_name(Some("network-offline-symbolic"));
+            self.summary.set_label("Cockpit bar unavailable");
+            self.detail.set_label("Using Luma's local desktop controls");
+            self.health.set_label("Offline");
+            self.root.add_css_class("is-unavailable");
+        }
+    }
+}
+
+fn activate_cockpit_item(search: &SearchController, item: &ResultItem) -> bool {
+    match &item.action {
+        Action::CockpitControl { action } => {
+            search.execute_cockpit_action(action.clone());
+            true
+        }
+        Action::OpenCockpitContext { context } => {
+            search.open_cockpit_context(*context);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn monitor_for_connector(connector: &str) -> Option<gdk::Monitor> {
+    let display = gdk::Display::default()?;
+    let monitors = display.monitors();
+    (0..monitors.n_items())
+        .filter_map(|index| monitors.item(index))
+        .filter_map(|item| item.downcast::<gdk::Monitor>().ok())
+        .find(|monitor| monitor.connector().as_deref() == Some(connector))
 }
 
 fn layer_shell_enabled(display_is_wayland: bool, protocol_supported: bool) -> bool {
@@ -362,14 +663,13 @@ fn main() {
 
 fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let cli = Cli::parse_from(&args);
     configure_gdk_backend();
     let config = Arc::new(ConfigStore::load());
     let _ = APP_CONFIG.set(config.clone());
     let sources = Arc::new(Sources::load(config.clone()));
-    let mode = cli.mode.unwrap_or_else(|| config.current().default_mode);
     let application = Application::builder()
         .application_id("me.robindecker.Luma")
+        .flags(gio::ApplicationFlags::HANDLES_COMMAND_LINE)
         .build();
     application.add_main_option(
         "mode",
@@ -387,13 +687,85 @@ fn run() -> Result<()> {
         "Initial query",
         Some("QUERY"),
     );
+    for (name, description, value_name) in [
+        ("context", "Cockpit context", "CONTEXT"),
+        ("output", "Target output connector", "OUTPUT"),
+        ("placement", "Launcher placement", "PLACEMENT"),
+    ] {
+        application.add_main_option(
+            name,
+            glib::Char::from(b'\0'),
+            glib::OptionFlags::NONE,
+            glib::OptionArg::String,
+            description,
+            Some(value_name),
+        );
+    }
 
-    application.connect_activate(move |app| {
-        build_ui(app, mode, cli.query.clone(), sources.clone());
+    let config_for_command = config.clone();
+    application.connect_command_line(move |app, command_line| {
+        let cli = match cli_from_command_line(command_line) {
+            Ok(cli) => cli,
+            Err(error) => {
+                eprintln!("{error}");
+                return glib::ExitCode::FAILURE;
+            }
+        };
+        for window in app.windows() {
+            window.close();
+        }
+        let mode = cli
+            .mode
+            .unwrap_or_else(|| config_for_command.current().default_mode);
+        build_ui(
+            app,
+            mode,
+            cli.query,
+            sources.clone(),
+            cli.context,
+            cli.output,
+            cli.placement,
+        );
+        glib::ExitCode::SUCCESS
     });
 
     application.run_with_args(&args);
     Ok(())
+}
+
+fn cli_from_command_line(command_line: &gio::ApplicationCommandLine) -> Result<Cli> {
+    let options = command_line.options_dict();
+    let string_option = |name: &str| -> Result<Option<String>> {
+        options
+            .lookup::<String>(name)
+            .map_err(|error| anyhow::anyhow!("invalid --{name} value: {error}"))
+    };
+    let mode = string_option("mode")?
+        .map(|value| {
+            SearchMode::from_str(&value, true)
+                .map_err(|error| anyhow::anyhow!("invalid --mode value: {error}"))
+        })
+        .transpose()?;
+    let context = string_option("context")?
+        .map(|value| {
+            DesktopContext::from_str(&value, true)
+                .map_err(|error| anyhow::anyhow!("invalid --context value: {error}"))
+        })
+        .transpose()?;
+    let placement = string_option("placement")?
+        .map(|value| {
+            LauncherPlacement::from_str(&value, true)
+                .map_err(|error| anyhow::anyhow!("invalid --placement value: {error}"))
+        })
+        .transpose()?
+        .unwrap_or_default();
+    Ok(Cli {
+        mode,
+        query: string_option("query")?,
+        context,
+        output: string_option("output")?,
+        placement,
+    })
 }
 
 fn configure_gdk_backend() {
@@ -441,6 +813,9 @@ fn build_ui(
     mode: SearchMode,
     initial_query: Option<String>,
     sources: Arc<Sources>,
+    context: Option<DesktopContext>,
+    output: Option<String>,
+    placement: LauncherPlacement,
 ) {
     let config = app_config()
         .map(|store| store.current())
@@ -462,7 +837,16 @@ fn build_ui(
         window.set_keyboard_mode(gtk4_layer_shell::KeyboardMode::Exclusive);
         window.set_namespace(Some("Luma"));
         window.set_anchor(gtk4_layer_shell::Edge::Top, true);
-        window.set_margin(gtk4_layer_shell::Edge::Top, config.ui.top_margin_px);
+        if placement == LauncherPlacement::Bar {
+            window.set_anchor(gtk4_layer_shell::Edge::Right, true);
+            window.set_margin(gtk4_layer_shell::Edge::Top, 5);
+            window.set_margin(gtk4_layer_shell::Edge::Right, 5);
+        } else {
+            window.set_margin(gtk4_layer_shell::Edge::Top, config.ui.top_margin_px);
+        }
+        if let Some(monitor) = output.as_deref().and_then(monitor_for_connector) {
+            window.set_monitor(Some(&monitor));
+        }
     }
 
     apply_css();
@@ -470,6 +854,10 @@ fn build_ui(
 
     let outer = GtkBox::new(Orientation::Vertical, 10);
     outer.add_css_class("launcher-shell");
+    if placement == LauncherPlacement::Bar {
+        outer.add_css_class("launcher-from-bar");
+        outer.add_css_class("launcher-entering");
+    }
     outer.set_halign(Align::Center);
     outer.set_size_request(config.ui.width_px, -1);
     outer.set_margin_top(config.ui.surface_margin_px);
@@ -511,8 +899,11 @@ fn build_ui(
         .child(&list)
         .build();
     scroller.add_css_class("launcher-scroller");
+    let context_header = ContextHeader::new(context);
+    let context_open_button = context_header.open_button.clone();
 
     outer.append(&entry_overlay);
+    outer.append(&context_header.root);
     outer.append(&scroller);
     window.set_child(Some(&outer));
 
@@ -520,6 +911,7 @@ fn build_ui(
     let add_password_draft = Rc::new(RefCell::new(None::<AddPasswordDraft>));
     let clipboard_url = Rc::new(RefCell::new(None::<String>));
     let search = SearchController::new(
+        window.clone(),
         entry.clone(),
         search_spinner.clone(),
         sources.clone(),
@@ -528,9 +920,22 @@ fn build_ui(
         current_results.clone(),
         clipboard_url.clone(),
         add_password_draft.clone(),
-        mode,
+        if context.is_some() {
+            SearchMode::Controls
+        } else {
+            mode
+        },
+        context,
+        output,
+        context_header,
     );
     search.start_update_poller();
+    if let Some(context) = context {
+        let search_for_open = search.clone();
+        context_open_button.connect_clicked(move |_| {
+            search_for_open.open_cockpit_context(context);
+        });
+    }
 
     if profiling_enabled() {
         install_frame_profiler(&window);
@@ -558,12 +963,16 @@ fn build_ui(
         let add_password_draft = add_password_draft.clone();
         let current_results = current_results.clone();
         let previous_focus_target = previous_focus_target.clone();
+        let search_for_activation = search.clone();
         list.connect_row_activated(move |_, row| {
             let item = {
                 let results = current_results.borrow();
                 results.get(row.index() as usize).cloned()
             };
             if let Some(item) = item {
+                if activate_cockpit_item(&search_for_activation, &item) {
+                    return;
+                }
                 activate_item(
                     &window,
                     &sources,
@@ -589,6 +998,7 @@ fn build_ui(
         let current_results = current_results.clone();
         let previous_focus_target = previous_focus_target.clone();
         let add_password_draft = add_password_draft.clone();
+        let search_for_activation = search.clone();
         entry.connect_activate(move |_| {
             if add_password_draft.borrow().is_some() {
                 advance_add_password_flow(
@@ -618,6 +1028,9 @@ fn build_ui(
             };
 
             if let Some(item) = selected {
+                if activate_cockpit_item(&search_for_activation, &item) {
+                    return;
+                }
                 activate_item(
                     &window,
                     &sources,
@@ -689,6 +1102,12 @@ fn build_ui(
 
     search.refresh();
     window.present();
+    if placement == LauncherPlacement::Bar {
+        let outer = outer.clone();
+        glib::timeout_add_local_once(Duration::from_millis(320), move || {
+            outer.remove_css_class("launcher-entering");
+        });
+    }
     request_initial_focus(&window, &entry);
     schedule_clipboard_url_loads(&search);
 }
@@ -1110,6 +1529,9 @@ fn execute_action(
         }
         Action::DesktopControl { operation } => {
             execute_desktop_control_operation(&operation)?;
+        }
+        Action::CockpitControl { .. } | Action::OpenCockpitContext { .. } => {
+            anyhow::bail!("cockpit actions must run through the launcher integration controller");
         }
         Action::InstallPackage { package, manager } => {
             launch_package_install(manager, &package)?;

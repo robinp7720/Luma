@@ -128,6 +128,12 @@ pub enum Action {
     DesktopControl {
         operation: DesktopControlOperation,
     },
+    CockpitControl {
+        action: crate::cockpit::ContextAction,
+    },
+    OpenCockpitContext {
+        context: crate::cockpit::DesktopContext,
+    },
     InstallPackage {
         package: String,
         manager: PackageManager,
