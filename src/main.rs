@@ -491,8 +491,8 @@ impl SearchController {
             &self.current_results,
             ResultItem {
                 title: "Applying control…".to_string(),
-                subtitle: "Waiting for cockpit-bar".to_string(),
-                source: "Cockpit",
+                subtitle: "Waiting for Vigil".to_string(),
+                source: "Vigil",
                 icon_name: "emblem-synchronizing-symbolic".to_string(),
                 ..Default::default()
             },
@@ -548,12 +548,10 @@ impl ContextHeader {
 
         let text = GtkBox::new(Orientation::Vertical, 2);
         text.set_hexpand(true);
-        let title = Label::new(Some(
-            context.map(DesktopContext::as_str).unwrap_or("Cockpit"),
-        ));
+        let title = Label::new(Some(context.map(DesktopContext::as_str).unwrap_or("Vigil")));
         title.add_css_class("launcher-context-title");
         title.set_xalign(0.0);
-        let summary = Label::new(Some("Connecting to cockpit-bar…"));
+        let summary = Label::new(Some("Connecting to Vigil…"));
         summary.add_css_class("launcher-context-summary");
         summary.set_xalign(0.0);
         let detail = Label::new(Some("Live desktop state"));
@@ -605,7 +603,7 @@ impl ContextHeader {
         } else {
             self.open_button.set_sensitive(false);
             self.icon.set_icon_name(Some("network-offline-symbolic"));
-            self.summary.set_label("Cockpit bar unavailable");
+            self.summary.set_label("Vigil unavailable");
             self.detail.set_label("Using Luma's local desktop controls");
             self.health.set_label("Offline");
             self.root.add_css_class("is-unavailable");
@@ -688,7 +686,7 @@ fn run() -> Result<()> {
         Some("QUERY"),
     );
     for (name, description, value_name) in [
-        ("context", "Cockpit context", "CONTEXT"),
+        ("context", "Vigil context", "CONTEXT"),
         ("output", "Target output connector", "OUTPUT"),
         ("placement", "Launcher placement", "PLACEMENT"),
     ] {

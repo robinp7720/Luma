@@ -1,3 +1,4 @@
+use crate::cockpit::CockpitClient;
 use crate::config::{ConfigStore, EmailBackendPreference, FileSearchBackendChoice, LauncherConfig};
 use crate::mail_eds_protocol::{MailEdsMessageSummary, MailEdsSearchResponse};
 use crate::model::{
@@ -108,7 +109,7 @@ pub(crate) struct ControlSnapshot {
     pub has_bluetoothctl: bool,
     pub has_nmcli: bool,
     pub has_powerprofilesctl: bool,
-    pub has_dunstctl: bool,
+    pub has_notification_service: bool,
     pub has_grim: bool,
     pub has_slurp: bool,
     pub has_hyprpicker: bool,
@@ -2917,18 +2918,18 @@ fn control_results_from_snapshot(
         );
     }
 
-    if snapshot.has_dunstctl {
+    if snapshot.has_notification_service {
         push_control_action(
             &mut items,
             query,
             ControlActionSpec {
                 title: "Pause/resume notifications",
-                subtitle: "Toggle Dunst notification pause state",
+                subtitle: "Toggle Vigil Do Not Disturb",
                 icon_name: "preferences-system-notifications-symbolic",
                 search_terms: &[
                     "notifications",
                     "notification",
-                    "dunst",
+                    "vigil",
                     "pause",
                     "resume",
                     "do not disturb",
@@ -2945,12 +2946,12 @@ fn control_results_from_snapshot(
             query,
             ControlActionSpec {
                 title: "Close notifications",
-                subtitle: "Close all visible Dunst notifications",
+                subtitle: "Clear Vigil notification history",
                 icon_name: "preferences-system-notifications-symbolic",
                 search_terms: &[
                     "notifications",
                     "notification",
-                    "dunst",
+                    "vigil",
                     "close",
                     "dismiss",
                     "clear",
@@ -3979,11 +3980,11 @@ mod tests {
         display_domain, email_badges, email_primary_subtitle, email_result_items, email_snippet,
         maildir_is_unread, no_results_item, package_backend_for_query,
         package_command_path_with_fallbacks, package_search_results_from_output,
-        parse_bluetooth_status, parse_chromium_bookmarks_json, parse_dunst_history,
-        parse_file_search_line, parse_firefox_bookmark_rows, parse_nmcli_device_status,
-        parse_package_search_output, parse_playerctl_metadata, parse_recent_files_xbel,
-        parse_thunderbird_email_row, parse_wpctl_volume, pass_entry_name, relative_age_label,
-        thunderbird_database_uri, thunderbird_message_uri,
+        parse_bluetooth_status, parse_chromium_bookmarks_json, parse_file_search_line,
+        parse_firefox_bookmark_rows, parse_nmcli_device_status, parse_package_search_output,
+        parse_playerctl_metadata, parse_recent_files_xbel, parse_thunderbird_email_row,
+        parse_wpctl_volume, pass_entry_name, relative_age_label, thunderbird_database_uri,
+        thunderbird_message_uri,
     };
     use crate::model::{
         Action, DesktopControlOperation, PowerOperation, QueryInput, ResultItem, SearchMode,
@@ -4418,7 +4419,7 @@ aur/veloren 0.18.0-1 [+21 ~0.00]
             has_bluetoothctl: true,
             has_nmcli: true,
             has_powerprofilesctl: true,
-            has_dunstctl: true,
+            has_notification_service: true,
             has_grim: true,
             has_slurp: true,
             has_hyprpicker: true,
@@ -4473,7 +4474,7 @@ aur/veloren 0.18.0-1 [+21 ~0.00]
                 body: "cargo test failed".to_string(),
                 search_blob: "kitty build failed cargo test failed".to_string(),
             }],
-            has_dunstctl: true,
+            has_notification_service: true,
             ..ControlSnapshot::default()
         };
         let query = QueryInput::parse("control: cargo", SearchMode::All);
@@ -4549,26 +4550,6 @@ aur/veloren 0.18.0-1 [+21 ~0.00]
             .expect("network");
         assert_eq!(network.kind, "ethernet");
         assert_eq!(network.connection, "Ethernet connection 1");
-    }
-
-    #[test]
-    fn parses_dunst_history_summaries_and_bodies() {
-        let entries = parse_dunst_history(
-            r#"{
-                "summary" : { "type" : "s", "data" : "Build failed" },
-                "body" : { "type" : "s", "data" : "cargo test failed" },
-                "appname" : { "type" : "s", "data" : "kitty" }
-            }"#,
-        );
-
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].summary, "Build failed");
-        assert_eq!(entries[0].body, "cargo test failed");
-        assert_eq!(entries[0].app_name, "kitty");
-        assert_eq!(
-            entries[0].search_blob,
-            "kitty build failed cargo test failed"
-        );
     }
 
     #[test]
@@ -5433,7 +5414,10 @@ fn load_control_snapshot() -> ControlSnapshot {
     let has_bluetoothctl = command_exists("bluetoothctl");
     let has_nmcli = command_exists("nmcli");
     let has_powerprofilesctl = command_exists("powerprofilesctl");
-    let has_dunstctl = command_exists("dunstctl");
+    let notification_state = CockpitClient::from_env()
+        .and_then(|client| client.notifications())
+        .ok();
+    let has_notification_service = notification_state.is_some();
     let has_grim = command_exists("grim");
     let has_slurp = command_exists("slurp");
     let has_hyprpicker = command_exists("hyprpicker");
@@ -5488,19 +5472,34 @@ fn load_control_snapshot() -> ControlSnapshot {
         } else {
             None
         },
-        notifications: if has_dunstctl {
-            command_output_string("dunstctl", &["history"])
-                .map(|output| parse_dunst_history(&output))
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        },
+        notifications: notification_state
+            .map(|state| {
+                state
+                    .items
+                    .into_iter()
+                    .filter(|notification| notification.duplicate_count != 0)
+                    .map(|notification| {
+                        let search_blob = format!(
+                            "{} {} {}",
+                            notification.app_name, notification.summary, notification.body
+                        )
+                        .to_ascii_lowercase();
+                        NotificationEntry {
+                            app_name: notification.app_name,
+                            summary: notification.summary,
+                            body: notification.body,
+                            search_blob,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
         has_playerctl,
         has_wpctl,
         has_bluetoothctl,
         has_nmcli,
         has_powerprofilesctl,
-        has_dunstctl,
+        has_notification_service,
         has_grim,
         has_slurp,
         has_hyprpicker,
@@ -5584,95 +5583,6 @@ fn parse_backlight_brightness(output: &str) -> Option<u8> {
             .find_map(|part| part.trim().strip_suffix('%'))
             .and_then(|part| part.parse::<u8>().ok())
     })
-}
-
-fn parse_dunst_history(output: &str) -> Vec<NotificationEntry> {
-    let mut entries = Vec::new();
-    let mut pending_body = String::new();
-    let mut current_summary: Option<String> = None;
-    let mut current_body = String::new();
-
-    for (key, value) in gvariant_string_pairs(output) {
-        match key.as_str() {
-            "body" if current_summary.is_none() => pending_body = value,
-            "body" => current_body = value,
-            "summary" => {
-                current_summary = Some(value);
-                current_body = std::mem::take(&mut pending_body);
-            }
-            "appname" => {
-                if let Some(summary) = current_summary.take() {
-                    let body = std::mem::take(&mut current_body);
-                    let app_name = value;
-                    let search_blob = format!("{app_name} {summary} {body}").to_ascii_lowercase();
-                    entries.push(NotificationEntry {
-                        app_name,
-                        summary,
-                        body,
-                        search_blob,
-                    });
-                }
-            }
-            _ => {}
-        }
-    }
-
-    entries
-}
-
-fn gvariant_string_pairs(output: &str) -> Vec<(String, String)> {
-    let mut pairs = Vec::new();
-    let mut index = 0;
-    while let Some(key_start_rel) = output[index..].find('"') {
-        let key_start = index + key_start_rel + 1;
-        let Some(key_end_rel) = output[key_start..].find('"') else {
-            break;
-        };
-        let key_end = key_start + key_end_rel;
-        let key = &output[key_start..key_end];
-        if !matches!(key, "summary" | "body" | "appname") {
-            index = key_end + 1;
-            continue;
-        }
-        let Some(data_pos_rel) = output[key_end..].find("\"data\"") else {
-            break;
-        };
-        let data_pos = key_end + data_pos_rel;
-        let Some(value_start_rel) = output[data_pos + 6..].find('"') else {
-            break;
-        };
-        let value_start = data_pos + 6 + value_start_rel + 1;
-        let Some((value, value_end)) = parse_quoted_string(output, value_start) else {
-            break;
-        };
-        pairs.push((key.to_string(), value));
-        index = value_end;
-    }
-    pairs
-}
-
-fn parse_quoted_string(input: &str, mut index: usize) -> Option<(String, usize)> {
-    let mut value = String::new();
-    while index < input.len() {
-        let ch = input[index..].chars().next()?;
-        index += ch.len_utf8();
-        match ch {
-            '"' => return Some((value, index)),
-            '\\' => {
-                let escaped = input[index..].chars().next()?;
-                index += escaped.len_utf8();
-                match escaped {
-                    'n' => value.push('\n'),
-                    't' => value.push('\t'),
-                    '"' => value.push('"'),
-                    '\\' => value.push('\\'),
-                    other => value.push(other),
-                }
-            }
-            other => value.push(other),
-        }
-    }
-    None
 }
 
 fn command_exists(binary: &str) -> bool {

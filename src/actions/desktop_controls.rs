@@ -1,3 +1,4 @@
+use crate::cockpit::{CockpitClient, DesktopContext};
 use crate::model::DesktopControlOperation;
 use anyhow::{Context, Result};
 use std::process::Command;
@@ -91,23 +92,27 @@ pub(crate) fn desktop_control_commands(
         DesktopControlOperation::ColorPicker => {
             vec![DesktopControlCommand::new("hyprpicker", &["-a"])]
         }
-        DesktopControlOperation::NotificationHistoryPop => {
-            vec![DesktopControlCommand::new("dunstctl", &["history-pop"])]
-        }
-        DesktopControlOperation::NotificationCloseAll => {
-            vec![DesktopControlCommand::new("dunstctl", &["close-all"])]
-        }
-        DesktopControlOperation::NotificationPauseToggle => vec![DesktopControlCommand::new(
-            "sh",
-            &[
-                "-lc",
-                "paused=$(dunstctl is-paused); if [ \"$paused\" = true ]; then dunstctl set-paused false; else dunstctl set-paused true; fi",
-            ],
-        )],
+        DesktopControlOperation::NotificationHistoryPop => Vec::new(),
+        DesktopControlOperation::NotificationCloseAll => Vec::new(),
+        DesktopControlOperation::NotificationPauseToggle => Vec::new(),
     }
 }
 
 pub(crate) fn execute_desktop_control_operation(operation: &DesktopControlOperation) -> Result<()> {
+    match operation {
+        DesktopControlOperation::NotificationHistoryPop => {
+            return CockpitClient::from_env()?.open_context(DesktopContext::Notifications, None);
+        }
+        DesktopControlOperation::NotificationCloseAll => {
+            return CockpitClient::from_env()?.clear_notifications();
+        }
+        DesktopControlOperation::NotificationPauseToggle => {
+            let client = CockpitClient::from_env()?;
+            let enabled = !client.notifications()?.dnd;
+            return client.set_notification_dnd(enabled);
+        }
+        _ => {}
+    }
     for command in desktop_control_commands(operation) {
         Command::new(command.program)
             .args(&command.args)

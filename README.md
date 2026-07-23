@@ -23,7 +23,7 @@ Luma also includes a built-in settings panel for interactive configuration. Type
 - Recent file search from `~/.local/share/recently-used.xbel`
 - Web search through the default browser
 - `libqalculate` integration through `qalc`
-- Desktop controls for media, audio, screen brightness, Bluetooth, network settings, power profiles, screenshots, color picking, and Dunst notification history
+- Desktop controls for media, audio, screen brightness, Bluetooth, network settings, power profiles, screenshots, color picking, and Vigil notification history
 
 ## Requirements
 
@@ -51,7 +51,7 @@ Optional integrations:
 - `powerprofilesctl` for power profile status and switching
 - `grim`, `slurp`, and `wl-copy` for screenshots
 - `hyprpicker` for screen color picking
-- `dunstctl` for notification controls and local notification-history search
+- Vigil for notification controls and local notification-history search
 
 ## Configuration
 
@@ -95,14 +95,14 @@ Luma --mode ssh
 Luma --mode controls
 ```
 
-Cockpit-bar can open Luma on the originating monitor with live quick-settings context:
+Vigil can open Luma on the originating monitor with live quick-settings context:
 
 ```bash
 Luma --context audio --output DP-5 --placement bar
 ```
 
 Context launches initially show the bar's live state and typed actions. Typing broadens back to
-the normal unified search while keeping related controls ranked prominently. When cockpit-bar is
+the normal unified search while keeping related controls ranked prominently. When Vigil is
 not running, Luma keeps its local desktop controls and marks bar-only features unavailable.
 
 ## Search Syntax
@@ -174,7 +174,7 @@ Control rows expose local desktop actions for:
 - Power profile cycling and direct profile selection through `powerprofilesctl`
 - Screenshot area/screen actions through `grim`, `slurp`, and `wl-copy`
 - Screen color picking through `hyprpicker`
-- Dunst notification pause/resume, close-all, history pop, and searchable local notification history
+- Vigil notification DND, clear-all, inbox opening, and searchable local history
 
 ## Notes
 

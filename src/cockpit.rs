@@ -25,6 +25,7 @@ pub enum DesktopContext {
     Audio,
     Power,
     Clock,
+    Notifications,
 }
 
 impl DesktopContext {
@@ -38,6 +39,7 @@ impl DesktopContext {
             Self::Audio => "audio",
             Self::Power => "power",
             Self::Clock => "clock",
+            Self::Notifications => "notifications",
         }
     }
 }
@@ -132,6 +134,28 @@ pub struct ContextSnapshot {
     pub actions: Vec<ContextActionSpec>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationState {
+    pub items: Vec<NotificationEntry>,
+    pub visible_ids: Vec<u32>,
+    pub unread_count: u16,
+    pub dnd: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationEntry {
+    pub id: u32,
+    pub app_name: String,
+    pub summary: String,
+    pub body: String,
+    #[serde(default = "default_duplicate_count")]
+    pub duplicate_count: u16,
+}
+
+fn default_duplicate_count() -> u16 {
+    1
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ControlRequest {
@@ -145,6 +169,11 @@ enum ControlRequest {
         context: DesktopContext,
         output: Option<String>,
     },
+    NotificationsGet,
+    NotificationsClear,
+    NotificationsSetDnd {
+        enabled: bool,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -153,6 +182,9 @@ enum ControlResponse {
     Accepted,
     Contexts {
         contexts: Vec<ContextSnapshot>,
+    },
+    Notifications {
+        state: NotificationState,
     },
     ActionResult {
         success: bool,
@@ -174,7 +206,7 @@ impl CockpitClient {
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow!("XDG_RUNTIME_DIR is unavailable"))?;
         Ok(Self {
-            socket_path: PathBuf::from(runtime).join("cockpit-bar.sock"),
+            socket_path: PathBuf::from(runtime).join("vigil.sock"),
         })
     }
 
@@ -206,6 +238,33 @@ impl CockpitClient {
             ControlResponse::Accepted => Ok(()),
             ControlResponse::Error { message } => bail!(message),
             _ => bail!("bar returned an unexpected surface response"),
+        }
+    }
+
+    pub fn notifications(&self) -> Result<NotificationState> {
+        match self.send(&ControlRequest::NotificationsGet, SNAPSHOT_TIMEOUT)? {
+            ControlResponse::Notifications { state } => Ok(state),
+            ControlResponse::Error { message } => bail!(message),
+            _ => bail!("Vigil returned an unexpected notification response"),
+        }
+    }
+
+    pub fn clear_notifications(&self) -> Result<()> {
+        match self.send(&ControlRequest::NotificationsClear, ACTION_TIMEOUT)? {
+            ControlResponse::Accepted => Ok(()),
+            ControlResponse::Error { message } => bail!(message),
+            _ => bail!("Vigil returned an unexpected notification response"),
+        }
+    }
+
+    pub fn set_notification_dnd(&self, enabled: bool) -> Result<()> {
+        match self.send(
+            &ControlRequest::NotificationsSetDnd { enabled },
+            ACTION_TIMEOUT,
+        )? {
+            ControlResponse::Accepted => Ok(()),
+            ControlResponse::Error { message } => bail!(message),
+            _ => bail!("Vigil returned an unexpected notification response"),
         }
     }
 
@@ -254,7 +313,7 @@ pub fn context_results(
             results.push(ResultItem {
                 title: spec.title.clone(),
                 subtitle: spec.subtitle.clone(),
-                source: "Cockpit",
+                source: "Vigil",
                 icon_name: spec.icon_name.clone(),
                 score: if selected.is_some() {
                     contextual_action_score(&spec.action)
@@ -279,7 +338,7 @@ pub fn context_results(
             results.push(ResultItem {
                 title: format!("Open {} quick settings", context.title),
                 subtitle: context.detail.clone(),
-                source: "Cockpit",
+                source: "Vigil",
                 icon_name: context.icon_name.clone(),
                 score: if selected.is_some() { 900 } else { 740 },
                 action: Action::OpenCockpitContext {
@@ -364,6 +423,12 @@ fn local_action_matches_context(action: &Action, context: DesktopContext) -> boo
             operation,
             DesktopControlOperation::PowerProfileCycle
                 | DesktopControlOperation::PowerProfileSet { .. }
+        ),
+        DesktopContext::Notifications => matches!(
+            operation,
+            DesktopControlOperation::NotificationHistoryPop
+                | DesktopControlOperation::NotificationCloseAll
+                | DesktopControlOperation::NotificationPauseToggle
         ),
         DesktopContext::Keyboard | DesktopContext::Resources | DesktopContext::Clock => false,
     }
