@@ -26,7 +26,7 @@ pub(crate) fn power_confirmation_results(operation: PowerOperation) -> Vec<Resul
             source: "Power",
             icon_name: "process-stop-symbolic".to_string(),
             score: 90,
-            action: Action::None,
+            action: Action::ReturnToSearch,
             ..Default::default()
         },
     ]

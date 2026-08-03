@@ -156,6 +156,22 @@ enum CockpitCommandResult {
 struct SearchAsyncState {
     generation: u64,
     pending_timeout: Option<glib::SourceId>,
+    presentation: ResultsPresentation,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ResultsPresentation {
+    #[default]
+    Search,
+    Submenu,
+}
+
+fn accepts_search_update(state: &SearchAsyncState, generation: u64) -> bool {
+    state.generation == generation && state.presentation == ResultsPresentation::Search
+}
+
+fn accepts_automatic_refresh(state: &SearchAsyncState) -> bool {
+    state.presentation == ResultsPresentation::Search
 }
 
 #[derive(Debug)]
@@ -261,6 +277,7 @@ impl SearchController {
             return;
         }
 
+        self.state.borrow_mut().presentation = ResultsPresentation::Search;
         let query = self.entry.text().to_string();
         let clipboard_url = self.clipboard_url.borrow().clone();
         let generation = self.bump_generation();
@@ -316,6 +333,30 @@ impl SearchController {
         state.generation
     }
 
+    fn refresh_if_searching(&self) {
+        if accepts_automatic_refresh(&self.state.borrow()) {
+            self.refresh();
+        }
+    }
+
+    fn pause_search_updates(&self) {
+        let mut state = self.state.borrow_mut();
+        state.generation = state.generation.saturating_add(1);
+        let _ = state.pending_timeout.take();
+        state.presentation = ResultsPresentation::Submenu;
+        set_background_processing(&self.spinner, false);
+    }
+
+    fn show_submenu_results(&self, results: Vec<ResultItem>) {
+        self.pause_search_updates();
+        rebuild_results(&self.list, &self.scroller, &results, None);
+        self.current_results.replace(results);
+    }
+
+    fn show_submenu_status(&self, item: ResultItem) {
+        self.show_submenu_results(vec![item]);
+    }
+
     fn schedule_deferred(&self, snapshot: SearchSnapshot, generation: u64) {
         let controller = self.clone();
         let snapshot_for_timeout = snapshot.clone();
@@ -366,7 +407,7 @@ impl SearchController {
             deferred_results,
         } = update;
 
-        if self.state.borrow().generation != generation {
+        if !accepts_search_update(&self.state.borrow(), generation) {
             return;
         }
 
@@ -450,7 +491,7 @@ impl SearchController {
         }
         if changed {
             self.update_context_header();
-            self.refresh();
+            self.refresh_if_searching();
         }
 
         loop {
@@ -972,6 +1013,7 @@ fn build_ui(
                     return;
                 }
                 activate_item(
+                    &search_for_activation,
                     &window,
                     &sources,
                     item,
@@ -1030,6 +1072,7 @@ fn build_ui(
                     return;
                 }
                 activate_item(
+                    &search_for_activation,
                     &window,
                     &sources,
                     item,
@@ -1141,7 +1184,7 @@ fn load_clipboard_url(search: &SearchController) {
 
             search.clipboard_url.replace(Some(text.to_string()));
             if search.add_password_draft.borrow().is_none() {
-                search.refresh();
+                search.refresh_if_searching();
             }
         });
 }
@@ -1162,6 +1205,7 @@ fn request_initial_focus(window: &ApplicationWindow, entry: &Entry) {
 }
 
 fn activate_item(
+    search: &SearchController,
     window: &ApplicationWindow,
     sources: &Sources,
     item: ResultItem,
@@ -1172,6 +1216,11 @@ fn activate_item(
     add_password_draft: &Rc<RefCell<Option<AddPasswordDraft>>>,
     previous_focus_target: Option<&WindowFocusTarget>,
 ) {
+    if matches!(item.action, Action::ReturnToSearch) {
+        search.refresh();
+        return;
+    }
+
     if let Action::Power {
         operation,
         confirmed: false,
@@ -1179,8 +1228,7 @@ fn activate_item(
     {
         if power_requires_confirmation(operation) {
             let results = power_confirmation_results(operation);
-            rebuild_results(list, scroller, &results, None);
-            current_results.replace(results);
+            search.show_submenu_results(results);
             return;
         }
     }
@@ -1193,15 +1241,11 @@ fn activate_item(
         match load_pass_credential(entry) {
             Ok(credential) => {
                 let results = inspected_password_results(&credential);
-                rebuild_results(list, scroller, &results, None);
-                current_results.replace(results);
+                search.show_submenu_results(results);
             }
-            Err(error) => show_status_result(
-                list,
-                scroller,
-                current_results,
-                action_failure_result(&error.root_cause().to_string()),
-            ),
+            Err(error) => {
+                search.show_submenu_status(action_failure_result(&error.root_cause().to_string()))
+            }
         }
         return;
     }
@@ -1210,20 +1254,17 @@ fn activate_item(
         match load_pass_credential(entry) {
             Ok(credential) => {
                 let results = inspected_password_results(&credential);
-                rebuild_results(list, scroller, &results, None);
-                current_results.replace(results);
+                search.show_submenu_results(results);
             }
-            Err(error) => show_status_result(
-                list,
-                scroller,
-                current_results,
-                action_failure_result(&error.root_cause().to_string()),
-            ),
+            Err(error) => {
+                search.show_submenu_status(action_failure_result(&error.root_cause().to_string()))
+            }
         }
         return;
     }
 
     if let Action::AddPassword { entry, url } = &item.action {
+        search.pause_search_updates();
         start_add_password_flow(
             entry_widget,
             list,
@@ -1355,9 +1396,9 @@ fn finish_add_password_flow(
     mode: SearchMode,
     draft: AddPasswordDraft,
 ) {
-    add_password_draft.replace(None);
     entry_widget.set_placeholder_text(Some(placeholder_for_mode(mode)));
     entry_widget.set_text("");
+    add_password_draft.replace(None);
 
     match create_generated_password_entry(sources, &draft) {
         Ok(credential) => {
@@ -1545,6 +1586,9 @@ fn execute_action(
         }
         Action::CopyText { text } => {
             copy_to_clipboard(&text);
+        }
+        Action::ReturnToSearch => {
+            anyhow::bail!("return-to-search must be handled by the launcher UI");
         }
         Action::None => return Ok(()),
     }
@@ -1861,9 +1905,10 @@ fn is_executable(path: &std::path::Path) -> bool {
 mod tests {
     use super::{
         EmailOpenStrategy, LAUNCHER_SHADOW_BLUR_PX, LAUNCHER_SHADOW_Y_OFFSET_PX,
-        LAUNCHER_SURFACE_MARGIN_BOTTOM_PX, LAUNCHER_SURFACE_MARGIN_PX, SearchUpdatePhase,
-        SearchWork, SearchWorkExecution, action_failure_result, default_ssh_terminal,
-        email_open_strategy, inspected_password_results, layer_shell_enabled,
+        LAUNCHER_SURFACE_MARGIN_BOTTOM_PX, LAUNCHER_SURFACE_MARGIN_PX, ResultsPresentation,
+        SearchAsyncState, SearchUpdatePhase, SearchWork, SearchWorkExecution,
+        accepts_automatic_refresh, accepts_search_update, action_failure_result,
+        default_ssh_terminal, email_open_strategy, inspected_password_results, layer_shell_enabled,
         package_install_command, power_confirmation_results, power_requires_confirmation,
         search_work_execution,
     };
@@ -2011,6 +2056,30 @@ mod tests {
             search_work_execution(SearchWork::DeferredProviders),
             SearchWorkExecution::BackgroundThread
         );
+    }
+
+    #[test]
+    fn submenu_rejects_deferred_results_and_automatic_refreshes() {
+        let state = SearchAsyncState {
+            generation: 7,
+            presentation: ResultsPresentation::Submenu,
+            ..SearchAsyncState::default()
+        };
+
+        assert!(!accepts_search_update(&state, 7));
+        assert!(!accepts_automatic_refresh(&state));
+    }
+
+    #[test]
+    fn active_search_accepts_only_its_current_generation() {
+        let state = SearchAsyncState {
+            generation: 7,
+            ..SearchAsyncState::default()
+        };
+
+        assert!(accepts_search_update(&state, 7));
+        assert!(!accepts_search_update(&state, 6));
+        assert!(accepts_automatic_refresh(&state));
     }
 
     #[test]
@@ -2166,7 +2235,7 @@ mod tests {
                 confirmed: true,
             }
         ));
-        assert!(matches!(results[1].action, Action::None));
+        assert!(matches!(results[1].action, Action::ReturnToSearch));
     }
 
     #[test]

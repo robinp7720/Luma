@@ -148,6 +148,7 @@ pub enum Action {
     CopyText {
         text: String,
     },
+    ReturnToSearch,
     #[default]
     None,
 }
