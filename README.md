@@ -105,6 +105,11 @@ Context launches initially show the bar's live state and typed actions. Typing b
 the normal unified search while keeping related controls ranked prominently. When Vigil is
 not running, Luma keeps its local desktop controls and marks bar-only features unavailable.
 
+Lock and suspend actions share the dotfiles session lifecycle. Lock delegates
+to `~/.dotfiles/scripts/session_lock.sh`, while suspend lets Hypridle acquire
+the session lock before system sleep. This keeps Luma, compositor shortcuts,
+and idle locking on the same Hyprlock configuration and fallback path.
+
 ## Search Syntax
 
 Luma understands a few lightweight prefixes:

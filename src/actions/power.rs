@@ -1,8 +1,7 @@
 use crate::model::{Action, PowerOperation, ResultItem};
 use anyhow::{Context, Result};
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::thread;
-use std::time::Duration;
 
 pub(crate) fn power_confirmation_results(operation: PowerOperation) -> Vec<ResultItem> {
     vec![
@@ -69,9 +68,9 @@ fn power_operation_icon(operation: PowerOperation) -> &'static str {
 pub(crate) fn execute_power_operation(operation: PowerOperation) -> Result<()> {
     match operation {
         PowerOperation::Lock => lock_session(),
+        // hypridle holds a delay inhibitor until ext-session-lock confirms the
+        // session is covered, so suspend no longer needs a guessed sleep here.
         PowerOperation::Suspend => {
-            let _ = lock_session();
-            thread::sleep(Duration::from_secs(1));
             spawn_system_command("systemctl", &["suspend"], "failed to suspend")
         }
         PowerOperation::Logout => logout_session(),
@@ -85,23 +84,32 @@ pub(crate) fn execute_power_operation(operation: PowerOperation) -> Result<()> {
 }
 
 fn lock_session() -> Result<()> {
-    if is_hyprland_session() && !process_running_for_user("hyprlock") {
-        if crate::spawn_optional_command("hyprlock", &[])?.is_some() {
-            return Ok(());
-        }
-    }
-
-    if lock_current_logind_session()? {
+    let command = session_lock_command();
+    let program = command.to_string_lossy();
+    if crate::spawn_optional_command(&program, &[])?.is_some() {
         return Ok(());
     }
+    anyhow::bail!(
+        "shared session lock command is unavailable: {}",
+        command.display()
+    );
+}
 
-    if !process_running_for_user("hyprlock")
-        && crate::spawn_optional_command("hyprlock", &[])?.is_some()
+fn session_lock_command() -> PathBuf {
+    if let Some(command) = std::env::var_os("LUMA_SESSION_LOCK_COMMAND")
+        && !command.is_empty()
     {
-        return Ok(());
+        return PathBuf::from(command);
     }
 
-    anyhow::bail!("no lock command is available for the current session");
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| session_lock_command_for_home(&home))
+        .unwrap_or_else(|| PathBuf::from("session_lock.sh"))
+}
+
+fn session_lock_command_for_home(home: &Path) -> PathBuf {
+    home.join(".dotfiles/scripts/session_lock.sh")
 }
 
 fn logout_session() -> Result<()> {
@@ -132,15 +140,6 @@ fn logout_session() -> Result<()> {
     }
 
     anyhow::bail!("no safe logout method found for the current session");
-}
-
-fn lock_current_logind_session() -> Result<bool> {
-    if let Some(session_id) = current_logind_session_id() {
-        return crate::spawn_optional_command("loginctl", &["lock-session", &session_id])
-            .map(|child| child.is_some());
-    }
-
-    crate::spawn_optional_command("loginctl", &["lock-session"]).map(|child| child.is_some())
 }
 
 fn current_logind_session_id() -> Option<String> {
@@ -189,23 +188,24 @@ fn desktop_matches(wanted: &str) -> bool {
         .any(|token| token.eq_ignore_ascii_case(wanted))
 }
 
-fn process_running_for_user(process_name: &str) -> bool {
-    let Ok(uid) = std::env::var("UID") else {
-        return false;
-    };
-    if uid.trim().is_empty() {
-        return false;
-    }
-
-    Command::new("pgrep")
-        .args(["-u", &uid, "-x", process_name])
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
 fn spawn_system_command(program: &str, args: &[&str], message: &str) -> Result<()> {
     crate::spawn_optional_command(program, args)
         .with_context(|| message.to_string())?
         .with_context(|| format!("{program} is not installed"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::session_lock_command_for_home;
+
+    #[test]
+    fn shared_lock_command_resolves_inside_dotfiles() {
+        assert_eq!(
+            session_lock_command_for_home(Path::new("/home/example")),
+            Path::new("/home/example/.dotfiles/scripts/session_lock.sh")
+        );
+    }
 }
