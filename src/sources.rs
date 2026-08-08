@@ -2590,7 +2590,7 @@ fn control_results_from_snapshot(
             query,
             ControlActionSpec {
                 title: "Open TV mode",
-                subtitle: "Start the controller-first Steam and Jellyfin home screen",
+                subtitle: "Start the controller-first Steam and Kodi home screen",
                 icon_name: "video-display-symbolic",
                 search_terms: &[
                     "tv",
@@ -2598,7 +2598,7 @@ fn control_results_from_snapshot(
                     "couch",
                     "gaming",
                     "steam",
-                    "jellyfin",
+                    "kodi",
                     "big picture",
                 ],
                 operation: DesktopControlOperation::TvModeStart,
