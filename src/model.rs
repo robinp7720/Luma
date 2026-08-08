@@ -81,6 +81,7 @@ pub enum DesktopControlOperation {
     NotificationHistoryPop,
     NotificationCloseAll,
     NotificationPauseToggle,
+    TvModeStart,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

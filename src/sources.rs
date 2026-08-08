@@ -2584,6 +2584,32 @@ fn control_results_from_snapshot(
     let mut items = Vec::new();
     let empty_query = query.text.is_empty();
 
+    if command_exists("tv-mode") {
+        push_control_action(
+            &mut items,
+            query,
+            ControlActionSpec {
+                title: "Open TV mode",
+                subtitle: "Start the controller-first Steam and Jellyfin home screen",
+                icon_name: "video-display-symbolic",
+                search_terms: &[
+                    "tv",
+                    "television",
+                    "couch",
+                    "gaming",
+                    "steam",
+                    "jellyfin",
+                    "big picture",
+                ],
+                operation: DesktopControlOperation::TvModeStart,
+                prediction_key: Some("control:tv-mode-start".to_string()),
+                base_score: 820,
+            },
+            now,
+            &prediction_boost,
+        );
+    }
+
     let media_subtitle = snapshot.media.as_ref().map(media_subtitle);
     if snapshot.has_playerctl {
         push_control_action(

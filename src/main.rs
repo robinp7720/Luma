@@ -2257,6 +2257,10 @@ mod tests {
 
         let color = desktop_control_commands(&DesktopControlOperation::ColorPicker);
         assert_eq!(color[0].program, "hyprpicker");
+
+        let tv = desktop_control_commands(&DesktopControlOperation::TvModeStart);
+        assert_eq!(tv[0].program, "tv-mode");
+        assert_eq!(tv[0].args, vec!["start"]);
         assert_eq!(color[0].args, vec!["-a"]);
     }
 

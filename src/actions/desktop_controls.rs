@@ -95,6 +95,9 @@ pub(crate) fn desktop_control_commands(
         DesktopControlOperation::NotificationHistoryPop => Vec::new(),
         DesktopControlOperation::NotificationCloseAll => Vec::new(),
         DesktopControlOperation::NotificationPauseToggle => Vec::new(),
+        DesktopControlOperation::TvModeStart => {
+            vec![DesktopControlCommand::new("tv-mode", &["start"])]
+        }
     }
 }
 
@@ -111,6 +114,7 @@ pub(crate) fn execute_desktop_control_operation(operation: &DesktopControlOperat
             let enabled = !client.notifications()?.dnd;
             return client.set_notification_dnd(enabled);
         }
+        DesktopControlOperation::TvModeStart => {}
         _ => {}
     }
     for command in desktop_control_commands(operation) {
