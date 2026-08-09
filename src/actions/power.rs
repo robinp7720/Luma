@@ -126,10 +126,6 @@ fn logout_session() -> Result<()> {
         return Ok(());
     }
 
-    if is_bspwm_session() && crate::spawn_optional_command("bspc", &["quit"])?.is_some() {
-        return Ok(());
-    }
-
     if let Some(session_id) = current_logind_session_id() {
         spawn_system_command(
             "loginctl",
@@ -172,10 +168,6 @@ pub(crate) fn is_hyprland_session() -> bool {
 
 pub(crate) fn is_niri_session() -> bool {
     std::env::var("NIRI_SOCKET").is_ok() || desktop_matches("niri")
-}
-
-fn is_bspwm_session() -> bool {
-    std::env::var("BSPWM_SOCKET").is_ok() || desktop_matches("bspwm")
 }
 
 fn desktop_matches(wanted: &str) -> bool {
