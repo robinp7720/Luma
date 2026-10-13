@@ -222,3 +222,5 @@ Control rows expose local desktop actions for:
 - Copied password data expires after `PASSWORD_STORE_CLIP_TIME` seconds, defaulting to 15 seconds.
 - Web search defaults to DuckDuckGo. Override it with `DOT_LAUNCHER_SEARCH_URL`.
 - SSH sessions launch through `~/.dotfiles/scripts/launch_kitty.sh -e ssh <host>`.
+
+Hyprland window activation and logout use the native Lua IPC API (Hyprland 0.55+ with a Lua configuration).

@@ -114,7 +114,7 @@ fn session_lock_command_for_home(home: &Path) -> PathBuf {
 
 fn logout_session() -> Result<()> {
     if is_hyprland_session()
-        && crate::spawn_optional_command("hyprctl", &["dispatch", "exit"])?.is_some()
+        && crate::spawn_optional_command("hyprctl", &["dispatch", "hl.dsp.exit()"])?.is_some()
     {
         return Ok(());
     }

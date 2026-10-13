@@ -4827,7 +4827,10 @@ aur/veloren 0.18.0-1 [+21 ~0.00]
         });
 
         assert_eq!(program, "hyprctl");
-        assert_eq!(args, vec!["dispatch", "focuswindow", "address:0xabc"]);
+        assert_eq!(
+            args,
+            vec!["dispatch", r#"hl.dsp.focus({ window = "address:0xabc" })"#]
+        );
     }
 
     #[test]

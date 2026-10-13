@@ -109,8 +109,10 @@ pub fn window_focus_command(target: &WindowFocusTarget) -> (&'static str, Vec<St
             "hyprctl",
             vec![
                 "dispatch".to_string(),
-                "focuswindow".to_string(),
-                format!("address:{address}"),
+                format!(
+                    "hl.dsp.focus({{ window = {:?} }})",
+                    format!("address:{address}")
+                ),
             ],
         ),
         WindowFocusTarget::Niri { id } => (
