@@ -169,6 +169,7 @@ enum ControlRequest {
         context: DesktopContext,
         output: Option<String>,
     },
+    ControlCenterClose,
     NotificationsGet,
     NotificationsClear,
     NotificationsSetDnd {
@@ -235,6 +236,14 @@ impl CockpitClient {
             &ControlRequest::ControlCenterOpen { context, output },
             ACTION_TIMEOUT,
         )? {
+            ControlResponse::Accepted => Ok(()),
+            ControlResponse::Error { message } => bail!(message),
+            _ => bail!("bar returned an unexpected surface response"),
+        }
+    }
+
+    pub fn close_control_center(&self) -> Result<()> {
+        match self.send(&ControlRequest::ControlCenterClose, SNAPSHOT_TIMEOUT)? {
             ControlResponse::Accepted => Ok(()),
             ControlResponse::Error { message } => bail!(message),
             _ => bail!("bar returned an unexpected surface response"),
@@ -310,6 +319,11 @@ pub fn context_results(
             {
                 continue;
             }
+            if results.iter().any(|item: &ResultItem| {
+                matches!(&item.action, Action::CockpitControl { action } if action == &spec.action)
+            }) {
+                continue;
+            }
             results.push(ResultItem {
                 title: spec.title.clone(),
                 subtitle: spec.subtitle.clone(),
@@ -336,11 +350,29 @@ pub fn context_results(
                 ))
         {
             results.push(ResultItem {
-                title: format!("Open {} quick settings", context.title),
-                subtitle: context.detail.clone(),
+                title: format!("Open {}", context.title),
+                subtitle: context.summary.clone(),
                 source: "Vigil",
                 icon_name: context.icon_name.clone(),
-                score: if selected.is_some() { 900 } else { 740 },
+                // An empty Controls filter starts with places to inspect, before
+                // commands that immediately change volume, connectivity, or power.
+                score: if normalized.is_empty() {
+                    match context.context {
+                        DesktopContext::Overview => 1_200,
+                        DesktopContext::Audio => 1_190,
+                        DesktopContext::Network => 1_180,
+                        DesktopContext::Bluetooth => 1_170,
+                        DesktopContext::Notifications => 1_160,
+                        DesktopContext::Clock => 1_150,
+                        DesktopContext::Power => 1_140,
+                        DesktopContext::Keyboard => 1_130,
+                        DesktopContext::Resources => 1_120,
+                    }
+                } else if context.title.to_ascii_lowercase().contains(&normalized) {
+                    1_150
+                } else {
+                    740
+                },
                 action: Action::OpenCockpitContext {
                     context: context.context,
                 },
@@ -479,9 +511,34 @@ mod tests {
                 action: ContextAction::ToggleMute,
             }],
         };
-        let results = super::context_results(&[context], Some(DesktopContext::Audio), "");
+        let results = super::context_results(&[context.clone()], Some(DesktopContext::Audio), "");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "Mute audio");
+
+        let mut overview = context.clone();
+        overview.context = DesktopContext::Overview;
+        overview.title = "Quick Settings".to_string();
+        let results =
+            super::merge_context_results(Vec::new(), &[overview, context], None, "", true);
+        assert!(matches!(
+            results[0].action,
+            Action::OpenCockpitContext {
+                context: DesktopContext::Overview
+            }
+        ));
+        assert_eq!(results[0].title, "Open Quick Settings");
+        assert_eq!(
+            results
+                .iter()
+                .filter(|item| matches!(
+                    item.action,
+                    Action::CockpitControl {
+                        action: ContextAction::ToggleMute
+                    }
+                ))
+                .count(),
+            1
+        );
     }
 
     #[test]

@@ -62,6 +62,8 @@ impl Default for SourceToggles {
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct UiConfig {
+    /// Retain the application and its search index briefly after closing.
+    pub idle_timeout_seconds: u32,
     pub width_px: i32,
     pub height_px: i32,
     pub top_margin_px: i32,
@@ -72,6 +74,7 @@ pub struct UiConfig {
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
+            idle_timeout_seconds: 30,
             width_px: 720,
             height_px: 420,
             top_margin_px: 72,

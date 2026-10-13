@@ -1,7 +1,12 @@
+use std::cell::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use gtk4::gdk;
+
+thread_local! {
+    static THEME_PROVIDER: RefCell<Option<gtk4::CssProvider>> = const { RefCell::new(None) };
+}
 
 pub(crate) fn theme_css_path(
     xdg_config_home: Option<&Path>,
@@ -28,18 +33,38 @@ pub(crate) fn apply_css() {
     let home = dirs::home_dir();
     let path = theme_css_path(xdg_config_home.as_deref(), home.as_deref());
     let theme_override = load_theme_override(path.as_deref());
-    let css = compose_theme_css(fallback_css(), theme_override.as_deref());
-    let provider = gtk4::CssProvider::new();
-    provider.load_from_string(&css);
-    gtk4::style_context_add_provider_for_display(
-        &gdk::Display::default().expect("display"),
-        &provider,
-        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    let css = format!(
+        "{}\n{}",
+        compose_theme_css(fallback_css(), theme_override.as_deref()),
+        include_str!("interaction.css"),
     );
+    THEME_PROVIDER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let provider = slot.get_or_insert_with(|| {
+            let provider = gtk4::CssProvider::new();
+            gtk4::style_context_add_provider_for_display(
+                &gdk::Display::default().expect("display"),
+                &provider,
+                gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+            provider
+        });
+        provider.load_from_string(&css);
+    });
 }
 
 pub(crate) fn fallback_css() -> &'static str {
     r#"
+      @define-color luma_surface #0e1416;
+      @define-color luma_surface_high #252b2d;
+      @define-color luma_surface_highest #303638;
+      @define-color luma_on_surface #dee3e5;
+      @define-color luma_on_surface_variant #bfc8cb;
+      @define-color luma_primary #83d2e3;
+      @define-color luma_primary_container #004e5a;
+      @define-color luma_on_primary_container #a2eeff;
+      @define-color luma_outline_variant #40484b;
+
       window {
         background: transparent;
       }
@@ -50,20 +75,6 @@ pub(crate) fn fallback_css() -> &'static str {
         border-radius: 18px;
         box-shadow: 0 18px 44px rgba(0, 0, 0, 0.32);
         padding: 0.8rem;
-      }
-
-      @keyframes launcher-context-enter {
-        0% { opacity: 0; transform: translate(14px, -12px) scale(0.96); }
-        62% { opacity: 1; transform: translate(-2px, 2px) scale(1.008); }
-        100% { opacity: 1; transform: none; }
-      }
-
-      .launcher-from-bar {
-        transform-origin: 100% 0;
-      }
-
-      .launcher-from-bar.launcher-entering {
-        animation: launcher-context-enter 320ms cubic-bezier(0.16, 1, 0.3, 1) both;
       }
 
       .launcher-context {
@@ -121,10 +132,6 @@ pub(crate) fn fallback_css() -> &'static str {
       .launcher-context.is-unavailable .launcher-context-health {
         background: rgba(255, 170, 120, 0.12);
         color: rgba(255, 198, 162, 0.92);
-      }
-
-      @media (prefers-reduced-motion: reduce) {
-        .launcher-from-bar.launcher-entering { animation: none; }
       }
 
       .launcher-entry {

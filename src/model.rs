@@ -115,6 +115,13 @@ pub enum Action {
     PasswordActions {
         entry: String,
     },
+    PasswordFields {
+        entry: String,
+    },
+    PasswordFieldActions {
+        entry: String,
+        field: String,
+    },
     AddPassword {
         entry: String,
         url: Option<String>,
@@ -173,6 +180,8 @@ pub enum PasswordOperation {
     CopyOtp,
     TypeOtp,
     CustomAutotype,
+    CopyField { field: String },
+    TypeField { field: String },
 }
 
 #[derive(Clone, Debug)]
@@ -251,7 +260,8 @@ fn parse_prefixed_query(
     }
 
     let lowered = raw.to_ascii_lowercase();
-    const PREFIXES: [(&str, SearchMode, SourceFilter, Option<PackageManager>); 28] = [
+    const PREFIXES: [(&str, SearchMode, SourceFilter, Option<PackageManager>); 29] = [
+        ("all:", SearchMode::All, SourceFilter::All, None),
         ("apps:", SearchMode::Apps, SourceFilter::All, None),
         ("app:", SearchMode::Apps, SourceFilter::All, None),
         ("windows:", SearchMode::Windows, SourceFilter::All, None),

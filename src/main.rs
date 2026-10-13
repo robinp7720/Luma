@@ -12,11 +12,12 @@ mod ui;
 use crate::actions::{
     copy_pass_entry, execute_desktop_control_operation, execute_password_operation,
     execute_power_operation, inspected_password_results, load_pass_credential,
-    power_confirmation_results, power_requires_confirmation,
+    password_field_action_results, password_field_results, power_confirmation_results,
+    power_requires_confirmation,
 };
 use crate::cockpit::{CockpitClient, ContextSnapshot, DesktopContext, merge_context_results};
 use crate::config::{ConfigStore, EmailBackendPreference, EmailConfig};
-use crate::model::{Action, PackageManager, ResultItem, SearchMode};
+use crate::model::{Action, PackageManager, QueryInput, ResultItem, SearchMode};
 use crate::model::{PasswordOperation, WindowFocusTarget};
 use crate::password::{
     Credential, format_generated_pass_entry, generate_password, parse_credential,
@@ -27,10 +28,11 @@ use crate::sources::{
     SearchSnapshot, Sources, append_deferred_results, evolution_helper_command, focus_window,
     focused_window_target, no_results_item, run_mail_helper_action,
 };
+use crate::ui::navigation::SearchNavigation;
 use crate::ui::results::{
     background_processing_after_update, finalize_loaded_results, install_frame_profiler,
     move_selection, pending_deferred_results, profiling_enabled, rebuild_results,
-    set_background_processing,
+    same_presentation, set_background_processing,
 };
 use crate::ui::theme::apply_css;
 use anyhow::{Context, Result};
@@ -71,6 +73,9 @@ enum LauncherPlacement {
     about = "Unified predictive desktop launcher for apps, windows, files, passwords, email, SSH, commands, web, and libqalculate"
 )]
 struct Cli {
+    /// Close an already visible launcher when the same shortcut is repeated.
+    #[arg(long)]
+    toggle: bool,
     #[arg(long, value_enum)]
     mode: Option<SearchMode>,
 
@@ -108,6 +113,7 @@ enum AddPasswordStep {
 }
 
 const DEFERRED_SEARCH_IDLE_DELAY_MS: u64 = 180;
+const SOURCE_CACHE_LIFETIME: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 struct SearchController {
@@ -157,6 +163,7 @@ struct SearchAsyncState {
     generation: u64,
     pending_timeout: Option<glib::SourceId>,
     presentation: ResultsPresentation,
+    local_results: Option<(QueryInput, Vec<ResultItem>)>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -186,25 +193,6 @@ struct SearchUpdate {
 enum SearchUpdatePhase {
     Immediate,
     Deferred,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SearchWork {
-    ImmediateSnapshot,
-    DeferredProviders,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SearchWorkExecution {
-    Inline,
-    BackgroundThread,
-}
-
-fn search_work_execution(work: SearchWork) -> SearchWorkExecution {
-    match work {
-        SearchWork::ImmediateSnapshot => SearchWorkExecution::Inline,
-        SearchWork::DeferredProviders => SearchWorkExecution::BackgroundThread,
-    }
 }
 
 impl SearchController {
@@ -256,6 +244,9 @@ impl SearchController {
     fn start_update_poller(&self) {
         let controller = self.clone();
         glib::timeout_add_local(Duration::from_millis(16), move || {
+            if !controller.window.is_visible() {
+                return glib::ControlFlow::Break;
+            }
             controller.drain_updates();
             controller.drain_cockpit_updates();
             glib::ControlFlow::Continue
@@ -288,30 +279,17 @@ impl SearchController {
         } else {
             self.mode
         };
-        match search_work_execution(SearchWork::ImmediateSnapshot) {
-            SearchWorkExecution::Inline => {
-                let snapshot = sources.search_snapshot(&query, mode, clipboard_url.as_deref());
-                self.apply_search_update(SearchUpdate {
-                    generation,
-                    phase: SearchUpdatePhase::Immediate,
-                    snapshot,
-                    deferred_results: Vec::new(),
-                });
-            }
-            SearchWorkExecution::BackgroundThread => {
-                set_background_processing(&self.spinner, true);
-                let tx = self.update_tx.clone();
-                thread::spawn(move || {
-                    let snapshot = sources.search_snapshot(&query, mode, clipboard_url.as_deref());
-                    let _ = tx.send(SearchUpdate {
-                        generation,
-                        phase: SearchUpdatePhase::Immediate,
-                        snapshot,
-                        deferred_results: Vec::new(),
-                    });
-                });
-            }
-        }
+        set_background_processing(&self.spinner, true);
+        let tx = self.update_tx.clone();
+        thread::spawn(move || {
+            let snapshot = sources.search_snapshot(&query, mode, clipboard_url.as_deref());
+            let _ = tx.send(SearchUpdate {
+                generation,
+                phase: SearchUpdatePhase::Immediate,
+                snapshot,
+                deferred_results: Vec::new(),
+            });
+        });
     }
 
     fn drain_updates(&self) {
@@ -329,12 +307,17 @@ impl SearchController {
     fn bump_generation(&self) -> u64 {
         let mut state = self.state.borrow_mut();
         state.generation = state.generation.saturating_add(1);
-        let _ = state.pending_timeout.take();
+        state.local_results = None;
+        if let Some(source) = state.pending_timeout.take() {
+            source.remove();
+        }
         state.generation
     }
 
     fn refresh_if_searching(&self) {
-        if accepts_automatic_refresh(&self.state.borrow()) {
+        // Let a slower provider finish; periodic desktop updates must not keep
+        // invalidating its generation before any results can become visible.
+        if accepts_automatic_refresh(&self.state.borrow()) && !self.spinner.is_visible() {
             self.refresh();
         }
     }
@@ -342,7 +325,10 @@ impl SearchController {
     fn pause_search_updates(&self) {
         let mut state = self.state.borrow_mut();
         state.generation = state.generation.saturating_add(1);
-        let _ = state.pending_timeout.take();
+        state.local_results = None;
+        if let Some(source) = state.pending_timeout.take() {
+            source.remove();
+        }
         state.presentation = ResultsPresentation::Submenu;
         set_background_processing(&self.spinner, false);
     }
@@ -372,28 +358,17 @@ impl SearchController {
                 let sources = controller.sources.clone();
                 let snapshot = snapshot_for_timeout.clone();
                 let tx = controller.update_tx.clone();
-                match search_work_execution(SearchWork::DeferredProviders) {
-                    SearchWorkExecution::Inline => {
-                        let deferred_results = sources.search_deferred_results(&snapshot);
-                        let _ = tx.send(SearchUpdate {
-                            generation,
-                            phase: SearchUpdatePhase::Deferred,
-                            snapshot,
-                            deferred_results,
-                        });
-                    }
-                    SearchWorkExecution::BackgroundThread => {
-                        thread::spawn(move || {
-                            let deferred_results = sources.search_deferred_results(&snapshot);
-                            let _ = tx.send(SearchUpdate {
-                                generation,
-                                phase: SearchUpdatePhase::Deferred,
-                                snapshot,
-                                deferred_results,
-                            });
-                        });
-                    }
-                }
+                let integrated_controls = controller.cockpit_available.get();
+                thread::spawn(move || {
+                    let deferred_results = sources
+                        .search_deferred_results_with_desktop(&snapshot, integrated_controls);
+                    let _ = tx.send(SearchUpdate {
+                        generation,
+                        phase: SearchUpdatePhase::Deferred,
+                        snapshot,
+                        deferred_results,
+                    });
+                });
             },
         );
         self.state.borrow_mut().pending_timeout = Some(source_id);
@@ -417,10 +392,10 @@ impl SearchController {
         );
 
         if phase == SearchUpdatePhase::Immediate {
-            let results = self.integrate_cockpit_results(
-                snapshot.immediate_results.clone(),
-                &snapshot.query.text,
-            );
+            self.state.borrow_mut().local_results =
+                Some((snapshot.query.clone(), snapshot.immediate_results.clone()));
+            let results =
+                self.integrate_cockpit_results(snapshot.immediate_results.clone(), &snapshot.query);
             if snapshot.deferred.is_empty() {
                 let results = finalize_loaded_results(results, &snapshot.query);
                 self.render_results(results);
@@ -433,17 +408,23 @@ impl SearchController {
         }
 
         let results = append_deferred_results(snapshot.immediate_results.clone(), deferred_results);
-        let mut results = self.integrate_cockpit_results(results, &snapshot.query.text);
+        self.state.borrow_mut().local_results = Some((snapshot.query.clone(), results.clone()));
+        let mut results = self.integrate_cockpit_results(results, &snapshot.query);
         if results.is_empty() {
             results.push(no_results_item(&snapshot.query));
         }
         self.render_results(results);
     }
 
-    fn integrate_cockpit_results(&self, results: Vec<ResultItem>, query: &str) -> Vec<ResultItem> {
-        if self.cockpit_context.is_none()
-            && (!matches!(self.mode, SearchMode::All | SearchMode::Controls)
-                || (self.mode == SearchMode::All && query.trim().is_empty()))
+    fn integrate_cockpit_results(
+        &self,
+        results: Vec<ResultItem>,
+        query: &QueryInput,
+    ) -> Vec<ResultItem> {
+        if !matches!(query.mode, SearchMode::All | SearchMode::Controls)
+            || (self.cockpit_context.is_none()
+                && query.mode == SearchMode::All
+                && query.text.trim().is_empty())
         {
             return results;
         }
@@ -451,7 +432,7 @@ impl SearchController {
             results,
             &self.cockpit_contexts.borrow(),
             self.cockpit_context,
-            query,
+            &query.text,
             self.cockpit_available.get(),
         )
     }
@@ -473,17 +454,19 @@ impl SearchController {
 
     fn drain_cockpit_updates(&self) {
         let mut changed = false;
+        let mut lost_desktop = false;
         loop {
             match self.cockpit_update_rx.borrow_mut().try_recv() {
                 Ok(Ok(contexts)) => {
-                    self.cockpit_available.set(true);
+                    changed |= !self.cockpit_available.replace(true)
+                        || *self.cockpit_contexts.borrow() != contexts;
                     self.cockpit_contexts.replace(contexts);
-                    changed = true;
                 }
                 Ok(Err(_)) => {
-                    self.cockpit_available.set(false);
+                    let was_available = self.cockpit_available.replace(false);
+                    changed |= was_available;
+                    lost_desktop |= was_available;
                     self.cockpit_contexts.borrow_mut().clear();
-                    changed = true;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
@@ -491,7 +474,23 @@ impl SearchController {
         }
         if changed {
             self.update_context_header();
-            self.refresh_if_searching();
+            if lost_desktop && accepts_automatic_refresh(&self.state.borrow()) {
+                self.refresh();
+            }
+            // Desktop telemetry updates the presentation only. Re-running the
+            // whole search every 750 ms spawns tools and disrupts selection.
+            let state = self.state.borrow();
+            if accepts_automatic_refresh(&state)
+                && let Some((query, local)) = &state.local_results
+            {
+                let results = self.integrate_cockpit_results(local.clone(), query);
+                let results = if self.spinner.is_visible() {
+                    pending_deferred_results(results)
+                } else {
+                    finalize_loaded_results(results, query)
+                };
+                self.render_results(results);
+            }
         }
 
         loop {
@@ -559,6 +558,10 @@ impl SearchController {
     }
 
     fn render_results(&self, results: Vec<ResultItem>) {
+        if same_presentation(&self.current_results.borrow(), &results) {
+            self.current_results.replace(results);
+            return;
+        }
         // Keep the user's arrow-key selection anchored to its item when a rebuild
         // is triggered by deferred results arriving, rather than snapping to row 0.
         let previous_selection = self
@@ -701,15 +704,21 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    let started = std::time::Instant::now();
     let args: Vec<String> = std::env::args().collect();
     configure_gdk_backend();
-    let config = Arc::new(ConfigStore::load());
-    let _ = APP_CONFIG.set(config.clone());
-    let sources = Arc::new(Sources::load(config.clone()));
     let application = Application::builder()
         .application_id("me.robindecker.Luma")
         .flags(gio::ApplicationFlags::HANDLES_COMMAND_LINE)
         .build();
+    application.add_main_option(
+        "toggle",
+        glib::Char::from(b'\0'),
+        glib::OptionFlags::NONE,
+        glib::OptionArg::None,
+        "Toggle the requested launcher",
+        None,
+    );
     application.add_main_option(
         "mode",
         glib::Char::from(b'\0'),
@@ -741,26 +750,81 @@ fn run() -> Result<()> {
         );
     }
 
-    let config_for_command = config.clone();
+    // Remote shortcut invocations must reach the primary process before doing
+    // any indexing. Startup runs only in the primary GApplication instance.
+    let sources = RefCell::new(None::<(std::time::Instant, Arc<Sources>)>);
+    application.connect_startup(move |app| {
+        if profiling_enabled() {
+            eprintln!(
+                "[luma-profile] application startup={:.2}ms",
+                started.elapsed().as_secs_f64() * 1_000.0
+            );
+        }
+        let config = Arc::new(ConfigStore::load());
+        app.set_inactivity_timeout(
+            config
+                .current()
+                .ui
+                .idle_timeout_seconds
+                .saturating_mul(1_000),
+        );
+        let _ = APP_CONFIG.set(config.clone());
+    });
+    let last_launch = Rc::new(RefCell::new(None::<Cli>));
     application.connect_command_line(move |app, command_line| {
-        let cli = match cli_from_command_line(command_line) {
+        let mut cli = match cli_from_command_line(command_line) {
             Ok(cli) => cli,
             Err(error) => {
                 eprintln!("{error}");
                 return glib::ExitCode::FAILURE;
             }
         };
-        for window in app.windows() {
+        let mode = cli.mode.unwrap_or_else(|| {
+            app_config()
+                .expect("primary startup config")
+                .current()
+                .default_mode
+        });
+        cli.mode = Some(mode);
+        let launcher_windows = app
+            .windows()
+            .into_iter()
+            .filter(|window| window.title().as_deref() == Some("Luma"))
+            .collect::<Vec<_>>();
+        let toggle_closed = cli.toggle
+            && launcher_windows.iter().any(|window| window.is_visible())
+            && last_launch
+                .borrow()
+                .as_ref()
+                .is_some_and(|previous| same_launch_request(previous, &cli));
+        for window in launcher_windows {
             window.close();
         }
-        let mode = cli
-            .mode
-            .unwrap_or_else(|| config_for_command.current().default_mode);
+        if toggle_closed {
+            return glib::ExitCode::SUCCESS;
+        }
+        // Frequent reopening can keep the primary process alive indefinitely.
+        // Bound index age too, so newly installed apps and bookmarks appear.
+        let sources = {
+            let mut cache = sources.borrow_mut();
+            if cache
+                .as_ref()
+                .is_none_or(|(loaded, _)| loaded.elapsed() >= SOURCE_CACHE_LIFETIME)
+            {
+                let config = app_config().expect("primary startup config");
+                *cache = Some((std::time::Instant::now(), Arc::new(Sources::load(config))));
+            }
+            cache.as_ref().expect("initialized source cache").1.clone()
+        };
+        last_launch.replace(Some(cli.clone()));
+        // Complete the handoff before presenting Luma, so a late close request
+        // cannot dismiss a settings page subsequently opened from the launcher.
+        let _ = CockpitClient::from_env().and_then(|client| client.close_control_center());
         build_ui(
             app,
             mode,
             cli.query,
-            sources.clone(),
+            sources,
             cli.context,
             cli.output,
             cli.placement,
@@ -799,12 +863,21 @@ fn cli_from_command_line(command_line: &gio::ApplicationCommandLine) -> Result<C
         .transpose()?
         .unwrap_or_default();
     Ok(Cli {
+        toggle: options.lookup::<bool>("toggle")?.unwrap_or(false),
         mode,
         query: string_option("query")?,
         context,
         output: string_option("output")?,
         placement,
     })
+}
+
+fn same_launch_request(previous: &Cli, next: &Cli) -> bool {
+    previous.mode == next.mode
+        && previous.context == next.context
+        && previous.query == next.query
+        && previous.placement == next.placement
+        && (next.output.is_none() || previous.output == next.output)
 }
 
 fn configure_gdk_backend() {
@@ -856,6 +929,7 @@ fn build_ui(
     output: Option<String>,
     placement: LauncherPlacement,
 ) {
+    let started = std::time::Instant::now();
     let config = app_config()
         .map(|store| store.current())
         .unwrap_or_default();
@@ -895,7 +969,6 @@ fn build_ui(
     outer.add_css_class("launcher-shell");
     if placement == LauncherPlacement::Bar {
         outer.add_css_class("launcher-from-bar");
-        outer.add_css_class("launcher-entering");
     }
     outer.set_halign(Align::Center);
     outer.set_size_request(config.ui.width_px, -1);
@@ -948,6 +1021,21 @@ fn build_ui(
 
     let current_results = Rc::new(RefCell::new(Vec::<ResultItem>::new()));
     let add_password_draft = Rc::new(RefCell::new(None::<AddPasswordDraft>));
+    let navigation = SearchNavigation::new(
+        &entry,
+        if context.is_some() {
+            SearchMode::Controls
+        } else {
+            mode
+        },
+    );
+    outer.insert_child_after(&navigation.root, Some(&entry_overlay));
+    let hints = Label::new(Some(
+        "↑↓ Navigate   ·   Enter Open   ·   Esc Close   ·   Ctrl+1–5 Filter",
+    ));
+    hints.add_css_class("launcher-hints");
+    hints.set_xalign(0.0);
+    outer.append(&hints);
     let clipboard_url = Rc::new(RefCell::new(None::<String>));
     let search = SearchController::new(
         window.clone(),
@@ -969,11 +1057,16 @@ fn build_ui(
         context_header,
     );
     search.start_update_poller();
+    let mut window_signals = Vec::new();
     if let Some(context) = context {
         let search_for_open = search.clone();
-        context_open_button.connect_clicked(move |_| {
+        let handler = context_open_button.connect_clicked(move |_| {
             search_for_open.open_cockpit_context(context);
         });
+        window_signals.push((
+            context_open_button.clone().upcast::<glib::Object>(),
+            handler,
+        ));
     }
 
     if profiling_enabled() {
@@ -983,13 +1076,18 @@ fn build_ui(
     {
         let search = search.clone();
         let add_password_draft = add_password_draft.clone();
-        entry.connect_changed(move |_| {
+        let navigation = navigation.clone();
+        let handler = entry.connect_changed(move |_| {
+            navigation
+                .root
+                .set_sensitive(add_password_draft.borrow().is_none());
             if add_password_draft.borrow().is_some() {
                 return;
             }
 
             search.refresh();
         });
+        window_signals.push((entry.clone().upcast::<glib::Object>(), handler));
     }
 
     {
@@ -1003,7 +1101,7 @@ fn build_ui(
         let current_results = current_results.clone();
         let previous_focus_target = previous_focus_target.clone();
         let search_for_activation = search.clone();
-        list.connect_row_activated(move |_, row| {
+        let handler = list.connect_row_activated(move |_, row| {
             let item = {
                 let results = current_results.borrow();
                 results.get(row.index() as usize).cloned()
@@ -1026,6 +1124,7 @@ fn build_ui(
                 );
             }
         });
+        window_signals.push((list.clone().upcast::<glib::Object>(), handler));
     }
 
     {
@@ -1039,7 +1138,7 @@ fn build_ui(
         let previous_focus_target = previous_focus_target.clone();
         let add_password_draft = add_password_draft.clone();
         let search_for_activation = search.clone();
-        entry.connect_activate(move |_| {
+        let handler = entry.connect_activate(move |_| {
             if add_password_draft.borrow().is_some() {
                 advance_add_password_flow(
                     &activate_entry,
@@ -1085,6 +1184,7 @@ fn build_ui(
                 );
             }
         });
+        window_signals.push((entry.clone().upcast::<glib::Object>(), handler));
     }
 
     {
@@ -1094,25 +1194,31 @@ fn build_ui(
         let current_results = current_results.clone();
         let keys = EventControllerKey::new();
         let key_window = window.clone();
-        keys.connect_key_pressed(move |_, key, _, _| match key {
-            gdk::Key::Escape => {
-                key_window.close();
-                glib::Propagation::Stop
+        let handler = keys.connect_key_pressed(move |_, key, _, modifiers| {
+            if navigation.activate_shortcut(key, modifiers) {
+                return glib::Propagation::Stop;
             }
-            gdk::Key::Down => {
-                let result_count = current_results.borrow().len() as i32;
-                move_selection(&list, &scroller, 1, result_count);
-                entry.grab_focus();
-                glib::Propagation::Stop
+            match key {
+                gdk::Key::Escape => {
+                    key_window.close();
+                    glib::Propagation::Stop
+                }
+                gdk::Key::Down => {
+                    let result_count = current_results.borrow().len() as i32;
+                    move_selection(&list, &scroller, 1, result_count);
+                    entry.grab_focus();
+                    glib::Propagation::Stop
+                }
+                gdk::Key::Up => {
+                    let result_count = current_results.borrow().len() as i32;
+                    move_selection(&list, &scroller, -1, result_count);
+                    entry.grab_focus();
+                    glib::Propagation::Stop
+                }
+                _ => glib::Propagation::Proceed,
             }
-            gdk::Key::Up => {
-                let result_count = current_results.borrow().len() as i32;
-                move_selection(&list, &scroller, -1, result_count);
-                entry.grab_focus();
-                glib::Propagation::Stop
-            }
-            _ => glib::Propagation::Proceed,
         });
+        window_signals.push((keys.clone().upcast::<glib::Object>(), handler));
         window.add_controller(keys);
     }
 
@@ -1121,12 +1227,9 @@ fn build_ui(
 
         {
             let focus_armed = focus_armed.clone();
-            let window = window.clone();
             entry.connect_has_focus_notify(move |entry| {
                 if entry.has_focus() {
                     focus_armed.set(true);
-                } else if focus_armed.get() && window.is_visible() {
-                    window.close();
                 }
             });
         }
@@ -1141,23 +1244,43 @@ fn build_ui(
         }
     }
 
+    // A warm application outlives each window. Disconnect callbacks holding
+    // that window's controller, and discard query/submenu data on every close.
+    let cleanup = RefCell::new(Some((window_signals, search.clone())));
+    window.connect_close_request(move |_| {
+        if let Some((signals, search)) = cleanup.borrow_mut().take() {
+            for (object, handler) in signals {
+                object.disconnect(handler);
+            }
+            search.pause_search_updates();
+            search.current_results.borrow_mut().clear();
+            search.add_password_draft.replace(None);
+            search.clipboard_url.replace(None);
+            search.entry.set_text("");
+            while let Some(row) = search.list.first_child() {
+                search.list.remove(&row);
+            }
+        }
+        glib::Propagation::Proceed
+    });
+
     search.refresh();
     window.present();
-    if placement == LauncherPlacement::Bar {
-        let outer = outer.clone();
-        glib::timeout_add_local_once(Duration::from_millis(320), move || {
-            outer.remove_css_class("launcher-entering");
-        });
-    }
     request_initial_focus(&window, &entry);
     schedule_clipboard_url_loads(&search);
+    if profiling_enabled() {
+        eprintln!(
+            "[luma-profile] ui build={:.2}ms",
+            started.elapsed().as_secs_f64() * 1_000.0
+        );
+    }
 }
 
 fn schedule_clipboard_url_loads(search: &SearchController) {
     for delay_ms in [80_u64, 220, 500] {
         let search = search.clone();
         glib::timeout_add_local_once(Duration::from_millis(delay_ms), move || {
-            if search.clipboard_url.borrow().is_some() {
+            if !search.window.is_visible() || search.clipboard_url.borrow().is_some() {
                 return;
             }
             load_clipboard_url(&search);
@@ -1174,6 +1297,9 @@ fn load_clipboard_url(search: &SearchController) {
     display
         .clipboard()
         .read_text_async(None::<&gio::Cancellable>, move |result| {
+            if !search.window.is_visible() {
+                return;
+            }
             let Ok(Some(text)) = result else {
                 return;
             };
@@ -1256,6 +1382,28 @@ fn activate_item(
                 let results = inspected_password_results(&credential);
                 search.show_submenu_results(results);
             }
+            Err(error) => {
+                search.show_submenu_status(action_failure_result(&error.root_cause().to_string()))
+            }
+        }
+        return;
+    }
+
+    if let Action::PasswordFields { entry } = &item.action {
+        match load_pass_credential(entry) {
+            Ok(credential) => search.show_submenu_results(password_field_results(&credential)),
+            Err(error) => {
+                search.show_submenu_status(action_failure_result(&error.root_cause().to_string()))
+            }
+        }
+        return;
+    }
+
+    if let Action::PasswordFieldActions { entry, field } = &item.action {
+        match load_pass_credential(entry)
+            .and_then(|credential| password_field_action_results(&credential, field))
+        {
+            Ok(results) => search.show_submenu_results(results),
             Err(error) => {
                 search.show_submenu_status(action_failure_result(&error.root_cause().to_string()))
             }
@@ -1551,7 +1699,9 @@ fn execute_action(
             execute_password_operation(window, &entry, operation, previous_focus_target)?;
             return Ok(());
         }
-        Action::PasswordActions { .. } => {
+        Action::PasswordActions { .. }
+        | Action::PasswordFields { .. }
+        | Action::PasswordFieldActions { .. } => {
             anyhow::bail!("password action menu must open from the launcher UI");
         }
         Action::AddPassword { .. } => {
@@ -1846,9 +1996,7 @@ fn file_uri_to_path(uri: &str) -> Option<std::path::PathBuf> {
 
 fn placeholder_for_mode(mode: SearchMode) -> &'static str {
     match mode {
-        SearchMode::All => {
-            "Search apps, files, passwords, email, SSH, commands, web, and calculations"
-        }
+        SearchMode::All => "Search apps, windows, files, or actions",
         SearchMode::Apps => "Launch an application",
         SearchMode::Windows => "Switch to an active window",
         SearchMode::Files => "Search files with LocalSearch",
@@ -1906,11 +2054,10 @@ mod tests {
     use super::{
         EmailOpenStrategy, LAUNCHER_SHADOW_BLUR_PX, LAUNCHER_SHADOW_Y_OFFSET_PX,
         LAUNCHER_SURFACE_MARGIN_BOTTOM_PX, LAUNCHER_SURFACE_MARGIN_PX, ResultsPresentation,
-        SearchAsyncState, SearchUpdatePhase, SearchWork, SearchWorkExecution,
-        accepts_automatic_refresh, accepts_search_update, action_failure_result,
-        default_ssh_terminal, email_open_strategy, inspected_password_results, layer_shell_enabled,
-        package_install_command, power_confirmation_results, power_requires_confirmation,
-        search_work_execution,
+        SearchAsyncState, SearchUpdatePhase, accepts_automatic_refresh, accepts_search_update,
+        action_failure_result, default_ssh_terminal, email_open_strategy,
+        inspected_password_results, layer_shell_enabled, package_install_command,
+        power_confirmation_results, power_requires_confirmation,
     };
     use crate::actions::{
         desktop_controls::desktop_control_commands, password::use_x11_type_backend,
@@ -1928,6 +2075,20 @@ mod tests {
     };
     use crate::ui::theme::fallback_css;
     use std::fs::{self, File};
+
+    #[test]
+    fn repeated_launcher_shortcut_closes_but_a_different_purpose_switches() {
+        use clap::Parser;
+        let all = super::Cli::try_parse_from(["Luma", "--toggle"]).unwrap();
+        let windows =
+            super::Cli::try_parse_from(["Luma", "--toggle", "--mode", "windows"]).unwrap();
+        assert!(super::same_launch_request(&all, &all));
+        assert!(!super::same_launch_request(&all, &windows));
+        let left = super::Cli::try_parse_from(["Luma", "--output", "DP-2"]).unwrap();
+        let right = super::Cli::try_parse_from(["Luma", "--output", "DP-3"]).unwrap();
+        assert!(!super::same_launch_request(&left, &right));
+        assert!(super::same_launch_request(&left, &all));
+    }
 
     #[test]
     fn prefers_launch_kitty_wrapper_when_it_is_executable() {
@@ -1992,6 +2153,24 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_live_results_keep_widgets_but_badges_and_status_changes_refresh() {
+        let row = selection_test_item("Windows", "Firefox");
+        assert!(super::same_presentation(
+            std::slice::from_ref(&row),
+            std::slice::from_ref(&row)
+        ));
+        let mut changed = row.clone();
+        changed.accessory = Some("Muted".to_string());
+        assert!(!super::same_presentation(
+            std::slice::from_ref(&row),
+            &[changed]
+        ));
+        let mut enabled = row.clone();
+        enabled.action = Action::ReturnToSearch;
+        assert!(!super::same_presentation(&[row], &[enabled]));
+    }
+
+    #[test]
     fn selection_follows_the_chosen_item_when_async_results_change_order() {
         let app = selection_test_item("Applications", "Reddit Client");
         let bookmark = selection_test_item("Bookmarks", "Reddit");
@@ -2044,18 +2223,6 @@ mod tests {
             SearchUpdatePhase::Deferred,
             true
         ));
-    }
-
-    #[test]
-    fn immediate_search_snapshots_are_applied_inline() {
-        assert_eq!(
-            search_work_execution(SearchWork::ImmediateSnapshot),
-            SearchWorkExecution::Inline
-        );
-        assert_eq!(
-            search_work_execution(SearchWork::DeferredProviders),
-            SearchWorkExecution::BackgroundThread
-        );
     }
 
     #[test]

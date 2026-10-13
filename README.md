@@ -68,6 +68,17 @@ The settings panel lets you adjust:
 
 Some appearance changes apply on the next launch.
 
+Luma stays ready for 30 seconds after its last window closes so repeated
+shortcuts reuse the application and search index. Hidden windows stop polling.
+Set `ui.idle_timeout_seconds` in the JSON config to adjust this interval, or `0`
+to exit immediately. Restart Luma after changing this setting.
+The search index refreshes on opening once it is 30 seconds old, even during
+frequent use, so newly installed applications and bookmarks become searchable.
+
+When Vigil is available, Controls uses its live desktop state. Local command
+probes remain available as a fallback and run after typing pauses; they do not
+delay native settings or application results.
+
 ## Usage
 
 Run from source:
@@ -112,6 +123,17 @@ and idle locking on the same Hyprlock configuration and fallback path.
 
 ## Search Syntax
 
+The visible All, Apps, Windows, Controls, and Files filters keep your search text
+when switching scope. `Ctrl+1` through `Ctrl+5` select them from the keyboard;
+`all:` also returns a dedicated launch mode to unified search. Arrow keys select
+results, Enter opens, and Escape closes. `Luma --toggle` closes an already visible
+launcher for the same requested mode, while a different mode replaces it.
+
+Search providers run off the UI thread and desktop status commands time out when
+a service does not answer. Open windows join the initial ranked results. The
+Controls filter includes Vigil's live contexts; opening Luma dismisses an open
+quick-settings panel before presenting the launcher.
+
 Luma understands a few lightweight prefixes:
 
 ```text
@@ -149,6 +171,7 @@ Password search shows one row per matching entry. Selecting a password entry ope
 - Open or copy URL metadata when present
 - Copy or type OTP when `pass-otp` metadata is present
 - Custom autotype when an entry defines an autotype template
+- Additional custom metadata fields, each with Copy and Type actions
 
 Choosing Autotype types username, Tab, and password into the previously focused window without submitting the form.
 

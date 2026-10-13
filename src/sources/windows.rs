@@ -1,4 +1,4 @@
-use crate::model::{Action, ResultItem, WindowFocusTarget};
+use crate::model::{Action, ResultItem, WindowFocusTarget, score_text};
 use std::process::Command;
 
 #[derive(Clone, Debug)]
@@ -9,6 +9,14 @@ pub struct WindowEntry {
     pub search_blob: String,
     pub focus_order: i64,
     pub focus_target: WindowFocusTarget,
+}
+
+pub(crate) fn window_match_score(window: &WindowEntry, query: &str) -> Option<i32> {
+    // A browser's changing page title should not weaken an exact app-name match.
+    [&window.title, &window.app_name, &window.search_blob]
+        .into_iter()
+        .filter_map(|text| score_text(text, query))
+        .max()
 }
 
 pub(crate) fn load_windows() -> Vec<WindowEntry> {
@@ -270,4 +278,31 @@ fn unsigned_field(value: &serde_json::Value, key: &str) -> Option<u64> {
 
 fn bool_field(value: &serde_json::Value, key: &str) -> Option<bool> {
     value.get(key).and_then(serde_json::Value::as_bool)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_app_name_beats_a_bookmark_even_with_a_long_window_title() {
+        let window = WindowEntry {
+            title: "A long article currently open in the browser".to_string(),
+            app_name: "firefox".to_string(),
+            workspace: "2".to_string(),
+            search_blob: "a long article currently open in the browser firefox 2".to_string(),
+            focus_order: 0,
+            focus_target: WindowFocusTarget::Hyprland {
+                address: "0x123".to_string(),
+                xwayland: false,
+            },
+        };
+        let window_score = window_match_score(&window, "firefox").unwrap() + 860;
+        let bookmark_score =
+            score_text("Firefox: Support support.mozilla.org", "firefox").unwrap() + 830;
+        assert!(window_score > bookmark_score);
+        assert!(window_match_score(&window, "article").is_some());
+        assert!(window_match_score(&window, "2").is_some());
+        assert!(window_match_score(&window, "unrelated").is_none());
+    }
 }

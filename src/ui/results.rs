@@ -69,6 +69,20 @@ fn same_result(left: &ResultItem, right: &ResultItem) -> bool {
     left.source == right.source && left.title == right.title && left.subtitle == right.subtitle
 }
 
+// Preserve hover, keyboard focus, scroll position, and CSS transitions when a
+// live-context poll leaves the visible results unchanged. Actions are refreshed
+// separately by the controller even when the widgets can be reused.
+pub(crate) fn same_presentation(previous: &[ResultItem], next: &[ResultItem]) -> bool {
+    previous.len() == next.len()
+        && previous.iter().zip(next).all(|(left, right)| {
+            same_result(left, right)
+                && left.icon_name == right.icon_name
+                && left.accessory == right.accessory
+                && left.badges == right.badges
+                && matches!(left.action, Action::None) == matches!(right.action, Action::None)
+        })
+}
+
 pub(crate) fn preserved_selection_index(
     previous: Option<&ResultItem>,
     results: &[ResultItem],

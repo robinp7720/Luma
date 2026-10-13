@@ -21,7 +21,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 mod windows;
 pub use windows::{focus_window, focused_window_target};
 use windows::{
-    load_windows, window_prediction_key, window_result_item, window_result_item_with_score,
+    load_windows, window_match_score, window_prediction_key, window_result_item,
+    window_result_item_with_score,
 };
 
 const MAX_APPS: usize = 8;
@@ -353,7 +354,8 @@ pub struct Sources {
 
 impl Sources {
     pub fn load(config: Arc<ConfigStore>) -> Self {
-        Self {
+        let started = Instant::now();
+        let sources = Self {
             config: config.clone(),
             apps: load_applications(),
             ssh_hosts: load_ssh_hosts(),
@@ -370,7 +372,14 @@ impl Sources {
             pass_available: command_exists("pass"),
             qalc_available: command_exists("qalc"),
             predictions: Arc::new(Mutex::new(PredictionStore::load())),
+        };
+        if crate::ui::results::profiling_enabled() {
+            eprintln!(
+                "[luma-profile] index load={:.2}ms",
+                started.elapsed().as_secs_f64() * 1_000.0
+            );
         }
+        sources
     }
 
     #[cfg(test)]
@@ -419,6 +428,7 @@ impl Sources {
         }
     }
 
+    #[cfg(test)]
     pub fn search(&self, raw_query: &str, cli_mode: SearchMode) -> Vec<ResultItem> {
         self.search_with_clipboard_url(raw_query, cli_mode, None)
     }
@@ -435,10 +445,15 @@ impl Sources {
 
         if query.text.is_empty() {
             results.extend(self.default_results(&query, now, clipboard_url));
+            let controls_deferred =
+                query.mode == SearchMode::Controls && self.current_config().sources.controls;
             return SearchSnapshot {
                 query,
                 immediate_results: results,
-                deferred: DeferredSearchPlan::default(),
+                deferred: DeferredSearchPlan {
+                    controls: controls_deferred,
+                    ..DeferredSearchPlan::default()
+                },
             };
         }
 
@@ -468,8 +483,9 @@ impl Sources {
 
         let package_search_deferred = self.should_defer_package_search(&query);
 
-        let windows_search_deferred = self.should_defer_windows_search(&query);
-        if !windows_search_deferred && query.mode.includes(SearchMode::Windows) {
+        // Compositor enumeration belongs in the initial ranked snapshot (already
+        // computed off the GTK thread), so matching windows stay visible beside apps.
+        if query.mode.includes(SearchMode::Windows) {
             results.extend(self.search_windows(&query, now));
         }
 
@@ -486,9 +502,6 @@ impl Sources {
         }
 
         let controls_search_deferred = self.should_defer_controls_search(&query);
-        if !controls_search_deferred && query.mode.includes(SearchMode::Controls) {
-            results.extend(self.search_controls(&query, now));
-        }
 
         if query.mode == SearchMode::All {
             results.extend(self.search_bookmarks(&query, now));
@@ -545,7 +558,7 @@ impl Sources {
             deferred: DeferredSearchPlan {
                 files: file_search_deferred,
                 email: email_search_deferred,
-                windows: windows_search_deferred,
+                windows: false,
                 controls: controls_search_deferred,
                 recents: recent_files_deferred,
                 calc: false,
@@ -554,7 +567,16 @@ impl Sources {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn search_deferred_results(&self, snapshot: &SearchSnapshot) -> Vec<ResultItem> {
+        self.search_deferred_results_with_desktop(snapshot, false)
+    }
+
+    pub(crate) fn search_deferred_results_with_desktop(
+        &self,
+        snapshot: &SearchSnapshot,
+        integrated_controls: bool,
+    ) -> Vec<ResultItem> {
         let now = current_unix_time();
         let mut results = Vec::new();
 
@@ -571,7 +593,7 @@ impl Sources {
         }
 
         if snapshot.deferred.controls {
-            results.extend(self.search_controls(&snapshot.query, now));
+            results.extend(self.search_controls(&snapshot.query, now, integrated_controls));
         }
 
         if snapshot.deferred.recents {
@@ -585,6 +607,7 @@ impl Sources {
         results
     }
 
+    #[cfg(test)]
     pub fn search_with_clipboard_url(
         &self,
         raw_query: &str,
@@ -624,12 +647,8 @@ impl Sources {
                 || (email_config.local_mail_enabled && !self.local_email_entries.is_empty()))
     }
 
-    fn should_defer_windows_search(&self, query: &QueryInput) -> bool {
-        query.mode == SearchMode::All && self.current_config().sources.windows
-    }
-
     fn should_defer_controls_search(&self, query: &QueryInput) -> bool {
-        query.mode == SearchMode::All && self.current_config().sources.controls
+        query.mode.includes(SearchMode::Controls) && self.current_config().sources.controls
     }
 
     fn should_defer_recent_files_search(&self, query: &QueryInput) -> bool {
@@ -1068,14 +1087,6 @@ impl Sources {
                     "preferences-desktop-symbolic",
                     65,
                 ));
-            } else {
-                let query = QueryInput {
-                    mode,
-                    source_filter: query.source_filter,
-                    package_manager: query.package_manager,
-                    text: String::new(),
-                };
-                results.extend(self.search_controls(&query, now));
             }
         }
 
@@ -1128,7 +1139,7 @@ impl Sources {
         let mut items = load_windows()
             .into_iter()
             .filter_map(|window| {
-                let score = score_text(&window.search_blob, &query.text)?;
+                let score = window_match_score(&window, &query.text)?;
                 let prediction_key = window_prediction_key(&window);
                 let boosted_score = score + 860 + self.prediction_boost(&prediction_key, now);
                 Some(window_result_item_with_score(window, boosted_score))
@@ -1593,7 +1604,12 @@ impl Sources {
         items
     }
 
-    fn search_controls(&self, query: &QueryInput, now: u64) -> Vec<ResultItem> {
+    fn search_controls(
+        &self,
+        query: &QueryInput,
+        now: u64,
+        integrated_controls: bool,
+    ) -> Vec<ResultItem> {
         if !self.current_config().sources.controls {
             if query.mode == SearchMode::Controls {
                 return vec![instruction_result(
@@ -1607,7 +1623,7 @@ impl Sources {
             return Vec::new();
         }
 
-        let snapshot = load_control_snapshot();
+        let snapshot = load_control_snapshot(integrated_controls);
         control_results_from_snapshot(&snapshot, query, now, |key| self.prediction_boost(key, now))
     }
 
@@ -3617,7 +3633,7 @@ fn run_command_with_timeout(
             let _ = child.wait();
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
-                "mail helper timed out",
+                "command timed out",
             ));
         }
 
@@ -4023,6 +4039,45 @@ mod tests {
 
     fn empty_prediction_store() -> Arc<Mutex<PredictionStore>> {
         Arc::new(Mutex::new(PredictionStore::disabled()))
+    }
+
+    #[test]
+    fn unresponsive_status_command_is_terminated_instead_of_holding_search_open() {
+        let mut command = std::process::Command::new("sleep");
+        command.arg("5");
+        let start = std::time::Instant::now();
+        let error = super::run_command_with_timeout(command, 50).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn controls_publish_an_initial_snapshot_before_probing_system_commands() {
+        let sources = empty_sources();
+        for query in ["", "audio"] {
+            let snapshot = sources.search_snapshot(query, SearchMode::Controls, None);
+            assert!(snapshot.deferred.controls);
+            assert!(
+                snapshot
+                    .immediate_results
+                    .iter()
+                    .all(|item| !matches!(item.action, Action::DesktopControl { .. }))
+            );
+        }
+        let mut config = crate::config::LauncherConfig::default();
+        config.sources.controls = false;
+        let sources = Sources {
+            config: Arc::new(crate::config::ConfigStore::disabled(config)),
+            ..sources
+        };
+        let snapshot = sources.search_snapshot("", SearchMode::Controls, None);
+        assert!(!snapshot.deferred.controls);
+        assert!(
+            snapshot
+                .immediate_results
+                .iter()
+                .any(|item| item.title == "Desktop controls are disabled")
+        );
     }
 
     #[test]
@@ -5315,7 +5370,7 @@ aur/veloren 0.18.0-1 [+21 ~0.00]
     }
 
     #[test]
-    fn all_mode_defers_desktop_status_sources_before_immediate_results() {
+    fn all_mode_ranks_windows_immediately_and_defers_desktop_status() {
         let sources = empty_sources();
 
         let snapshot = sources.search_snapshot("reddit", SearchMode::All, None);
@@ -5325,10 +5380,15 @@ aur/veloren 0.18.0-1 [+21 ~0.00]
             "all-mode desktop status work should not block immediate app results"
         );
         assert!(
+            !snapshot.deferred.windows,
+            "windows must join the first ranked results"
+        );
+        assert!(snapshot.deferred.controls);
+        assert!(
             snapshot
                 .immediate_results
                 .iter()
-                .all(|item| item.source != "Windows" && item.source != "Controls")
+                .all(|item| item.source != "Controls")
         );
     }
 
@@ -5434,12 +5494,14 @@ aur/veloren 0.18.0-1 [+21 ~0.00]
     }
 }
 
-fn load_control_snapshot() -> ControlSnapshot {
-    let has_playerctl = command_exists("playerctl");
-    let has_wpctl = command_exists("wpctl");
-    let has_bluetoothctl = command_exists("bluetoothctl");
+fn load_control_snapshot(integrated_controls: bool) -> ControlSnapshot {
+    // Vigil already owns live media, audio, Bluetooth and power state. Only
+    // probe these commands when running without its native controls.
+    let has_playerctl = !integrated_controls && command_exists("playerctl");
+    let has_wpctl = !integrated_controls && command_exists("wpctl");
+    let has_bluetoothctl = !integrated_controls && command_exists("bluetoothctl");
     let has_nmcli = command_exists("nmcli");
-    let has_powerprofilesctl = command_exists("powerprofilesctl");
+    let has_powerprofilesctl = !integrated_controls && command_exists("powerprofilesctl");
     let notification_state = CockpitClient::from_env()
         .and_then(|client| client.notifications())
         .ok();
@@ -5469,14 +5531,15 @@ fn load_control_snapshot() -> ControlSnapshot {
             None
         },
         bluetooth: if has_bluetoothctl {
-            let show = command_output_string("bluetoothctl", &["show"]).unwrap_or_default();
-            let connected = command_output_string("bluetoothctl", &["devices", "Connected"])
-                .unwrap_or_default();
-            parse_bluetooth_status(&show, &connected)
+            command_output_string("bluetoothctl", &["show"]).and_then(|show| {
+                let connected = command_output_string("bluetoothctl", &["devices", "Connected"])
+                    .unwrap_or_default();
+                parse_bluetooth_status(&show, &connected)
+            })
         } else {
             None
         },
-        network: if has_nmcli {
+        network: if has_nmcli && !integrated_controls {
             command_output_string(
                 "nmcli",
                 &["-t", "-f", "TYPE,STATE,CONNECTION", "device", "status"],
@@ -5492,7 +5555,7 @@ fn load_control_snapshot() -> ControlSnapshot {
         } else {
             None
         },
-        screen_brightness: if command_exists("brightnessctl") {
+        screen_brightness: if !integrated_controls && command_exists("brightnessctl") {
             command_output_string("brightnessctl", &["--class=backlight", "-m", "info"])
                 .and_then(|output| parse_backlight_brightness(&output))
         } else {
@@ -5533,7 +5596,9 @@ fn load_control_snapshot() -> ControlSnapshot {
 }
 
 fn command_output_string(program: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new(program).args(args).output().ok()?;
+    let mut command = Command::new(program);
+    command.args(args);
+    let output = run_command_with_timeout(command, 500).ok()?;
     output
         .status
         .success()

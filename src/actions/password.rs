@@ -14,6 +14,9 @@ use std::thread;
 use std::time::Duration;
 
 const AUTOTYPE_AFTER_CLOSE_DELAY_MS: u64 = 180;
+const RESERVED_METADATA_FIELDS: &[&str] = &[
+    "user", "username", "email", "url", "website", "autotype", "type",
+];
 
 pub(crate) fn copy_pass_entry(entry: &str) -> Result<()> {
     let secret = load_pass_secret(entry)?;
@@ -85,6 +88,19 @@ pub(crate) fn execute_password_operation(
         PasswordOperation::CustomAutotype => {
             let steps = custom_autotype_steps(entry, &credential)?;
             type_secret_steps(window, previous_focus_target, steps)?;
+        }
+        PasswordOperation::CopyField { field } => {
+            copy_secret(credential_field(&credential, &field)?)?;
+            window.close();
+        }
+        PasswordOperation::TypeField { field } => {
+            type_secret_steps(
+                window,
+                previous_focus_target,
+                vec![TypeStep::Text(
+                    credential_field(&credential, &field)?.to_string(),
+                )],
+            )?;
         }
         PasswordOperation::Inspect => unreachable!("inspect is handled before action execution"),
     }
@@ -311,7 +327,88 @@ pub(crate) fn inspected_password_results(credential: &Credential) -> Vec<ResultI
         ));
     }
 
+    if !custom_field_names(credential).is_empty() {
+        rows.push(ResultItem {
+            title: format!("Additional fields: {}", credential.entry),
+            subtitle: "Copy or type custom password-store metadata".to_string(),
+            source: "Passwords",
+            icon_name: "dialog-password-symbolic".to_string(),
+            score: 860,
+            action: Action::PasswordFields {
+                entry: credential.entry.clone(),
+            },
+            ..Default::default()
+        });
+    }
+
     rows
+}
+
+pub(crate) fn password_field_results(credential: &Credential) -> Vec<ResultItem> {
+    custom_field_names(credential)
+        .into_iter()
+        .enumerate()
+        .map(|(index, field)| ResultItem {
+            title: format!("Field: {field}"),
+            subtitle: "Choose how to use this password-store field".to_string(),
+            source: "Passwords",
+            icon_name: "dialog-password-symbolic".to_string(),
+            score: 1_000 - index as i32,
+            action: Action::PasswordFieldActions {
+                entry: credential.entry.clone(),
+                field,
+            },
+            ..Default::default()
+        })
+        .collect()
+}
+
+pub(crate) fn password_field_action_results(
+    credential: &Credential,
+    field: &str,
+) -> Result<Vec<ResultItem>> {
+    credential_field(credential, field)?;
+    Ok(vec![
+        password_action_result(
+            &credential.entry,
+            &format!("Copy {field}"),
+            "Copy this custom password-store field and clear it after the timeout",
+            PasswordOperation::CopyField {
+                field: field.to_string(),
+            },
+            1_000,
+            None,
+        ),
+        password_action_result(
+            &credential.entry,
+            &format!("Type {field}"),
+            "Type this custom password-store field into the focused window",
+            PasswordOperation::TypeField {
+                field: field.to_string(),
+            },
+            990,
+            None,
+        ),
+    ])
+}
+
+fn custom_field_names(credential: &Credential) -> Vec<String> {
+    let mut fields = credential
+        .fields
+        .keys()
+        .filter(|field| !RESERVED_METADATA_FIELDS.contains(&field.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    fields.sort_unstable();
+    fields
+}
+
+fn credential_field<'a>(credential: &'a Credential, field: &str) -> Result<&'a str> {
+    credential
+        .fields
+        .get(field)
+        .map(String::as_str)
+        .with_context(|| format!("pass entry does not contain the {field} field"))
 }
 
 fn password_action_result(
@@ -406,4 +503,62 @@ fn load_pass_output(args: &[&str]) -> Result<String> {
     }
 
     String::from_utf8(output.stdout).context("pass returned non-UTF-8 output")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        inspected_password_results, password_field_action_results, password_field_results,
+    };
+    use crate::model::{Action, PasswordOperation};
+    use crate::password::parse_credential;
+
+    #[test]
+    fn custom_fields_are_exposed_alphabetically_and_reserved_metadata_is_not() {
+        let credential = parse_credential(
+            "example/login",
+            "secret\nusername: robin\nurl: https://example.com\nautotype: user :tab pass\nzebra: last\naccount number: 123\npin: 1234\n",
+        )
+        .expect("credential");
+
+        assert!(
+            inspected_password_results(&credential)
+                .iter()
+                .any(|item| matches!(item.action, Action::PasswordFields { .. }))
+        );
+
+        let fields = password_field_results(&credential);
+        assert_eq!(
+            fields
+                .iter()
+                .map(|item| item.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Field: account number", "Field: pin", "Field: zebra"]
+        );
+        assert!(fields.iter().all(|item| !item.title.contains("secret")));
+    }
+
+    #[test]
+    fn custom_field_actions_keep_the_field_key_with_the_operation() {
+        let credential = parse_credential("example/login", "secret\nrecovery code: abc-def\n")
+            .expect("credential");
+
+        let actions =
+            password_field_action_results(&credential, "recovery code").expect("field actions");
+        assert!(matches!(
+            actions[0].action,
+            Action::Password {
+                operation: PasswordOperation::CopyField { ref field },
+                ..
+            } if field == "recovery code"
+        ));
+        assert!(matches!(
+            actions[1].action,
+            Action::Password {
+                operation: PasswordOperation::TypeField { ref field },
+                ..
+            } if field == "recovery code"
+        ));
+        assert!(password_field_action_results(&credential, "missing").is_err());
+    }
 }
