@@ -545,6 +545,8 @@ fn build_mode_dropdown(current: SearchMode) -> DropDown {
         "Calculator",
         "Controls",
         "Packages",
+        "Shortcuts",
+        "Clipboard",
     ]);
     dropdown.set_selected(search_mode_index(current) as u32);
     dropdown
@@ -575,7 +577,9 @@ fn mode_from_dropdown(index: u32) -> SearchMode {
         8 => SearchMode::Web,
         9 => SearchMode::Calc,
         10 => SearchMode::Controls,
-        _ => SearchMode::Packages,
+        11 => SearchMode::Packages,
+        12 => SearchMode::Keys,
+        _ => SearchMode::Clipboard,
     }
 }
 
@@ -593,6 +597,8 @@ fn search_mode_index(mode: SearchMode) -> usize {
         SearchMode::Calc => 9,
         SearchMode::Controls => 10,
         SearchMode::Packages => 11,
+        SearchMode::Keys => 12,
+        SearchMode::Clipboard => 13,
     }
 }
 

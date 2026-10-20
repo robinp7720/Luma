@@ -18,7 +18,15 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod clipboard;
+mod keys;
 mod windows;
+pub use clipboard::restore_clipboard_entry;
+use clipboard::{clipboard_match_score, clipboard_result_item, load_clipboard_history};
+use keys::{
+    load_shortcuts, niri_overlay_result_item, niri_running, shortcut_match_score,
+    shortcut_result_item,
+};
 pub use windows::{focus_window, focused_window_target};
 use windows::{
     load_windows, window_match_score, window_prediction_key, window_result_item,
@@ -37,6 +45,9 @@ const MAX_BOOKMARKS: usize = 8;
 const MAX_RECENTS: usize = 8;
 const MAX_CONTROLS: usize = 12;
 const MAX_PACKAGES: usize = 8;
+const MAX_SHORTCUTS: usize = 24;
+const MAX_CLIPBOARD: usize = 24;
+const CLIPBOARD_HISTORY_SCAN: usize = 500;
 const MAX_RESULTS: usize = 24;
 const MIN_FILE_QUERY_CHARS: usize = 2;
 const MIN_PACKAGE_QUERY_CHARS: usize = 2;
@@ -493,6 +504,14 @@ impl Sources {
             results.extend(self.search_ssh(&query, now));
         }
 
+        if query.mode == SearchMode::Keys {
+            results.extend(self.shortcut_results(&query.text));
+        }
+
+        if query.mode == SearchMode::Clipboard {
+            results.extend(self.clipboard_results(&query.text));
+        }
+
         if query.mode.includes(SearchMode::Pass) {
             results.extend(self.search_pass(&query, now));
         }
@@ -891,6 +910,16 @@ impl Sources {
             }
         }
 
+        if mode == SearchMode::Keys {
+            results.extend(self.shortcut_results(""));
+            return results;
+        }
+
+        if mode == SearchMode::Clipboard {
+            results.extend(self.clipboard_results(""));
+            return results;
+        }
+
         if mode == SearchMode::Windows {
             if !config.sources.windows {
                 results.push(instruction_result(
@@ -1128,6 +1157,75 @@ impl Sources {
             .collect::<Vec<_>>();
 
         sort_results(&mut items, MAX_APPS);
+        items
+    }
+
+    /// Hyprland's described bindings in config order, filtered by `text`.
+    fn shortcut_results(&self, text: &str) -> Vec<ResultItem> {
+        if niri_running() {
+            return vec![niri_overlay_result_item(900)];
+        }
+        let shortcuts = load_shortcuts();
+        if shortcuts.is_empty() {
+            return vec![instruction_result(
+                "No described shortcuts found",
+                "Give Hyprland bindings a description to list them here",
+                "Shortcuts",
+                "input-keyboard-symbolic",
+                65,
+            )];
+        }
+        let total = shortcuts.len() as i32;
+        let mut items = shortcuts
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, shortcut)| {
+                let score = shortcut_match_score(&shortcut, text)?;
+                // Earlier bindings win ties so an unfiltered list keeps config order.
+                Some(shortcut_result_item(
+                    shortcut,
+                    900 + score * total + (total - index as i32),
+                ))
+            })
+            .collect::<Vec<_>>();
+        sort_results(&mut items, MAX_SHORTCUTS);
+        items
+    }
+
+    /// Newest-first clipboard history from cliphist, filtered by `text`.
+    fn clipboard_results(&self, text: &str) -> Vec<ResultItem> {
+        if !command_exists("cliphist") {
+            return vec![instruction_result(
+                "cliphist is not installed",
+                "Install cliphist and enable cliphist.service to keep clipboard history",
+                "Clipboard",
+                "edit-paste-symbolic",
+                65,
+            )];
+        }
+        let entries = load_clipboard_history(CLIPBOARD_HISTORY_SCAN);
+        if entries.is_empty() {
+            return vec![instruction_result(
+                "Clipboard history is empty",
+                "Copied text and images appear here once cliphist.service is running",
+                "Clipboard",
+                "edit-paste-symbolic",
+                65,
+            )];
+        }
+        let total = entries.len() as i32;
+        let mut items = entries
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                let score = clipboard_match_score(&entry, text)?;
+                Some(clipboard_result_item(
+                    entry,
+                    900 + score * total + (total - index as i32),
+                ))
+            })
+            .collect::<Vec<_>>();
+        sort_results(&mut items, MAX_CLIPBOARD);
         items
     }
 
@@ -5731,6 +5829,10 @@ pub(crate) fn no_results_item(query: &QueryInput) -> ResultItem {
             }
             SearchMode::Packages => {
                 "Try a different package name or install pacman/paru first.".to_string()
+            }
+            SearchMode::Keys => "Try an action such as screenshot, float, or layout.".to_string(),
+            SearchMode::Clipboard => {
+                "Try a different fragment of something you copied.".to_string()
             }
         },
     };

@@ -1737,6 +1737,10 @@ fn execute_action(
         Action::CopyText { text } => {
             copy_to_clipboard(&text);
         }
+        Action::RestoreClipboard { entry } => {
+            sources::restore_clipboard_entry(&entry)
+                .context("failed to restore clipboard entry")?;
+        }
         Action::ReturnToSearch => {
             anyhow::bail!("return-to-search must be handled by the launcher UI");
         }
@@ -2008,6 +2012,8 @@ fn placeholder_for_mode(mode: SearchMode) -> &'static str {
         SearchMode::Calc => "Evaluate a libqalculate expression",
         SearchMode::Controls => "Search desktop controls",
         SearchMode::Packages => "Search pacman/paru packages",
+        SearchMode::Keys => "Search keyboard shortcuts",
+        SearchMode::Clipboard => "Search clipboard history",
     }
 }
 

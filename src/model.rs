@@ -15,6 +15,8 @@ pub enum SearchMode {
     Calc,
     Controls,
     Packages,
+    Keys,
+    Clipboard,
 }
 
 impl SearchMode {
@@ -156,6 +158,9 @@ pub enum Action {
     CopyText {
         text: String,
     },
+    RestoreClipboard {
+        entry: String,
+    },
     ReturnToSearch,
     #[default]
     None,
@@ -260,7 +265,7 @@ fn parse_prefixed_query(
     }
 
     let lowered = raw.to_ascii_lowercase();
-    const PREFIXES: [(&str, SearchMode, SourceFilter, Option<PackageManager>); 29] = [
+    const PREFIXES: [(&str, SearchMode, SourceFilter, Option<PackageManager>); 33] = [
         ("all:", SearchMode::All, SourceFilter::All, None),
         ("apps:", SearchMode::Apps, SourceFilter::All, None),
         ("app:", SearchMode::Apps, SourceFilter::All, None),
@@ -284,6 +289,10 @@ fn parse_prefixed_query(
         ("packages:", SearchMode::Packages, SourceFilter::All, None),
         ("package:", SearchMode::Packages, SourceFilter::All, None),
         ("pkg:", SearchMode::Packages, SourceFilter::All, None),
+        ("keys:", SearchMode::Keys, SourceFilter::All, None),
+        ("shortcuts:", SearchMode::Keys, SourceFilter::All, None),
+        ("clip:", SearchMode::Clipboard, SourceFilter::All, None),
+        ("clipboard:", SearchMode::Clipboard, SourceFilter::All, None),
         (
             "pacman:",
             SearchMode::Packages,
@@ -517,6 +526,20 @@ mod tests {
         let short = QueryInput::parse("pkg: obsidian", SearchMode::All);
         assert_eq!(short.mode, SearchMode::Packages);
         assert_eq!(short.text, "obsidian");
+    }
+
+    #[test]
+    fn textual_prefixes_can_select_shortcut_and_clipboard_modes() {
+        let keys = QueryInput::parse("keys: float", SearchMode::All);
+        assert_eq!(keys.mode, SearchMode::Keys);
+        assert_eq!(keys.text, "float");
+
+        let shortcuts = QueryInput::parse("shortcuts: layout", SearchMode::Apps);
+        assert_eq!(shortcuts.mode, SearchMode::Keys);
+
+        let clip = QueryInput::parse("clip: token", SearchMode::All);
+        assert_eq!(clip.mode, SearchMode::Clipboard);
+        assert_eq!(clip.text, "token");
     }
 
     #[test]

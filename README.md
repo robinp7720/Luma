@@ -24,6 +24,8 @@ Luma also includes a built-in settings panel for interactive configuration. Type
 - Web search through the default browser
 - `libqalculate` integration through `qalc`
 - Desktop controls for media, audio, screen brightness, Bluetooth, network settings, power profiles, screenshots, color picking, and Vigil notification history
+- Keyboard shortcut search over Hyprland's described bindings (Niri opens its own overlay)
+- Clipboard history search through `cliphist`, restoring text or images with `wl-copy`
 
 ## Requirements
 
@@ -51,6 +53,7 @@ Optional integrations:
 - `powerprofilesctl` for power profile status and switching
 - `grim`, `slurp`, and `wl-copy` for screenshots
 - `hyprpicker` for screen color picking
+- `cliphist`, fed by `wl-paste --watch cliphist store`, for clipboard history
 - Vigil for notification controls and local notification-history search
 
 ## Configuration
@@ -104,6 +107,8 @@ Luma --mode pass
 Luma --mode email
 Luma --mode ssh
 Luma --mode controls
+Luma --mode keys
+Luma --mode clipboard
 ```
 
 Vigil can open Luma on the originating monitor with live quick-settings context:
@@ -144,6 +149,8 @@ pass: github/work
 mail: invoices
 ssh: web-server
 control: volume
+keys: screenshot
+clip: token
 ```
 
 In the default mode, bare text is searched across the unified result set. Password queries also support adding new entries:
