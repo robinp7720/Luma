@@ -17,6 +17,8 @@ pub enum SearchMode {
     Packages,
     Keys,
     Clipboard,
+    Timers,
+    Notifications,
 }
 
 impl SearchMode {
@@ -161,9 +163,49 @@ pub enum Action {
     RestoreClipboard {
         entry: String,
     },
+    /// A command for Vigil's control socket; the launcher closes once it lands.
+    Vigil {
+        command: VigilCommand,
+    },
+    TimerActions {
+        id: String,
+        label: String,
+        paused: bool,
+    },
+    NotificationActions {
+        id: u32,
+        summary: String,
+        actionable: bool,
+        /// `(key, label)` pairs other than the default action.
+        actions: Vec<(String, String)>,
+    },
     ReturnToSearch,
     #[default]
     None,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum VigilCommand {
+    StartTimer {
+        label: String,
+        duration_seconds: u64,
+    },
+    PauseTimer {
+        id: String,
+    },
+    ResumeTimer {
+        id: String,
+    },
+    CancelTimer {
+        id: String,
+    },
+    InvokeNotification {
+        id: u32,
+        action_key: String,
+    },
+    DismissNotification {
+        id: u32,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -265,7 +307,7 @@ fn parse_prefixed_query(
     }
 
     let lowered = raw.to_ascii_lowercase();
-    const PREFIXES: [(&str, SearchMode, SourceFilter, Option<PackageManager>); 33] = [
+    const PREFIXES: [(&str, SearchMode, SourceFilter, Option<PackageManager>); 38] = [
         ("all:", SearchMode::All, SourceFilter::All, None),
         ("apps:", SearchMode::Apps, SourceFilter::All, None),
         ("app:", SearchMode::Apps, SourceFilter::All, None),
@@ -293,6 +335,21 @@ fn parse_prefixed_query(
         ("shortcuts:", SearchMode::Keys, SourceFilter::All, None),
         ("clip:", SearchMode::Clipboard, SourceFilter::All, None),
         ("clipboard:", SearchMode::Clipboard, SourceFilter::All, None),
+        ("timers:", SearchMode::Timers, SourceFilter::All, None),
+        ("timer:", SearchMode::Timers, SourceFilter::All, None),
+        (
+            "notifications:",
+            SearchMode::Notifications,
+            SourceFilter::All,
+            None,
+        ),
+        (
+            "notification:",
+            SearchMode::Notifications,
+            SourceFilter::All,
+            None,
+        ),
+        ("notif:", SearchMode::Notifications, SourceFilter::All, None),
         (
             "pacman:",
             SearchMode::Packages,
@@ -540,6 +597,17 @@ mod tests {
         let clip = QueryInput::parse("clip: token", SearchMode::All);
         assert_eq!(clip.mode, SearchMode::Clipboard);
         assert_eq!(clip.text, "token");
+    }
+
+    #[test]
+    fn textual_prefixes_can_select_timer_and_notification_modes() {
+        let timer = QueryInput::parse("timer: 25m focus", SearchMode::All);
+        assert_eq!(timer.mode, SearchMode::Timers);
+        assert_eq!(timer.text, "25m focus");
+
+        let notif = QueryInput::parse("notif: build", SearchMode::Apps);
+        assert_eq!(notif.mode, SearchMode::Notifications);
+        assert_eq!(notif.text, "build");
     }
 
     #[test]

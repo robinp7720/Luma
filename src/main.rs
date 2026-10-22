@@ -18,7 +18,7 @@ use crate::actions::{
 use crate::cockpit::{CockpitClient, ContextSnapshot, DesktopContext, merge_context_results};
 use crate::config::{ConfigStore, EmailBackendPreference, EmailConfig};
 use crate::model::{Action, PackageManager, QueryInput, ResultItem, SearchMode};
-use crate::model::{PasswordOperation, WindowFocusTarget};
+use crate::model::{PasswordOperation, VigilCommand, WindowFocusTarget};
 use crate::password::{
     Credential, format_generated_pass_entry, generate_password, parse_credential,
     pass_insert_command, run_program_input,
@@ -1387,6 +1387,27 @@ fn activate_item(
         return;
     }
 
+    if let Action::TimerActions { id, label, paused } = &item.action {
+        search.show_submenu_results(sources::timer_action_results(id, label, *paused));
+        return;
+    }
+
+    if let Action::NotificationActions {
+        id,
+        summary,
+        actionable,
+        actions,
+    } = &item.action
+    {
+        search.show_submenu_results(sources::notification_action_results(
+            *id,
+            summary,
+            *actionable,
+            actions,
+        ));
+        return;
+    }
+
     if let Action::PasswordActions { entry } = &item.action {
         match load_pass_credential(entry) {
             Ok(credential) => {
@@ -1752,6 +1773,10 @@ fn execute_action(
             sources::restore_clipboard_entry(&entry)
                 .context("failed to restore clipboard entry")?;
         }
+        Action::Vigil { command } => execute_vigil_command(command)?,
+        Action::TimerActions { .. } | Action::NotificationActions { .. } => {
+            anyhow::bail!("Vigil action menus must open from the launcher UI");
+        }
         Action::ReturnToSearch => {
             anyhow::bail!("return-to-search must be handled by the launcher UI");
         }
@@ -1760,6 +1785,24 @@ fn execute_action(
 
     window.close();
     Ok(())
+}
+
+fn execute_vigil_command(command: VigilCommand) -> Result<()> {
+    let client = CockpitClient::from_env()?;
+    match command {
+        VigilCommand::StartTimer {
+            label,
+            duration_seconds,
+        } => client.start_timer(label, duration_seconds),
+        VigilCommand::PauseTimer { id } => client.pause_timer(id),
+        VigilCommand::ResumeTimer { id } => client.resume_timer(id),
+        VigilCommand::CancelTimer { id } => client.cancel_timer(id),
+        VigilCommand::InvokeNotification { id, action_key } => {
+            client.invoke_notification(id, action_key)
+        }
+        VigilCommand::DismissNotification { id } => client.dismiss_notification(id),
+    }
+    .context("Vigil did not accept the request")
 }
 
 fn spawn_optional_command(program: &str, args: &[&str]) -> Result<Option<std::process::Child>> {
@@ -2025,6 +2068,8 @@ fn placeholder_for_mode(mode: SearchMode) -> &'static str {
         SearchMode::Packages => "Search pacman/paru packages",
         SearchMode::Keys => "Search keyboard shortcuts",
         SearchMode::Clipboard => "Search clipboard history",
+        SearchMode::Timers => "Start a timer like 25m focus, or manage running timers",
+        SearchMode::Notifications => "Search notifications",
     }
 }
 

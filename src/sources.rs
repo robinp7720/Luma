@@ -20,6 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod clipboard;
 mod keys;
+mod vigil;
 mod windows;
 pub use clipboard::restore_clipboard_entry;
 use clipboard::{clipboard_match_score, clipboard_result_item, load_clipboard_history};
@@ -27,6 +28,8 @@ use keys::{
     load_shortcuts, niri_overlay_result_item, niri_running, shortcut_match_score,
     shortcut_result_item,
 };
+pub(crate) use vigil::{notification_action_results, timer_action_results};
+use vigil::{notification_results, timer_results};
 pub use windows::{focus_window, focused_window_target};
 use windows::{
     load_windows, window_match_score, window_prediction_key, window_result_item,
@@ -155,6 +158,9 @@ pub(crate) struct NetworkStatus {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NotificationEntry {
+    pub id: u32,
+    pub actionable: bool,
+    pub actions: Vec<(String, String)>,
     pub app_name: String,
     pub summary: String,
     pub body: String,
@@ -510,6 +516,10 @@ impl Sources {
 
         if query.mode == SearchMode::Clipboard {
             results.extend(self.clipboard_results(&query.text));
+        }
+
+        if let Some(vigil_results) = vigil_mode_results(query.mode, &query.text, now) {
+            results.extend(vigil_results);
         }
 
         if query.mode.includes(SearchMode::Pass) {
@@ -917,6 +927,11 @@ impl Sources {
 
         if mode == SearchMode::Clipboard {
             results.extend(self.clipboard_results(""));
+            return results;
+        }
+
+        if let Some(vigil_results) = vigil_mode_results(mode, "", now) {
+            results.extend(vigil_results);
             return results;
         }
 
@@ -3117,8 +3132,11 @@ fn control_results_from_snapshot(
                 source: "Controls",
                 icon_name: "preferences-system-notifications-symbolic".to_string(),
                 score: score + 540,
-                action: Action::DesktopControl {
-                    operation: DesktopControlOperation::NotificationHistoryPop,
+                action: Action::NotificationActions {
+                    id: notification.id,
+                    summary: notification.summary.clone(),
+                    actionable: notification.actionable,
+                    actions: notification.actions.clone(),
                 },
                 ..Default::default()
             });
@@ -4648,6 +4666,9 @@ aur/veloren 0.18.0-1 [+21 ~0.00]
     fn control_search_matches_notification_history_without_prediction_key() {
         let snapshot = ControlSnapshot {
             notifications: vec![NotificationEntry {
+                id: 3,
+                actionable: false,
+                actions: Vec::new(),
                 app_name: "kitty".to_string(),
                 summary: "Build failed".to_string(),
                 body: "cargo test failed".to_string(),
@@ -4667,9 +4688,7 @@ aur/veloren 0.18.0-1 [+21 ~0.00]
         assert!(notification.prediction_key.is_none());
         assert!(matches!(
             notification.action,
-            Action::DesktopControl {
-                operation: DesktopControlOperation::NotificationHistoryPop
-            }
+            Action::NotificationActions { id: 3, .. }
         ));
     }
 
@@ -5675,6 +5694,14 @@ fn load_control_snapshot(integrated_controls: bool) -> ControlSnapshot {
                         )
                         .to_ascii_lowercase();
                         NotificationEntry {
+                            id: notification.id,
+                            actionable: notification.actionable,
+                            actions: notification
+                                .actions
+                                .into_iter()
+                                .filter(|action| action.key != "default")
+                                .map(|action| (action.key, action.label))
+                                .collect(),
                             app_name: notification.app_name,
                             summary: notification.summary,
                             body: notification.body,
@@ -5786,6 +5813,23 @@ fn command_exists(binary: &str) -> bool {
         .any(|dir| dir.join(binary).exists())
 }
 
+/// Timer and notification modes read Vigil's live state for each search.
+fn vigil_mode_results(mode: SearchMode, text: &str, now: u64) -> Option<Vec<ResultItem>> {
+    let client = || CockpitClient::from_env().ok();
+    match mode {
+        SearchMode::Timers => Some(timer_results(
+            text,
+            client().and_then(|client| client.timers().ok()),
+            i64::try_from(now).unwrap_or(i64::MAX),
+        )),
+        SearchMode::Notifications => Some(notification_results(
+            text,
+            client().and_then(|client| client.notifications().ok()),
+        )),
+        _ => None,
+    }
+}
+
 fn current_unix_time() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -5833,6 +5877,10 @@ pub(crate) fn no_results_item(query: &QueryInput) -> ResultItem {
             SearchMode::Keys => "Try an action such as screenshot, float, or layout.".to_string(),
             SearchMode::Clipboard => {
                 "Try a different fragment of something you copied.".to_string()
+            }
+            SearchMode::Timers => "Type a duration such as 25m focus.".to_string(),
+            SearchMode::Notifications => {
+                "Try an app name or words from a notification.".to_string()
             }
         },
     };

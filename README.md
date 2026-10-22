@@ -109,7 +109,15 @@ Luma --mode ssh
 Luma --mode controls
 Luma --mode keys
 Luma --mode clipboard
+Luma --mode timers
+Luma --mode notifications
 ```
+
+Timer mode (`timer:`) starts Vigil timers from a duration and label such as `25m focus`,
+`1h30m` or `90s tea`, and lists running ones with pause, resume and cancel. Notification mode
+(`notif:`) searches Vigil's history newest first; Enter offers the notification's actions and
+Dismiss. Both modes talk to Vigil's control socket, so the bar island and the lock screen show
+the same timers.
 
 Vigil can open Luma on the originating monitor with live quick-settings context:
 

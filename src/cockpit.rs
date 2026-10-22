@@ -150,6 +150,35 @@ pub struct NotificationEntry {
     pub body: String,
     #[serde(default = "default_duplicate_count")]
     pub duplicate_count: u16,
+    #[serde(default)]
+    pub actions: Vec<NotificationAction>,
+    /// Whether the sender still listens for actions.
+    #[serde(default)]
+    pub actionable: bool,
+    #[serde(default)]
+    pub received_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationAction {
+    pub key: String,
+    pub label: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimerState {
+    pub id: String,
+    pub label: String,
+    pub remaining_seconds: u64,
+    /// `None` while paused.
+    pub target_epoch: Option<i64>,
+    pub completed: bool,
+}
+
+impl TimerState {
+    pub fn is_paused(&self) -> bool {
+        !self.completed && self.target_epoch.is_none()
+    }
 }
 
 fn default_duplicate_count() -> u16 {
@@ -159,6 +188,20 @@ fn default_duplicate_count() -> u16 {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ControlRequest {
+    TimerStart {
+        label: String,
+        duration_seconds: u64,
+    },
+    TimerPause {
+        id: String,
+    },
+    TimerResume {
+        id: String,
+    },
+    TimerCancel {
+        id: String,
+    },
+    TimerList,
     ContextGet {
         context: Option<DesktopContext>,
     },
@@ -171,6 +214,13 @@ enum ControlRequest {
     },
     ControlCenterClose,
     NotificationsGet,
+    NotificationInvoke {
+        id: u32,
+        action_key: String,
+    },
+    NotificationDismiss {
+        id: u32,
+    },
     NotificationsClear,
     NotificationsSetDnd {
         enabled: bool,
@@ -181,6 +231,9 @@ enum ControlRequest {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ControlResponse {
     Accepted,
+    Timers {
+        timers: Vec<TimerState>,
+    },
     Contexts {
         contexts: Vec<ContextSnapshot>,
     },
@@ -271,6 +324,67 @@ impl CockpitClient {
             &ControlRequest::NotificationsSetDnd { enabled },
             ACTION_TIMEOUT,
         )? {
+            ControlResponse::Accepted => Ok(()),
+            ControlResponse::Error { message } => bail!(message),
+            _ => bail!("Vigil returned an unexpected notification response"),
+        }
+    }
+
+    pub fn timers(&self) -> Result<Vec<TimerState>> {
+        self.timer_request(&ControlRequest::TimerList, SNAPSHOT_TIMEOUT)
+    }
+
+    pub fn start_timer(&self, label: String, duration_seconds: u64) -> Result<()> {
+        self.timer_request(
+            &ControlRequest::TimerStart {
+                label,
+                duration_seconds,
+            },
+            ACTION_TIMEOUT,
+        )
+        .map(|_| ())
+    }
+
+    pub fn pause_timer(&self, id: String) -> Result<()> {
+        self.timer_request(&ControlRequest::TimerPause { id }, ACTION_TIMEOUT)
+            .map(|_| ())
+    }
+
+    pub fn resume_timer(&self, id: String) -> Result<()> {
+        self.timer_request(&ControlRequest::TimerResume { id }, ACTION_TIMEOUT)
+            .map(|_| ())
+    }
+
+    pub fn cancel_timer(&self, id: String) -> Result<()> {
+        self.timer_request(&ControlRequest::TimerCancel { id }, ACTION_TIMEOUT)
+            .map(|_| ())
+    }
+
+    fn timer_request(
+        &self,
+        request: &ControlRequest,
+        timeout: Duration,
+    ) -> Result<Vec<TimerState>> {
+        match self.send(request, timeout)? {
+            ControlResponse::Timers { timers } => Ok(timers),
+            ControlResponse::Error { message } => bail!(message),
+            _ => bail!("Vigil returned an unexpected timer response"),
+        }
+    }
+
+    pub fn invoke_notification(&self, id: u32, action_key: String) -> Result<()> {
+        match self.send(
+            &ControlRequest::NotificationInvoke { id, action_key },
+            ACTION_TIMEOUT,
+        )? {
+            ControlResponse::Accepted => Ok(()),
+            ControlResponse::Error { message } => bail!(message),
+            _ => bail!("Vigil returned an unexpected notification response"),
+        }
+    }
+
+    pub fn dismiss_notification(&self, id: u32) -> Result<()> {
+        match self.send(&ControlRequest::NotificationDismiss { id }, ACTION_TIMEOUT)? {
             ControlResponse::Accepted => Ok(()),
             ControlResponse::Error { message } => bail!(message),
             _ => bail!("Vigil returned an unexpected notification response"),

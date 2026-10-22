@@ -547,6 +547,8 @@ fn build_mode_dropdown(current: SearchMode) -> DropDown {
         "Packages",
         "Shortcuts",
         "Clipboard",
+        "Timers",
+        "Notifications",
     ]);
     dropdown.set_selected(search_mode_index(current) as u32);
     dropdown
@@ -579,7 +581,9 @@ fn mode_from_dropdown(index: u32) -> SearchMode {
         10 => SearchMode::Controls,
         11 => SearchMode::Packages,
         12 => SearchMode::Keys,
-        _ => SearchMode::Clipboard,
+        13 => SearchMode::Clipboard,
+        14 => SearchMode::Timers,
+        _ => SearchMode::Notifications,
     }
 }
 
@@ -599,6 +603,8 @@ fn search_mode_index(mode: SearchMode) -> usize {
         SearchMode::Packages => 11,
         SearchMode::Keys => 12,
         SearchMode::Clipboard => 13,
+        SearchMode::Timers => 14,
+        SearchMode::Notifications => 15,
     }
 }
 
