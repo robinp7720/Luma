@@ -95,12 +95,7 @@ struct Cli {
     placement: LauncherPlacement,
 }
 
-#[cfg(test)]
-const LAUNCHER_SURFACE_MARGIN_PX: i32 = 56;
-const LAUNCHER_SHADOW_Y_OFFSET_PX: i32 = 18;
-const LAUNCHER_SHADOW_BLUR_PX: i32 = 44;
-const LAUNCHER_SURFACE_MARGIN_BOTTOM_PX: i32 =
-    LAUNCHER_SHADOW_BLUR_PX + LAUNCHER_SHADOW_Y_OFFSET_PX + 8;
+const LAUNCHER_SURFACE_MARGIN_BOTTOM_PX: i32 = 8;
 #[derive(Clone, Debug)]
 struct AddPasswordDraft {
     entry: String,
@@ -2174,8 +2169,7 @@ fn is_executable(path: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        EmailOpenStrategy, LAUNCHER_SHADOW_BLUR_PX, LAUNCHER_SHADOW_Y_OFFSET_PX,
-        LAUNCHER_SURFACE_MARGIN_BOTTOM_PX, LAUNCHER_SURFACE_MARGIN_PX, ResultsPresentation,
+        EmailOpenStrategy, LAUNCHER_SURFACE_MARGIN_BOTTOM_PX, ResultsPresentation,
         SearchAsyncState, SearchUpdatePhase, accepts_automatic_refresh, accepts_search_update,
         action_failure_result, default_ssh_terminal, email_open_strategy,
         inspected_password_results, layer_shell_enabled, package_install_command,
@@ -2418,13 +2412,11 @@ mod tests {
     }
 
     #[test]
-    fn launcher_surface_reserves_room_for_the_css_shadow() {
-        assert!(LAUNCHER_SURFACE_MARGIN_PX >= LAUNCHER_SHADOW_BLUR_PX);
-        assert!(
-            LAUNCHER_SURFACE_MARGIN_BOTTOM_PX
-                >= LAUNCHER_SHADOW_BLUR_PX + LAUNCHER_SHADOW_Y_OFFSET_PX
-        );
-        assert!(fallback_css().contains("box-shadow: 0 18px 44px rgba(0, 0, 0, 0.32);"));
+    fn launcher_surface_uses_shadowless_opaque_fallback() {
+        assert_eq!(LAUNCHER_SURFACE_MARGIN_BOTTOM_PX, 8);
+        assert!(fallback_css().contains("background-color: @luma_surface;"));
+        assert!(!fallback_css().contains("linear-gradient("));
+        assert!(!fallback_css().contains("border-radius: 18px"));
     }
 
     #[test]
