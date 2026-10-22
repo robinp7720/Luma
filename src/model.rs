@@ -78,7 +78,9 @@ pub enum DesktopControlOperation {
     BluetoothTogglePower,
     NetworkSettings,
     PowerProfileCycle,
-    PowerProfileSet { profile: String },
+    PowerProfileSet {
+        profile: String,
+    },
     ScreenshotArea,
     ScreenshotScreen,
     ColorPicker,
@@ -86,6 +88,15 @@ pub enum DesktopControlOperation {
     NotificationCloseAll,
     NotificationPauseToggle,
     TvModeStart,
+    /// One of the Hyprland monitor layouts in `hypr/scripts/modes/`.
+    DisplayMode {
+        mode: String,
+    },
+    NightLight {
+        enabled: bool,
+    },
+    /// Reapply wallpapers and regenerate the matugen theme from them.
+    ReapplyTheme,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

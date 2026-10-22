@@ -1,3 +1,4 @@
+use crate::actions::desktop_controls::DISPLAY_MODES;
 use crate::cockpit::CockpitClient;
 use crate::config::{ConfigStore, EmailBackendPreference, FileSearchBackendChoice, LauncherConfig};
 use crate::mail_eds_protocol::{MailEdsMessageSummary, MailEdsSearchResponse};
@@ -128,6 +129,9 @@ pub(crate) struct ControlSnapshot {
     pub has_grim: bool,
     pub has_slurp: bool,
     pub has_hyprpicker: bool,
+    pub is_hyprland: bool,
+    pub has_hyprsunset: bool,
+    pub has_wallpaper_watcher: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3048,6 +3052,87 @@ fn control_results_from_snapshot(
         );
     }
 
+    if snapshot.is_hyprland {
+        for (index, (mode, title, subtitle)) in DISPLAY_MODES.iter().enumerate() {
+            push_control_action(
+                &mut items,
+                query,
+                ControlActionSpec {
+                    title,
+                    subtitle,
+                    icon_name: "video-display-symbolic",
+                    search_terms: &["display", "monitor", "layout", "mode", "game", "screen"],
+                    operation: DesktopControlOperation::DisplayMode {
+                        mode: (*mode).to_string(),
+                    },
+                    prediction_key: Some(format!("control:display-mode-{mode}")),
+                    base_score: 600 - index as i32 * 10,
+                },
+                now,
+                &prediction_boost,
+            );
+        }
+    }
+
+    if snapshot.has_hyprsunset {
+        for (enabled, title, subtitle) in [
+            (
+                true,
+                "Night light on",
+                "Warm the screen to reduce blue light",
+            ),
+            (false, "Night light off", "Show true screen colors"),
+        ] {
+            push_control_action(
+                &mut items,
+                query,
+                ControlActionSpec {
+                    title,
+                    subtitle,
+                    icon_name: "night-light-symbolic",
+                    search_terms: &[
+                        "night light",
+                        "night",
+                        "blue light",
+                        "filter",
+                        "warm",
+                        "hyprsunset",
+                    ],
+                    operation: DesktopControlOperation::NightLight { enabled },
+                    prediction_key: Some(format!("control:night-light-{enabled}")),
+                    base_score: 610,
+                },
+                now,
+                &prediction_boost,
+            );
+        }
+    }
+
+    if snapshot.has_wallpaper_watcher {
+        push_control_action(
+            &mut items,
+            query,
+            ControlActionSpec {
+                title: "Regenerate theme",
+                subtitle: "Reapply wallpapers and rebuild colors from them",
+                icon_name: "preferences-desktop-wallpaper-symbolic",
+                search_terms: &[
+                    "theme",
+                    "colors",
+                    "wallpaper",
+                    "matugen",
+                    "regenerate",
+                    "reload",
+                ],
+                operation: DesktopControlOperation::ReapplyTheme,
+                prediction_key: Some("control:reapply-theme".to_string()),
+                base_score: 590,
+            },
+            now,
+            &prediction_boost,
+        );
+    }
+
     if snapshot.has_hyprpicker {
         push_control_action(
             &mut items,
@@ -4620,6 +4705,9 @@ aur/veloren 0.18.0-1 [+21 ~0.00]
             has_grim: true,
             has_slurp: true,
             has_hyprpicker: true,
+            is_hyprland: true,
+            has_hyprsunset: true,
+            has_wallpaper_watcher: true,
         };
         let query = QueryInput::parse("control:", SearchMode::All);
         let items = control_results_from_snapshot(&snapshot, &query, 1_700_000_000, |_| 0);
@@ -5629,6 +5717,9 @@ fn load_control_snapshot(integrated_controls: bool) -> ControlSnapshot {
     let has_grim = command_exists("grim");
     let has_slurp = command_exists("slurp");
     let has_hyprpicker = command_exists("hyprpicker");
+    let is_hyprland = env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some();
+    let has_hyprsunset = is_hyprland && command_exists("hyprsunset");
+    let has_wallpaper_watcher = command_exists("awww") && command_exists("matugen");
 
     ControlSnapshot {
         media: if has_playerctl {
@@ -5720,6 +5811,9 @@ fn load_control_snapshot(integrated_controls: bool) -> ControlSnapshot {
         has_grim,
         has_slurp,
         has_hyprpicker,
+        is_hyprland,
+        has_hyprsunset,
+        has_wallpaper_watcher,
     }
 }
 

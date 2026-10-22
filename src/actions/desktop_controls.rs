@@ -117,6 +117,54 @@ pub(crate) fn desktop_control_commands(
         DesktopControlOperation::TvModeStart => {
             vec![DesktopControlCommand::new("tv-mode", &["start"])]
         }
+        DesktopControlOperation::DisplayMode { mode } => {
+            vec![dotfiles_command(
+                &format!("hypr/scripts/modes/{mode}.sh"),
+                &[],
+            )]
+        }
+        DesktopControlOperation::NightLight { enabled } => vec![dotfiles_command(
+            "scripts/night_light.sh",
+            &[if *enabled { "on" } else { "off" }],
+        )],
+        DesktopControlOperation::ReapplyTheme => vec![reapply_theme_command()],
+    }
+}
+
+/// The wallpaper watcher holds a lock while it runs, so restarting it is what
+/// re-reads `awww_wallpapers.conf` and regenerates the matugen theme.
+pub(crate) fn reapply_theme_command() -> DesktopControlCommand {
+    DesktopControlCommand::new(
+        "systemctl",
+        &["--user", "restart", "awww-wallpaper.service"],
+    )
+}
+
+pub(crate) const DISPLAY_MODES: [(&str, &str, &str); 3] = [
+    (
+        "default",
+        "Display mode: Default",
+        "Restore the everyday monitor layout",
+    ),
+    (
+        "game",
+        "Display mode: Game",
+        "Use the gaming monitor layout",
+    ),
+    (
+        "game_external",
+        "Display mode: Game external",
+        "Use the external-display gaming layout",
+    ),
+];
+
+fn dotfiles_command(relative: &str, args: &[&str]) -> DesktopControlCommand {
+    let path = std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".dotfiles").join(relative))
+        .unwrap_or_else(|| PathBuf::from(relative));
+    DesktopControlCommand {
+        program: path.to_string_lossy().into_owned(),
+        args: args.iter().map(|arg| (*arg).to_string()).collect(),
     }
 }
 
@@ -170,6 +218,36 @@ mod tests {
         assert_eq!(area[0].args, vec!["area"]);
         let screen = desktop_control_commands(&DesktopControlOperation::ScreenshotScreen);
         assert_eq!(screen[0].args, vec!["output"]);
+    }
+
+    #[test]
+    fn desktop_modes_run_the_shared_scripts_and_services() {
+        let game = desktop_control_commands(&DesktopControlOperation::DisplayMode {
+            mode: "game".to_string(),
+        });
+        assert!(
+            game[0]
+                .program
+                .ends_with(".dotfiles/hypr/scripts/modes/game.sh")
+        );
+
+        let night =
+            desktop_control_commands(&DesktopControlOperation::NightLight { enabled: true });
+        assert!(
+            night[0]
+                .program
+                .ends_with(".dotfiles/scripts/night_light.sh")
+        );
+        assert_eq!(night[0].args, vec!["on"]);
+        let day = desktop_control_commands(&DesktopControlOperation::NightLight { enabled: false });
+        assert_eq!(day[0].args, vec!["off"]);
+
+        let theme = desktop_control_commands(&DesktopControlOperation::ReapplyTheme);
+        assert_eq!(theme[0].program, "systemctl");
+        assert_eq!(
+            theme[0].args,
+            vec!["--user", "restart", "awww-wallpaper.service"]
+        );
     }
 
     #[test]
