@@ -2,10 +2,16 @@ use std::cell::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use gtk4::gdk;
+use gtk4::prelude::*;
+use gtk4::{gdk, gio, glib};
+
+/// matugen rewrites the theme in several steps; wait for it to settle.
+const THEME_RELOAD_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
 
 thread_local! {
     static THEME_PROVIDER: RefCell<Option<gtk4::CssProvider>> = const { RefCell::new(None) };
+    static THEME_MONITOR: RefCell<Option<gio::FileMonitor>> = const { RefCell::new(None) };
+    static THEME_RELOAD: RefCell<Option<glib::SourceId>> = const { RefCell::new(None) };
 }
 
 pub(crate) fn theme_css_path(
@@ -32,6 +38,9 @@ pub(crate) fn apply_css() {
     let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
     let home = dirs::home_dir();
     let path = theme_css_path(xdg_config_home.as_deref(), home.as_deref());
+    if let Some(path) = path.as_deref() {
+        watch_theme(path);
+    }
     let theme_override = load_theme_override(path.as_deref());
     let css = format!(
         "{}\n{}",
@@ -50,6 +59,47 @@ pub(crate) fn apply_css() {
             provider
         });
         provider.load_from_string(&css);
+    });
+}
+
+/// Keeps a warm launcher in step with wallpaper-driven theme changes.
+fn watch_theme(path: &Path) {
+    THEME_MONITOR.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_some() {
+            return;
+        }
+        let Ok(monitor) = gio::File::for_path(path).monitor_file(
+            gio::FileMonitorFlags::WATCH_MOVES,
+            None::<&gio::Cancellable>,
+        ) else {
+            return;
+        };
+        monitor.connect_changed(|_, _, _, event| {
+            if matches!(
+                event,
+                gio::FileMonitorEvent::ChangesDoneHint
+                    | gio::FileMonitorEvent::Created
+                    | gio::FileMonitorEvent::MovedIn
+                    | gio::FileMonitorEvent::Renamed
+            ) {
+                schedule_theme_reload();
+            }
+        });
+        *slot = Some(monitor);
+    });
+}
+
+fn schedule_theme_reload() {
+    THEME_RELOAD.with(|slot| {
+        if let Some(pending) = slot.borrow_mut().take() {
+            pending.remove();
+        }
+        let source = glib::timeout_add_local_once(THEME_RELOAD_DEBOUNCE, || {
+            THEME_RELOAD.with(|slot| slot.borrow_mut().take());
+            apply_css();
+        });
+        *slot.borrow_mut() = Some(source);
     });
 }
 

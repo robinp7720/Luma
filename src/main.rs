@@ -64,7 +64,10 @@ static APP_CONFIG: OnceLock<Arc<ConfigStore>> = OnceLock::new();
 enum LauncherPlacement {
     #[default]
     Center,
+    /// Under the bar's status area on the right, next to quick settings.
     Bar,
+    /// Under the bar's search button on the left.
+    BarStart,
 }
 
 #[derive(Parser, Clone, Debug)]
@@ -950,12 +953,20 @@ fn build_ui(
         window.set_keyboard_mode(gtk4_layer_shell::KeyboardMode::Exclusive);
         window.set_namespace(Some("Luma"));
         window.set_anchor(gtk4_layer_shell::Edge::Top, true);
-        if placement == LauncherPlacement::Bar {
-            window.set_anchor(gtk4_layer_shell::Edge::Right, true);
-            window.set_margin(gtk4_layer_shell::Edge::Top, 5);
-            window.set_margin(gtk4_layer_shell::Edge::Right, 5);
-        } else {
-            window.set_margin(gtk4_layer_shell::Edge::Top, config.ui.top_margin_px);
+        match placement {
+            LauncherPlacement::Bar => {
+                window.set_anchor(gtk4_layer_shell::Edge::Right, true);
+                window.set_margin(gtk4_layer_shell::Edge::Top, 5);
+                window.set_margin(gtk4_layer_shell::Edge::Right, 5);
+            }
+            LauncherPlacement::BarStart => {
+                window.set_anchor(gtk4_layer_shell::Edge::Left, true);
+                window.set_margin(gtk4_layer_shell::Edge::Top, 5);
+                window.set_margin(gtk4_layer_shell::Edge::Left, 5);
+            }
+            LauncherPlacement::Center => {
+                window.set_margin(gtk4_layer_shell::Edge::Top, config.ui.top_margin_px);
+            }
         }
         if let Some(monitor) = output.as_deref().and_then(monitor_for_connector) {
             window.set_monitor(Some(&monitor));
@@ -967,7 +978,7 @@ fn build_ui(
 
     let outer = GtkBox::new(Orientation::Vertical, 10);
     outer.add_css_class("launcher-shell");
-    if placement == LauncherPlacement::Bar {
+    if placement != LauncherPlacement::Center {
         outer.add_css_class("launcher-from-bar");
     }
     outer.set_halign(Align::Center);

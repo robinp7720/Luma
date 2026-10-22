@@ -117,6 +117,13 @@ Vigil can open Luma on the originating monitor with live quick-settings context:
 Luma --context audio --output DP-5 --placement bar
 ```
 
+`--placement bar` anchors Luma under the bar's status area on the right; `--placement bar-start`
+anchors it under the bar's search button on the left. Both keep the bar-attached styling.
+
+Luma watches `~/.config/Luma/theme.css` and restyles itself when matugen rewrites it, so a
+warm launcher follows wallpaper changes. Screenshot controls run
+`~/.dotfiles/scripts/screenshot.sh`, and volume and brightness controls show Vigil's OSD.
+
 Context launches initially show the bar's live state and typed actions. Typing broadens back to
 the normal unified search while keeping related controls ranked prominently. When Vigil is
 not running, Luma keeps its local desktop controls and marks bar-only features unavailable.
