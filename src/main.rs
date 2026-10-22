@@ -1774,6 +1774,7 @@ fn execute_action(
                 .context("failed to restore clipboard entry")?;
         }
         Action::Vigil { command } => execute_vigil_command(command)?,
+        Action::SetWallpaper { path } => sources::apply_wallpaper(&path)?,
         Action::TimerActions { .. } | Action::NotificationActions { .. } => {
             anyhow::bail!("Vigil action menus must open from the launcher UI");
         }
@@ -2070,6 +2071,7 @@ fn placeholder_for_mode(mode: SearchMode) -> &'static str {
         SearchMode::Clipboard => "Search clipboard history",
         SearchMode::Timers => "Start a timer like 25m focus, or manage running timers",
         SearchMode::Notifications => "Search notifications",
+        SearchMode::Wallpapers => "Pick a wallpaper for this display",
     }
 }
 

@@ -80,3 +80,7 @@ button.launcher-mode:focus-visible,
     transform: none;
   }
 }
+
+.launcher-icon-wrap.has-thumbnail {
+  padding: 0;
+}

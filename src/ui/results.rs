@@ -4,7 +4,8 @@ use crate::sources::{no_results_item, sort_and_limit_results};
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Box as GtkBox, Image, Label, ListBox, ListBoxRow, Orientation, ScrolledWindow, Spinner,
+    Align, Box as GtkBox, ContentFit, Image, Label, ListBox, ListBoxRow, Orientation, Overflow,
+    Picture, ScrolledWindow, Spinner,
 };
 use std::cell::Cell;
 use std::time::{Duration, Instant};
@@ -77,6 +78,7 @@ pub(crate) fn same_presentation(previous: &[ResultItem], next: &[ResultItem]) ->
         && previous.iter().zip(next).all(|(left, right)| {
             same_result(left, right)
                 && left.icon_name == right.icon_name
+                && left.thumbnail == right.thumbnail
                 && left.accessory == right.accessory
                 && left.badges == right.badges
                 && matches!(left.action, Action::None) == matches!(right.action, Action::None)
@@ -199,7 +201,18 @@ fn build_row(item: &ResultItem) -> ListBoxRow {
     icon_wrap.add_css_class("launcher-icon-wrap");
     icon_wrap.set_valign(Align::Center);
     icon_wrap.set_halign(Align::Center);
-    icon_wrap.append(&icon);
+    match item.thumbnail.as_deref() {
+        Some(path) => {
+            let picture = Picture::for_filename(path);
+            picture.set_content_fit(ContentFit::Cover);
+            picture.set_size_request(56, 34);
+            picture.add_css_class("launcher-thumbnail");
+            icon_wrap.add_css_class("has-thumbnail");
+            icon_wrap.set_overflow(Overflow::Hidden);
+            icon_wrap.append(&picture);
+        }
+        None => icon_wrap.append(&icon),
+    }
 
     let text_col = GtkBox::new(Orientation::Vertical, 2);
     text_col.set_hexpand(true);

@@ -22,6 +22,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 mod clipboard;
 mod keys;
 mod vigil;
+mod wallpapers;
 mod windows;
 pub use clipboard::restore_clipboard_entry;
 use clipboard::{clipboard_match_score, clipboard_result_item, load_clipboard_history};
@@ -31,6 +32,8 @@ use keys::{
 };
 pub(crate) use vigil::{notification_action_results, timer_action_results};
 use vigil::{notification_results, timer_results};
+pub use wallpapers::apply_wallpaper;
+use wallpapers::wallpaper_results;
 pub use windows::{focus_window, focused_window_target};
 use windows::{
     load_windows, window_match_score, window_prediction_key, window_result_item,
@@ -526,6 +529,10 @@ impl Sources {
             results.extend(vigil_results);
         }
 
+        if query.mode == SearchMode::Wallpapers {
+            results.extend(wallpaper_results(&query.text));
+        }
+
         if query.mode.includes(SearchMode::Pass) {
             results.extend(self.search_pass(&query, now));
         }
@@ -936,6 +943,11 @@ impl Sources {
 
         if let Some(vigil_results) = vigil_mode_results(mode, "", now) {
             results.extend(vigil_results);
+            return results;
+        }
+
+        if mode == SearchMode::Wallpapers {
+            results.extend(wallpaper_results(""));
             return results;
         }
 
@@ -2229,6 +2241,7 @@ fn email_result_items(entry: &EmailEntry, score: i32, include_secondary: bool) -
         },
         accessory: (!date_label.is_empty()).then(|| date_label.to_string()),
         badges: email_badges(entry),
+        thumbnail: None,
     }];
 
     if include_secondary {
@@ -5976,6 +5989,7 @@ pub(crate) fn no_results_item(query: &QueryInput) -> ResultItem {
             SearchMode::Notifications => {
                 "Try an app name or words from a notification.".to_string()
             }
+            SearchMode::Wallpapers => "Try part of a wallpaper file name.".to_string(),
         },
     };
 

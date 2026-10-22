@@ -549,6 +549,7 @@ fn build_mode_dropdown(current: SearchMode) -> DropDown {
         "Clipboard",
         "Timers",
         "Notifications",
+        "Wallpapers",
     ]);
     dropdown.set_selected(search_mode_index(current) as u32);
     dropdown
@@ -583,7 +584,8 @@ fn mode_from_dropdown(index: u32) -> SearchMode {
         12 => SearchMode::Keys,
         13 => SearchMode::Clipboard,
         14 => SearchMode::Timers,
-        _ => SearchMode::Notifications,
+        15 => SearchMode::Notifications,
+        _ => SearchMode::Wallpapers,
     }
 }
 
@@ -605,6 +607,7 @@ fn search_mode_index(mode: SearchMode) -> usize {
         SearchMode::Clipboard => 13,
         SearchMode::Timers => 14,
         SearchMode::Notifications => 15,
+        SearchMode::Wallpapers => 16,
     }
 }
 

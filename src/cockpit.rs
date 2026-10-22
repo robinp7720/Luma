@@ -454,6 +454,7 @@ pub fn context_results(
                 prediction_key: None,
                 accessory: spec.accessory.clone(),
                 badges: Vec::new(),
+                thumbnail: None,
             });
         }
         if selected.is_none()
@@ -493,6 +494,7 @@ pub fn context_results(
                 prediction_key: None,
                 accessory: None,
                 badges: Vec::new(),
+                thumbnail: None,
             });
         }
     }

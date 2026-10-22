@@ -111,7 +111,13 @@ Luma --mode keys
 Luma --mode clipboard
 Luma --mode timers
 Luma --mode notifications
+Luma --mode wallpapers
 ```
+
+Wallpaper mode (`wall:`) shows thumbnails of `~/.dotfiles/wallpapers`. Picking one writes it
+for the focused output and as the theme source in `scripts/awww_wallpapers.conf`, then restarts
+`awww-wallpaper.service`, which reapplies wallpapers and regenerates the matugen theme that
+Luma, Vigil, Hyprland and kitty follow live. Thumbnails are cached in `~/.cache/Luma/wallpapers`.
 
 Timer mode (`timer:`) starts Vigil timers from a duration and label such as `25m focus`,
 `1h30m` or `90s tea`, and lists running ones with pause, resume and cancel. Notification mode
@@ -127,6 +133,9 @@ Luma --context audio --output DP-5 --placement bar
 
 `--placement bar` anchors Luma under the bar's status area on the right; `--placement bar-start`
 anchors it under the bar's search button on the left. Both keep the bar-attached styling.
+
+Controls mode also switches Hyprland monitor layouts (`hypr/scripts/modes/`), the night light
+(`scripts/night_light.sh`) and regenerates the wallpaper theme.
 
 Luma watches `~/.config/Luma/theme.css` and restyles itself when matugen rewrites it, so a
 warm launcher follows wallpaper changes. Screenshot controls run

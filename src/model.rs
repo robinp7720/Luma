@@ -19,6 +19,7 @@ pub enum SearchMode {
     Clipboard,
     Timers,
     Notifications,
+    Wallpapers,
 }
 
 impl SearchMode {
@@ -40,6 +41,8 @@ pub struct ResultItem {
     pub accessory: Option<String>,
     /// Small status markers rendered next to the accessory on the title row.
     pub badges: Vec<EntryBadge>,
+    /// A small image file shown instead of the icon, such as a wallpaper.
+    pub thumbnail: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -177,6 +180,10 @@ pub enum Action {
     /// A command for Vigil's control socket; the launcher closes once it lands.
     Vigil {
         command: VigilCommand,
+    },
+    /// A `~/`-relative wallpaper for the focused output and the theme.
+    SetWallpaper {
+        path: String,
     },
     TimerActions {
         id: String,
@@ -318,7 +325,7 @@ fn parse_prefixed_query(
     }
 
     let lowered = raw.to_ascii_lowercase();
-    const PREFIXES: [(&str, SearchMode, SourceFilter, Option<PackageManager>); 38] = [
+    const PREFIXES: [(&str, SearchMode, SourceFilter, Option<PackageManager>); 41] = [
         ("all:", SearchMode::All, SourceFilter::All, None),
         ("apps:", SearchMode::Apps, SourceFilter::All, None),
         ("app:", SearchMode::Apps, SourceFilter::All, None),
@@ -361,6 +368,19 @@ fn parse_prefixed_query(
             None,
         ),
         ("notif:", SearchMode::Notifications, SourceFilter::All, None),
+        (
+            "wallpapers:",
+            SearchMode::Wallpapers,
+            SourceFilter::All,
+            None,
+        ),
+        (
+            "wallpaper:",
+            SearchMode::Wallpapers,
+            SourceFilter::All,
+            None,
+        ),
+        ("wall:", SearchMode::Wallpapers, SourceFilter::All, None),
         (
             "pacman:",
             SearchMode::Packages,
@@ -615,6 +635,10 @@ mod tests {
         let timer = QueryInput::parse("timer: 25m focus", SearchMode::All);
         assert_eq!(timer.mode, SearchMode::Timers);
         assert_eq!(timer.text, "25m focus");
+
+        let wall = QueryInput::parse("wall: forest", SearchMode::All);
+        assert_eq!(wall.mode, SearchMode::Wallpapers);
+        assert_eq!(wall.text, "forest");
 
         let notif = QueryInput::parse("notif: build", SearchMode::Apps);
         assert_eq!(notif.mode, SearchMode::Notifications);
