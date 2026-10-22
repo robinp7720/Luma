@@ -2242,6 +2242,7 @@ fn email_result_items(entry: &EmailEntry, score: i32, include_secondary: bool) -
         accessory: (!date_label.is_empty()).then(|| date_label.to_string()),
         badges: email_badges(entry),
         thumbnail: None,
+        level: None,
     }];
 
     if include_secondary {

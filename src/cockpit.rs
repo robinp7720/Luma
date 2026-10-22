@@ -114,6 +114,25 @@ pub enum ContextAction {
     },
 }
 
+impl ContextAction {
+    /// The same level action aimed at `percent`; `None` for non-level actions.
+    pub fn with_level(&self, percent: u8) -> Option<ContextAction> {
+        let percent = percent.min(100);
+        match self {
+            ContextAction::SetVolumePercent { .. } => {
+                Some(ContextAction::SetVolumePercent { percent })
+            }
+            ContextAction::SetBrightnessPercent { device, .. } => {
+                Some(ContextAction::SetBrightnessPercent {
+                    device: device.clone(),
+                    percent,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextActionSpec {
     pub title: String,
@@ -121,6 +140,9 @@ pub struct ContextActionSpec {
     pub icon_name: String,
     pub accessory: Option<String>,
     pub action: ContextAction,
+    /// A 0–100 level shown as a slider; the action is resent with each value.
+    #[serde(default)]
+    pub level: Option<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -443,10 +465,11 @@ pub fn context_results(
                 subtitle: spec.subtitle.clone(),
                 source: "Vigil",
                 icon_name: spec.icon_name.clone(),
-                score: if selected.is_some() {
-                    contextual_action_score(&spec.action)
-                } else {
-                    1_050
+                score: match (selected, spec.level) {
+                    // A context's level slider leads, ahead of its toggles.
+                    (Some(_), Some(_)) => 1_720,
+                    (Some(_), None) => contextual_action_score(&spec.action),
+                    (None, _) => 1_050,
                 },
                 action: Action::CockpitControl {
                     action: spec.action.clone(),
@@ -455,6 +478,7 @@ pub fn context_results(
                 accessory: spec.accessory.clone(),
                 badges: Vec::new(),
                 thumbnail: None,
+                level: spec.level,
             });
         }
         if selected.is_none()
@@ -495,6 +519,7 @@ pub fn context_results(
                 accessory: None,
                 badges: Vec::new(),
                 thumbnail: None,
+                level: None,
             });
         }
     }
@@ -625,6 +650,7 @@ mod tests {
                 icon_name: "audio-volume-muted-symbolic".to_string(),
                 accessory: None,
                 action: ContextAction::ToggleMute,
+                level: None,
             }],
         };
         let results = super::context_results(&[context.clone()], Some(DesktopContext::Audio), "");
@@ -655,6 +681,56 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn level_actions_retarget_and_lead_their_context() {
+        assert_eq!(
+            ContextAction::SetVolumePercent { percent: 10 }.with_level(130),
+            Some(ContextAction::SetVolumePercent { percent: 100 })
+        );
+        assert_eq!(
+            ContextAction::SetBrightnessPercent {
+                device: "intel_backlight".to_string(),
+                percent: 10,
+            }
+            .with_level(42),
+            Some(ContextAction::SetBrightnessPercent {
+                device: "intel_backlight".to_string(),
+                percent: 42,
+            })
+        );
+        assert_eq!(ContextAction::ToggleMute.with_level(42), None);
+
+        let spec = |title: &str, action, level| ContextActionSpec {
+            title: title.to_string(),
+            subtitle: String::new(),
+            icon_name: String::new(),
+            accessory: None,
+            action,
+            level,
+        };
+        let context = ContextSnapshot {
+            context: DesktopContext::Audio,
+            title: "Audio".to_string(),
+            icon_name: String::new(),
+            summary: String::new(),
+            detail: String::new(),
+            health: ContextHealth::Healthy,
+            actions: vec![
+                spec("Mute audio", ContextAction::ToggleMute, None),
+                spec(
+                    "Volume",
+                    ContextAction::SetVolumePercent { percent: 42 },
+                    Some(42),
+                ),
+            ],
+        };
+        let mut results = super::context_results(&[context], Some(DesktopContext::Audio), "");
+        results.sort_by(|left, right| right.score.cmp(&left.score));
+        assert_eq!(results[0].title, "Volume");
+        assert_eq!(results[0].level, Some(42));
+        assert_eq!(results[1].level, None);
     }
 
     #[test]

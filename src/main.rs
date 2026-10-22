@@ -31,8 +31,8 @@ use crate::sources::{
 use crate::ui::navigation::SearchNavigation;
 use crate::ui::results::{
     background_processing_after_update, finalize_loaded_results, install_frame_profiler,
-    move_selection, pending_deferred_results, profiling_enabled, rebuild_results,
-    same_presentation, set_background_processing,
+    move_selection, nudge_level, pending_deferred_results, profiling_enabled, rebuild_results,
+    same_presentation, set_background_processing, set_level_sink, sync_levels,
 };
 use crate::ui::theme::apply_css;
 use anyhow::{Context, Result};
@@ -549,6 +549,31 @@ impl SearchController {
         });
     }
 
+    /// Level sliders stream values to Vigil through one worker, which drops
+    /// stale values so a fast drag never queues up behind the socket.
+    fn install_level_sink(&self) {
+        let (level_tx, level_rx) = std::sync::mpsc::channel::<crate::cockpit::ContextAction>();
+        let error_tx = self.cockpit_command_tx.clone();
+        thread::spawn(move || {
+            while let Ok(mut action) = level_rx.recv() {
+                while let Ok(newer) = level_rx.try_recv() {
+                    action = newer;
+                }
+                let result = CockpitClient::from_env().and_then(|client| client.execute(action));
+                if let Err(error) = result {
+                    let _ = error_tx.send(CockpitCommandResult::Action(Err(error.to_string())));
+                }
+            }
+        });
+        set_level_sink(Rc::new(move |action, percent| {
+            if let Action::CockpitControl { action } = action
+                && let Some(action) = action.with_level(percent)
+            {
+                let _ = level_tx.send(action);
+            }
+        }));
+    }
+
     fn open_cockpit_context(&self, context: DesktopContext) {
         let tx = self.cockpit_command_tx.clone();
         let output = self.cockpit_output.clone();
@@ -562,6 +587,7 @@ impl SearchController {
 
     fn render_results(&self, results: Vec<ResultItem>) {
         if same_presentation(&self.current_results.borrow(), &results) {
+            sync_levels(&results);
             self.current_results.replace(results);
             return;
         }
@@ -659,6 +685,10 @@ impl ContextHeader {
 }
 
 fn activate_cockpit_item(search: &SearchController, item: &ResultItem) -> bool {
+    // Sliders apply as they move; Enter has nothing left to do.
+    if item.level.is_some() {
+        return true;
+    }
     match &item.action {
         Action::CockpitControl { action } => {
             search.execute_cockpit_action(action.clone());
@@ -1068,6 +1098,7 @@ fn build_ui(
         context_header,
     );
     search.start_update_poller();
+    search.install_level_sink();
     let mut window_signals = Vec::new();
     if let Some(context) = context {
         let search_for_open = search.clone();
@@ -1231,6 +1262,33 @@ fn build_ui(
         });
         window_signals.push((keys.clone().upcast::<glib::Object>(), handler));
         window.add_controller(keys);
+    }
+
+    {
+        // With nothing typed, arrows adjust a selected level slider. Capture
+        // runs before the entry, which would otherwise take them for its cursor.
+        let entry = entry.clone();
+        let list = list.clone();
+        let levels = EventControllerKey::new();
+        levels.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let handler = levels.connect_key_pressed(move |_, key, _, _| {
+            let delta = match key {
+                gdk::Key::Left => -5.0,
+                gdk::Key::Right => 5.0,
+                _ => return glib::Propagation::Proceed,
+            };
+            if entry.text().is_empty()
+                && list
+                    .selected_row()
+                    .is_some_and(|row| nudge_level(row.index().max(0) as usize, delta))
+            {
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        window_signals.push((levels.clone().upcast::<glib::Object>(), handler));
+        window.add_controller(levels);
     }
 
     {
@@ -2214,6 +2272,23 @@ mod tests {
             action: Action::None,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn level_rows_keep_their_slider_while_the_live_value_moves() {
+        let mut row = selection_test_item("Vigil", "Volume");
+        row.level = Some(40);
+        row.accessory = Some("40%".to_string());
+        let mut moved = row.clone();
+        moved.level = Some(55);
+        moved.accessory = Some("55%".to_string());
+        assert!(super::same_presentation(
+            std::slice::from_ref(&row),
+            std::slice::from_ref(&moved)
+        ));
+        let mut plain = moved.clone();
+        plain.level = None;
+        assert!(!super::same_presentation(&[row], &[plain]));
     }
 
     #[test]

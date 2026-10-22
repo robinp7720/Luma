@@ -5,10 +5,129 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
     Align, Box as GtkBox, ContentFit, Image, Label, ListBox, ListBoxRow, Orientation, Overflow,
-    Picture, ScrolledWindow, Spinner,
+    Picture, Scale, ScrolledWindow, Spinner,
 };
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
+
+/// Sends slider changes at most this often while dragging.
+const LEVEL_SEND_INTERVAL: Duration = Duration::from_millis(60);
+/// Live updates leave a slider alone this long after the user moved it.
+const LEVEL_USER_HOLD: Duration = Duration::from_millis(1_500);
+
+type LevelSink = Rc<dyn Fn(&Action, u8)>;
+
+struct LevelRow {
+    index: usize,
+    scale: Scale,
+    value: Label,
+    syncing: Rc<Cell<bool>>,
+    touched: Rc<Cell<Option<Instant>>>,
+}
+
+thread_local! {
+    static LEVEL_SINK: RefCell<Option<LevelSink>> = const { RefCell::new(None) };
+    static LEVEL_ROWS: RefCell<Vec<LevelRow>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Where level sliders send `(row action, percent)`; the launcher window
+/// installs one that forwards to Vigil.
+pub(crate) fn set_level_sink(sink: LevelSink) {
+    LEVEL_SINK.with(|slot| slot.replace(Some(sink)));
+}
+
+/// Moves sliders to fresh live values without rebuilding their rows, unless
+/// the user is adjusting them.
+pub(crate) fn sync_levels(results: &[ResultItem]) {
+    LEVEL_ROWS.with(|rows| {
+        for row in rows.borrow().iter() {
+            let Some(level) = results.get(row.index).and_then(|item| item.level) else {
+                continue;
+            };
+            if row
+                .touched
+                .get()
+                .is_some_and(|touched| touched.elapsed() < LEVEL_USER_HOLD)
+                || row.scale.value().round() as u8 == level
+            {
+                continue;
+            }
+            row.syncing.set(true);
+            row.scale.set_value(f64::from(level));
+            row.value.set_label(&format!("{level}%"));
+            row.syncing.set(false);
+        }
+    });
+}
+
+/// Nudges the slider in row `index` by `delta` percent; false if it has none.
+pub(crate) fn nudge_level(index: usize, delta: f64) -> bool {
+    LEVEL_ROWS.with(|rows| {
+        let rows = rows.borrow();
+        let Some(row) = rows.iter().find(|row| row.index == index) else {
+            return false;
+        };
+        row.scale
+            .set_value((row.scale.value() + delta).clamp(0.0, 100.0));
+        true
+    })
+}
+
+fn level_slider(item: &ResultItem, index: usize, level: u8) -> (GtkBox, Label) {
+    let scale = Scale::with_range(Orientation::Horizontal, 0.0, 100.0, 1.0);
+    scale.set_value(f64::from(level));
+    scale.set_draw_value(false);
+    scale.set_hexpand(true);
+    scale.set_increments(1.0, 5.0);
+    scale.set_can_focus(false);
+    scale.add_css_class("launcher-level-scale");
+    let value = Label::new(Some(&format!("{level}%")));
+    value.add_css_class("launcher-level-value");
+
+    let syncing = Rc::new(Cell::new(false));
+    let touched = Rc::new(Cell::new(None));
+    let pending = Rc::new(Cell::new(false));
+    {
+        let action = item.action.clone();
+        let (syncing, touched, value) = (syncing.clone(), touched.clone(), value.clone());
+        scale.connect_value_changed(move |scale| {
+            let percent = scale.value().round() as u8;
+            value.set_label(&format!("{percent}%"));
+            if syncing.get() {
+                return;
+            }
+            touched.set(Some(Instant::now()));
+            if pending.replace(true) {
+                return;
+            }
+            let (action, pending, scale) = (action.clone(), pending.clone(), scale.clone());
+            glib::timeout_add_local_once(LEVEL_SEND_INTERVAL, move || {
+                pending.set(false);
+                let percent = scale.value().round() as u8;
+                LEVEL_SINK.with(|sink| {
+                    if let Some(sink) = sink.borrow().as_ref() {
+                        sink(&action, percent);
+                    }
+                });
+            });
+        });
+    }
+
+    let slider = GtkBox::new(Orientation::Horizontal, 8);
+    slider.add_css_class("launcher-level");
+    slider.append(&scale);
+    LEVEL_ROWS.with(|rows| {
+        rows.borrow_mut().push(LevelRow {
+            index,
+            scale,
+            value: value.clone(),
+            syncing,
+            touched,
+        })
+    });
+    (slider, value)
+}
 
 thread_local! {
     static ICON_LOOKUP_TIME: Cell<Duration> = const { Cell::new(Duration::ZERO) };
@@ -79,7 +198,10 @@ pub(crate) fn same_presentation(previous: &[ResultItem], next: &[ResultItem]) ->
             same_result(left, right)
                 && left.icon_name == right.icon_name
                 && left.thumbnail == right.thumbnail
-                && left.accessory == right.accessory
+                && left.level.is_some() == right.level.is_some()
+                // A level's accessory is its live value, which `sync_levels`
+                // updates in place so a drag is never interrupted.
+                && (left.level.is_some() || left.accessory == right.accessory)
                 && left.badges == right.badges
                 && matches!(left.action, Action::None) == matches!(right.action, Action::None)
         })
@@ -110,11 +232,12 @@ pub(crate) fn rebuild_results(
     while let Some(child) = list.first_child() {
         list.remove(&child);
     }
+    LEVEL_ROWS.with(|rows| rows.borrow_mut().clear());
     let teardown = teardown_start.elapsed();
 
     let build_start = Instant::now();
-    for item in results {
-        let row = build_row(item);
+    for (index, item) in results.iter().enumerate() {
+        let row = build_row(item, index);
         list.append(&row);
     }
     let build = build_start.elapsed();
@@ -171,7 +294,7 @@ pub(crate) fn set_background_processing(spinner: &Spinner, active: bool) {
     }
 }
 
-fn build_row(item: &ResultItem) -> ListBoxRow {
+fn build_row(item: &ResultItem, index: usize) -> ListBoxRow {
     let row = ListBoxRow::new();
     row.add_css_class("launcher-row");
     if matches!(&item.action, Action::None) {
@@ -233,7 +356,12 @@ fn build_row(item: &ResultItem) -> ListBoxRow {
         title_row.append(&badge_widget(*badge));
     }
 
-    if let Some(accessory) = item
+    let level = item
+        .level
+        .map(|level| level_slider(item, index, level.min(100)));
+    if let Some((_, value)) = &level {
+        title_row.append(value);
+    } else if let Some(accessory) = item
         .accessory
         .as_deref()
         .map(str::trim)
@@ -250,7 +378,10 @@ fn build_row(item: &ResultItem) -> ListBoxRow {
     text_col.append(&title_row);
 
     let subtitle = item.subtitle.trim();
-    if !subtitle.is_empty() {
+    if let Some((slider, _)) = level {
+        row.add_css_class("launcher-row-level");
+        text_col.append(&slider);
+    } else if !subtitle.is_empty() {
         let subtitle_label = Label::new(Some(subtitle));
         subtitle_label.add_css_class("launcher-subtitle");
         subtitle_label.set_halign(Align::Start);

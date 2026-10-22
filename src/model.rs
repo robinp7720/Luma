@@ -43,6 +43,8 @@ pub struct ResultItem {
     pub badges: Vec<EntryBadge>,
     /// A small image file shown instead of the icon, such as a wallpaper.
     pub thumbnail: Option<String>,
+    /// A 0–100 level drawn as a slider; see `ui::results::set_level_sink`.
+    pub level: Option<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
