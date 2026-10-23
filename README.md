@@ -255,3 +255,12 @@ Control rows expose local desktop actions for:
 - SSH sessions launch through `~/.dotfiles/scripts/launch_kitty.sh -e ssh <host>`.
 
 Hyprland window activation and logout use the native Lua IPC API (Hyprland 0.55+ with a Lua configuration).
+
+### User styling
+
+Luma keeps its rounded fallback styling when no user CSS is present. CSS loads
+in this order: built-in theme, built-in interaction rules,
+`${XDG_CONFIG_HOME:-~/.config}/Luma/theme.css`, then `Luma/style.css` in the same
+directory. Use `theme.css` for generated palettes and `style.css` for persistent
+user overrides, including geometry and motion. Both files are watched for live
+reload; deleting an override returns to the preceding style layer.

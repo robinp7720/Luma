@@ -1,4 +1,11 @@
 /* Geometry and interaction stay local; Matugen supplies the color roles. */
+@keyframes luma-filter-select {
+  0% { transform: scale(0.94); }
+  55% { transform: scale(1.07); }
+  78% { transform: scale(0.99); }
+  100% { transform: none; }
+}
+
 .launcher-navigation {
   padding: 0 2px;
 }
@@ -6,10 +13,9 @@
 button.launcher-mode {
   min-height: 28px;
   padding: 2px 12px;
-  border-radius: 0;
-  border: 0;
-  border-bottom: 2px solid transparent;
-  background: @luma_surface;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  background: alpha(@luma_surface_highest, 0.52);
   color: @luma_on_surface_variant;
   box-shadow: none;
   font-size: 13px;
@@ -17,14 +23,16 @@ button.launcher-mode {
 }
 
 button.launcher-mode:hover {
-  background: @luma_surface_high;
+  background: alpha(@luma_primary_container, 0.52);
   color: @luma_on_surface;
+  transform: translate(0, -1px);
 }
 
 button.launcher-mode:checked {
-  background: @luma_surface;
-  border-bottom-color: @luma_primary;
-  color: @luma_primary;
+  background: alpha(@luma_primary_container, 0.82);
+  border-color: alpha(@luma_primary, 0.48);
+  color: @luma_on_primary_container;
+  animation: luma-filter-select 240ms ease-out;
 }
 
 .launcher-hints {
@@ -38,17 +46,31 @@ button.launcher-mode:checked {
 button.launcher-mode,
 .launcher-context-open {
   transition: background-color 160ms ease-out, border-color 160ms ease-out,
-              color 160ms ease-out;
+              color 160ms ease-out, box-shadow 160ms ease-out,
+              transform 180ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .launcher-row:hover {
-  background-color: @luma_surface_high;
+  background-color: alpha(@luma_surface_highest, 0.6);
+}
+
+.launcher-row:hover .launcher-icon-wrap {
+  transform: translate(0, -2px) rotate(-4deg) scale(1.04);
+}
+
+.launcher-icon-wrap {
+  transition: transform 180ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+button.launcher-mode:active,
+.launcher-context-open:active {
+  transform: scale(0.93);
 }
 
 button.launcher-mode:focus-visible,
 .launcher-context-open:focus-visible {
-  outline: 2px solid @luma_primary;
-  outline-offset: -2px;
+  outline: 2px solid alpha(@luma_primary, 0.72);
+  outline-offset: 2px;
 }
 
 @media (prefers-reduced-motion: reduce) {
