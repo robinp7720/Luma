@@ -4,6 +4,7 @@
 
 use super::instruction_result;
 use crate::model::{Action, ResultItem, score_text};
+use crate::search_runtime::SearchCommand;
 use anyhow::{Context, Result, anyhow};
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
@@ -205,7 +206,7 @@ fn focused_output() -> Option<String> {
     if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() {
         let output = Command::new("hyprctl")
             .args(["monitors", "-j"])
-            .output()
+            .search_output()
             .ok()?;
         let monitors: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
         return monitors
@@ -218,7 +219,7 @@ fn focused_output() -> Option<String> {
     if std::env::var_os("NIRI_SOCKET").is_some() {
         let output = Command::new("niri")
             .args(["msg", "--json", "focused-output"])
-            .output()
+            .search_output()
             .ok()?;
         let focused: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
         return focused["name"].as_str().map(str::to_string);

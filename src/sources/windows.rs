@@ -1,4 +1,5 @@
 use crate::model::{Action, ResultItem, WindowFocusTarget, score_text};
+use crate::search_runtime::SearchCommand;
 use std::process::Command;
 
 #[derive(Clone, Debug)]
@@ -21,7 +22,10 @@ pub(crate) fn window_match_score(window: &WindowEntry, query: &str) -> Option<i3
 
 pub(crate) fn load_windows() -> Vec<WindowEntry> {
     if super::command_exists("hyprctl") {
-        if let Ok(output) = Command::new("hyprctl").args(["clients", "-j"]).output() {
+        if let Ok(output) = Command::new("hyprctl")
+            .args(["clients", "-j"])
+            .search_output()
+        {
             if output.status.success() {
                 if let Ok(windows) =
                     parse_hypr_windows_json(&String::from_utf8_lossy(&output.stdout))
@@ -37,7 +41,7 @@ pub(crate) fn load_windows() -> Vec<WindowEntry> {
     if super::command_exists("niri") {
         if let Ok(output) = Command::new("niri")
             .args(["msg", "windows", "--json"])
-            .output()
+            .search_output()
         {
             if output.status.success() {
                 if let Ok(windows) =
@@ -61,7 +65,7 @@ pub fn focused_window_target() -> Option<WindowFocusTarget> {
     if super::command_exists("hyprctl") {
         if let Ok(output) = Command::new("hyprctl")
             .args(["activewindow", "-j"])
-            .output()
+            .search_output()
         {
             if output.status.success() {
                 let parsed = serde_json::from_slice::<serde_json::Value>(&output.stdout).ok()?;
@@ -78,7 +82,7 @@ pub fn focused_window_target() -> Option<WindowFocusTarget> {
     if super::command_exists("niri") {
         if let Ok(output) = Command::new("niri")
             .args(["msg", "focused-window", "--json"])
-            .output()
+            .search_output()
         {
             if output.status.success() {
                 let parsed = serde_json::from_slice::<serde_json::Value>(&output.stdout).ok()?;
@@ -90,7 +94,10 @@ pub fn focused_window_target() -> Option<WindowFocusTarget> {
     }
 
     if super::command_exists("xdotool") {
-        if let Ok(output) = Command::new("xdotool").arg("getactivewindow").output() {
+        if let Ok(output) = Command::new("xdotool")
+            .arg("getactivewindow")
+            .search_output()
+        {
             if output.status.success() {
                 let window_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 if !window_id.is_empty() {

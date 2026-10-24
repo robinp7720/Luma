@@ -334,6 +334,37 @@ pub fn open_config_panel(parent: &ApplicationWindow) -> Result<()> {
         &file_query_spin,
     );
 
+    let history_card = build_card(
+        "History",
+        "Choose which sources learn from use. Turning one off also hides its existing learned suggestions. Ctrl+Delete forgets the selected result.",
+    );
+    let history_switches: Vec<_> = crate::prediction::HISTORY_SOURCES
+        .iter()
+        .map(|source| {
+            let toggle = build_switch(
+                !config
+                    .history_disabled_sources
+                    .iter()
+                    .any(|excluded| excluded == source),
+            );
+            append_setting_row(&history_card, source, "Learn from activations", &toggle);
+            (source.to_string(), toggle)
+        })
+        .collect();
+    let clear_history = Button::with_label("Clear learned history");
+    let history_status = Label::new(None);
+    history_status.set_wrap(true);
+    let history_status_for_clear = history_status.clone();
+    clear_history.connect_clicked(move |_| {
+        let result = crate::prediction::shared().lock().unwrap().clear();
+        history_status_for_clear.set_label(match result {
+            Ok(()) => "Learned history cleared.",
+            Err(_) => "Could not clear history. Check state-directory permissions and retry.",
+        });
+    });
+    history_card.append(&clear_history);
+    history_card.append(&history_status);
+    content.append(&history_card);
     content.append(&defaults_card);
     content.append(&sources_card);
     content.append(&email_card);
@@ -370,6 +401,11 @@ pub fn open_config_panel(parent: &ApplicationWindow) -> Result<()> {
         save_button.connect_clicked(move |_| {
             let mut next = config_store.current();
             next.default_mode = mode_from_dropdown(default_mode.selected());
+            next.history_disabled_sources = history_switches
+                .iter()
+                .filter(|(_, toggle)| !toggle.is_active())
+                .map(|(source, _)| source.clone())
+                .collect();
             next.ui.width_px = width_spin.value().round() as i32;
             next.ui.height_px = height_spin.value().round() as i32;
             next.ui.top_margin_px = top_margin_spin.value().round() as i32;

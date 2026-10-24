@@ -1,4 +1,5 @@
 use crate::model::{Action, ResultItem, score_text};
+use crate::search_runtime::SearchCommand;
 use serde::Deserialize;
 use std::process::Command;
 
@@ -30,7 +31,7 @@ pub(crate) fn load_shortcuts() -> Vec<ShortcutEntry> {
     }
     Command::new("hyprctl")
         .args(["binds", "-j"])
-        .output()
+        .search_output()
         .ok()
         .filter(|output| output.status.success())
         .and_then(|output| parse_hypr_binds_json(&String::from_utf8_lossy(&output.stdout)).ok())

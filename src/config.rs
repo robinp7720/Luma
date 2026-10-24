@@ -153,6 +153,8 @@ impl Default for IntegrationConfig {
 pub struct LauncherConfig {
     pub default_mode: SearchMode,
     pub sources: SourceToggles,
+    /// Source labels excluded from both recording and learned ranking.
+    pub history_disabled_sources: Vec<String>,
     pub ui: UiConfig,
     pub integrations: IntegrationConfig,
 }
@@ -162,6 +164,7 @@ impl Default for LauncherConfig {
         Self {
             default_mode: SearchMode::All,
             sources: SourceToggles::default(),
+            history_disabled_sources: Vec::new(),
             ui: UiConfig::default(),
             integrations: IntegrationConfig::default(),
         }
@@ -232,7 +235,7 @@ impl ConfigStore {
         }
 
         let contents = serde_json::to_string_pretty(&self.current())?;
-        fs::write(path, contents)
+        crate::persistence::atomic_write(path, contents.as_bytes())
     }
 }
 
@@ -300,6 +303,7 @@ mod tests {
         let path = temp_config_path("roundtrip");
         let config = LauncherConfig {
             default_mode: SearchMode::Email,
+            history_disabled_sources: vec!["Passwords".into()],
             sources: SourceToggles {
                 email: false,
                 ..SourceToggles::default()

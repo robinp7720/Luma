@@ -4,7 +4,9 @@ mod config;
 mod mail_eds_protocol;
 mod model;
 mod password;
+mod persistence;
 mod prediction;
+mod search_runtime;
 mod settings;
 mod sources;
 mod ui;
@@ -141,6 +143,9 @@ struct SearchController {
     cockpit_command_rx: Rc<RefCell<std::sync::mpsc::Receiver<CockpitCommandResult>>>,
     cockpit_refresh_in_flight: Arc<AtomicBool>,
     state: Rc<RefCell<SearchAsyncState>>,
+    source_counts: GtkBox,
+    workers: Vec<search_runtime::LatestWorker>,
+    cancel: Rc<RefCell<Arc<AtomicBool>>>,
     update_tx: std::sync::mpsc::Sender<SearchUpdate>,
     update_rx: Rc<RefCell<std::sync::mpsc::Receiver<SearchUpdate>>>,
 }
@@ -167,6 +172,9 @@ struct SearchAsyncState {
     pending_timeout: Option<glib::SourceId>,
     presentation: ResultsPresentation,
     local_results: Option<(QueryInput, Vec<ResultItem>)>,
+    deferred_results: Vec<ResultItem>,
+    providers_pending: usize,
+    activate_when_ready: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -178,6 +186,11 @@ enum ResultsPresentation {
 
 fn accepts_search_update(state: &SearchAsyncState, generation: u64) -> bool {
     state.generation == generation && state.presentation == ResultsPresentation::Search
+}
+
+fn search_results_pending(state: &SearchAsyncState, has_results: bool, loading: bool) -> bool {
+    state.presentation == ResultsPresentation::Search
+        && (state.local_results.is_none() || (!has_results && loading))
 }
 
 fn accepts_automatic_refresh(state: &SearchAsyncState) -> bool {
@@ -239,6 +252,11 @@ impl SearchController {
             cockpit_command_rx: Rc::new(RefCell::new(cockpit_command_rx)),
             cockpit_refresh_in_flight: Arc::new(AtomicBool::new(false)),
             state: Rc::new(RefCell::new(SearchAsyncState::default())),
+            source_counts: GtkBox::new(Orientation::Horizontal, 4),
+            workers: (0..8)
+                .map(|_| search_runtime::LatestWorker::new())
+                .collect(),
+            cancel: Rc::new(RefCell::new(Arc::new(AtomicBool::new(false)))),
             update_tx,
             update_rx: Rc::new(RefCell::new(update_rx)),
         }
@@ -284,7 +302,7 @@ impl SearchController {
         };
         set_background_processing(&self.spinner, true);
         let tx = self.update_tx.clone();
-        thread::spawn(move || {
+        self.workers[0].submit(self.cancel.borrow().clone(), move || {
             let snapshot = sources.search_snapshot(&query, mode, clipboard_url.as_deref());
             let _ = tx.send(SearchUpdate {
                 generation,
@@ -311,6 +329,13 @@ impl SearchController {
         let mut state = self.state.borrow_mut();
         state.generation = state.generation.saturating_add(1);
         state.local_results = None;
+        state.deferred_results.clear();
+        state.providers_pending = 0;
+        state.activate_when_ready = false;
+        self.cancel
+            .borrow()
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.cancel.replace(Arc::new(AtomicBool::new(false)));
         if let Some(source) = state.pending_timeout.take() {
             source.remove();
         }
@@ -329,6 +354,13 @@ impl SearchController {
         let mut state = self.state.borrow_mut();
         state.generation = state.generation.saturating_add(1);
         state.local_results = None;
+        state.deferred_results.clear();
+        state.providers_pending = 0;
+        state.activate_when_ready = false;
+        self.cancel
+            .borrow()
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.cancel.replace(Arc::new(AtomicBool::new(false)));
         if let Some(source) = state.pending_timeout.take() {
             source.remove();
         }
@@ -362,16 +394,40 @@ impl SearchController {
                 let snapshot = snapshot_for_timeout.clone();
                 let tx = controller.update_tx.clone();
                 let integrated_controls = controller.cockpit_available.get();
-                thread::spawn(move || {
-                    let deferred_results = sources
-                        .search_deferred_results_with_desktop(&snapshot, integrated_controls);
-                    let _ = tx.send(SearchUpdate {
-                        generation,
-                        phase: SearchUpdatePhase::Deferred,
-                        snapshot,
-                        deferred_results,
-                    });
-                });
+                let plans = snapshot.deferred.providers();
+                controller.state.borrow_mut().providers_pending = plans.len();
+                for (index, plan) in plans.into_iter().enumerate() {
+                    let sources = sources.clone();
+                    let tx = tx.clone();
+                    let mut snapshot = snapshot.clone();
+                    snapshot.deferred = plan;
+                    controller.workers[index + 1].submit(
+                        controller.cancel.borrow().clone(),
+                        move || {
+                            let started = std::time::Instant::now();
+                            let deferred_results = sources.search_deferred_results_with_desktop(
+                                &snapshot,
+                                integrated_controls,
+                            );
+                            if profiling_enabled() {
+                                eprintln!(
+                                    "[luma-profile] provider={:?} duration={:.2}ms cancelled={}",
+                                    snapshot.deferred,
+                                    started.elapsed().as_secs_f64() * 1000.0,
+                                    search_runtime::cancelled()
+                                );
+                            }
+                            if !search_runtime::cancelled() {
+                                let _ = tx.send(SearchUpdate {
+                                    generation,
+                                    phase: SearchUpdatePhase::Deferred,
+                                    snapshot,
+                                    deferred_results,
+                                });
+                            }
+                        },
+                    );
+                }
             },
         );
         self.state.borrow_mut().pending_timeout = Some(source_id);
@@ -407,16 +463,40 @@ impl SearchController {
                 self.render_results(results);
                 self.schedule_deferred(snapshot, generation);
             }
+            self.activate_pending();
             return;
         }
 
+        let deferred_results = {
+            let mut state = self.state.borrow_mut();
+            state.providers_pending = state.providers_pending.saturating_sub(1);
+            state.deferred_results.extend(deferred_results);
+            set_background_processing(&self.spinner, state.providers_pending > 0);
+            state.deferred_results.clone()
+        };
         let results = append_deferred_results(snapshot.immediate_results.clone(), deferred_results);
         self.state.borrow_mut().local_results = Some((snapshot.query.clone(), results.clone()));
         let mut results = self.integrate_cockpit_results(results, &snapshot.query);
-        if results.is_empty() {
+        if results.is_empty() && self.state.borrow().providers_pending == 0 {
             results.push(no_results_item(&snapshot.query));
         }
         self.render_results(results);
+        self.activate_pending();
+    }
+
+    fn activate_pending(&self) {
+        let ready = !self.current_results.borrow().is_empty() || !self.spinner.is_visible();
+        let activate = {
+            let mut state = self.state.borrow_mut();
+            let activate = state.activate_when_ready && ready;
+            if activate {
+                state.activate_when_ready = false;
+            }
+            activate
+        };
+        if activate {
+            self.entry.emit_activate();
+        }
     }
 
     fn integrate_cockpit_results(
@@ -586,6 +666,39 @@ impl SearchController {
     }
 
     fn render_results(&self, results: Vec<ResultItem>) {
+        let count_sources = |items: &[ResultItem]| {
+            let mut counts = std::collections::BTreeMap::new();
+            for item in items {
+                *counts.entry(item.source).or_insert(0usize) += 1;
+            }
+            counts
+        };
+        if count_sources(&results) != count_sources(&self.current_results.borrow()) {
+            while let Some(child) = self.source_counts.first_child() {
+                self.source_counts.remove(&child);
+            }
+            let mut counts = std::collections::BTreeMap::new();
+            for item in &results {
+                if !item.source.is_empty() {
+                    *counts.entry(item.source).or_insert(0usize) += 1;
+                }
+            }
+            for (source, count) in counts {
+                let Some((_, prefix)) = ui::navigation::ALL_MODES
+                    .iter()
+                    .find(|(label, _)| *label == source)
+                else {
+                    continue;
+                };
+                let button = Button::with_label(&format!("{source} {count}"));
+                button.add_css_class("launcher-mode");
+                button.set_tooltip_text(Some(&format!("Search only {source}")));
+                let (entry, mode, prefix) = (self.entry.clone(), self.mode, *prefix);
+                button
+                    .connect_clicked(move |_| ui::navigation::select_prefix(&entry, mode, prefix));
+                self.source_counts.append(&button);
+            }
+        }
         if same_presentation(&self.current_results.borrow(), &results) {
             sync_levels(&results);
             self.current_results.replace(results);
@@ -599,6 +712,7 @@ impl SearchController {
             .map(|row| row.index())
             .filter(|index| *index >= 0)
             .and_then(|index| self.current_results.borrow().get(index as usize).cloned());
+        self.current_results.replace(results.clone());
         rebuild_results(
             &self.list,
             &self.scroller,
@@ -1072,10 +1186,29 @@ fn build_ui(
     );
     outer.insert_child_after(&navigation.root, Some(&entry_overlay));
     let hints = Label::new(Some(
-        "↑↓ Navigate   ·   Enter Open   ·   Esc Close   ·   Ctrl+1–5 Filter",
+        "↑↓ Navigate · Enter Actions/Open · Ctrl+K Modes · Ctrl+R Retry · Ctrl+Delete Forget",
     ));
     hints.add_css_class("launcher-hints");
     hints.set_xalign(0.0);
+    hints.set_wrap(true);
+    let hints_for_selection = hints.clone();
+    let results_for_hints = current_results.clone();
+    list.connect_row_selected(move |_, row| {
+        let results = results_for_hints.borrow();
+        let item = row.and_then(|row| results.get(row.index() as usize));
+        let action = match item.map(|item| &item.action) {
+            Some(Action::PasswordActions { .. }) => "Enter: password actions",
+            Some(Action::TimerActions { .. }) => "Enter: pause, resume or cancel",
+            Some(Action::NotificationActions { .. }) => "Enter: notification actions",
+            Some(Action::RestoreClipboard { .. }) => "Enter: copy to clipboard",
+            Some(Action::SetWallpaper { .. }) => "Enter: apply wallpaper",
+            Some(Action::OpenConfigPanel) => "Enter: settings",
+            Some(Action::InstallPackage { .. }) => "Enter: install in terminal",
+            Some(Action::None) | None => "↑↓ Navigate",
+            _ => "Enter: open or run",
+        };
+        hints_for_selection.set_label(&format!("{action} · Esc Close · Ctrl+K Modes\nCtrl+1–5 Filter · Ctrl+R Retry · Ctrl+Delete Forget"));
+    });
     outer.append(&hints);
     let clipboard_url = Rc::new(RefCell::new(None::<String>));
     let search = SearchController::new(
@@ -1097,6 +1230,14 @@ fn build_ui(
         output,
         context_header,
     );
+    let source_counts_scroll = ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Automatic)
+        .vscrollbar_policy(gtk4::PolicyType::Never)
+        .min_content_height(36)
+        .child(&search.source_counts)
+        .build();
+    outer.insert_child_after(&source_counts_scroll, Some(&entry_overlay));
+
     search.start_update_poller();
     search.install_level_sink();
     let mut window_signals = Vec::new();
@@ -1144,6 +1285,11 @@ fn build_ui(
         let previous_focus_target = previous_focus_target.clone();
         let search_for_activation = search.clone();
         let handler = list.connect_row_activated(move |_, row| {
+            let state = search_for_activation.state.borrow();
+            if state.presentation == ResultsPresentation::Search && state.local_results.is_none() {
+                return;
+            }
+            drop(state);
             let item = {
                 let results = current_results.borrow();
                 results.get(row.index() as usize).cloned()
@@ -1181,6 +1327,17 @@ fn build_ui(
         let add_password_draft = add_password_draft.clone();
         let search_for_activation = search.clone();
         let handler = entry.connect_activate(move |_| {
+            {
+                let mut state = search_for_activation.state.borrow_mut();
+                if search_results_pending(
+                    &state,
+                    !current_results.borrow().is_empty(),
+                    search_for_activation.spinner.is_visible(),
+                ) {
+                    state.activate_when_ready = true;
+                    return;
+                }
+            }
             if add_password_draft.borrow().is_some() {
                 advance_add_password_flow(
                     &activate_entry,
@@ -1229,16 +1386,43 @@ fn build_ui(
         window_signals.push((entry.clone().upcast::<glib::Object>(), handler));
     }
 
+    let navigation_for_focus = navigation.clone();
     {
         let entry = entry.clone();
         let list = list.clone();
         let scroller = scroller.clone();
         let current_results = current_results.clone();
         let keys = EventControllerKey::new();
+        // Reserve launcher shortcuts before GtkEntry consumes Ctrl+Delete.
+        keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
         let key_window = window.clone();
+        let search_keys = search.clone();
         let handler = keys.connect_key_pressed(move |_, key, _, modifiers| {
             if navigation.activate_shortcut(key, modifiers) {
                 return glib::Propagation::Stop;
+            }
+            if navigation.picker_visible() {
+                return glib::Propagation::Proceed;
+            }
+            if modifiers.contains(gdk::ModifierType::CONTROL_MASK) {
+                if key == gdk::Key::r && accepts_automatic_refresh(&search_keys.state.borrow()) {
+                    search_keys.refresh();
+                    return glib::Propagation::Stop;
+                }
+                if key == gdk::Key::Delete && accepts_automatic_refresh(&search_keys.state.borrow())
+                {
+                    let item = list.selected_row().and_then(|row| {
+                        current_results.borrow().get(row.index() as usize).cloned()
+                    });
+                    if let Some(key) = item.and_then(|item| item.prediction_key) {
+                        match prediction::shared().lock().unwrap().forget(&key) {
+                            Ok(()) => search_keys.refresh(),
+                            Err(error) => search_keys
+                                .show_submenu_status(action_failure_result(&error.to_string())),
+                        }
+                    }
+                    return glib::Propagation::Stop;
+                }
             }
             match key {
                 gdk::Key::Escape => {
@@ -1306,7 +1490,11 @@ fn build_ui(
         {
             let focus_armed = focus_armed.clone();
             window.connect_is_active_notify(move |window| {
-                if focus_armed.get() && !window.is_active() && window.is_visible() {
+                if focus_armed.get()
+                    && !window.is_active()
+                    && window.is_visible()
+                    && !navigation_for_focus.picker_visible()
+                {
                     window.close();
                 }
             });
@@ -2374,6 +2562,17 @@ mod tests {
 
         assert!(!accepts_search_update(&state, 7));
         assert!(!accepts_automatic_refresh(&state));
+    }
+
+    #[test]
+    fn enter_waits_for_current_query_even_when_old_rows_are_visible() {
+        let state = SearchAsyncState::default();
+        assert!(super::search_results_pending(&state, true, true));
+        let submenu = SearchAsyncState {
+            presentation: super::ResultsPresentation::Submenu,
+            ..Default::default()
+        };
+        assert!(!super::search_results_pending(&submenu, true, false));
     }
 
     #[test]

@@ -264,3 +264,41 @@ in this order: built-in theme, built-in interaction rules,
 directory. Use `theme.css` for generated palettes and `style.css` for persistent
 user overrides, including geometry and motion. Both files are watched for live
 reload; deleting an override returns to the preceding style layer.
+
+### Search reliability and discovery
+
+Ctrl+K or **More…** opens a searchable picker for every mode, including
+bookmarks and recent files. Type a mode name and press Enter, or use Down/Tab to
+choose a mode. Switching modes preserves the search text. Source-count buttons
+above the results narrow the same query to a source; counts describe the loaded
+results, not the total number of indexed matches. The footer describes the
+selected action.
+
+Search uses a fixed set of workers with one pending request per worker. New
+queries replace queued requests and cancel obsolete subprocesses. Deferred
+providers publish independently after the typing pause. Results remain selected
+by identity as other providers finish, and late sources remain reachable even
+when the initial list is full.
+
+File, package, clipboard, compositor, and database search commands have a
+three-second deadline; desktop probes retain their shorter deadlines, and the
+Evolution helper retains its configurable timeout. Subprocess output is drained
+while commands run, with an 8 MiB limit on each output stream. Provider failures
+for files, packages, and email appear as actionable status rows. Ctrl+R retries
+the current search; Enter on a failure row opens settings. A valid search with
+no matches remains distinct from a failed provider.
+
+### Learned history
+
+Settings includes per-source learning switches and **Clear learned history**.
+Turning off learning also excludes that source's existing history from ranking
+and suggestions; it does not delete those records. Ctrl+Delete forgets the
+selected search result's learned history without deleting its underlying file,
+password, or application. New activations can teach it again.
+
+History is shared across warm launcher windows. Configuration and history writes
+use atomic replacement and owner-only file permissions. The JSON configuration
+key history_disabled_sources contains source labels such as "Passwords",
+"Commands", or "Web"; an empty list preserves the existing learning behavior.
+
+LUMA_PROFILE=1 logs provider durations alongside existing rendering timings.

@@ -1,6 +1,6 @@
 use crate::SearchUpdatePhase;
 use crate::model::{Action, EntryBadge, QueryInput, ResultItem};
-use crate::sources::{no_results_item, sort_and_limit_results};
+use crate::sources::{no_results_item, sort_visible_results};
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
@@ -267,7 +267,7 @@ pub(crate) fn finalize_loaded_results(
     results: Vec<ResultItem>,
     query: &QueryInput,
 ) -> Vec<ResultItem> {
-    let mut results = sort_and_limit_results(results);
+    let mut results = sort_visible_results(results);
     if results.is_empty() {
         results.push(no_results_item(query));
     }
@@ -275,7 +275,7 @@ pub(crate) fn finalize_loaded_results(
 }
 
 pub(crate) fn pending_deferred_results(results: Vec<ResultItem>) -> Vec<ResultItem> {
-    sort_and_limit_results(results)
+    sort_visible_results(results)
 }
 
 pub(crate) fn background_processing_after_update(

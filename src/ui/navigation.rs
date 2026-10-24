@@ -9,10 +9,40 @@ const MODES: [(&str, &str, SearchMode); 5] = [
     ("Files", "file:", SearchMode::Files),
 ];
 
+pub(crate) const ALL_MODES: &[(&str, &str)] = &[
+    ("All", "all:"),
+    ("Applications", "app:"),
+    ("Windows", "win:"),
+    ("Controls", "control:"),
+    ("Files", "file:"),
+    ("Passwords", "pass:"),
+    ("Email", "mail:"),
+    ("SSH", "ssh:"),
+    ("Commands", "cmd:"),
+    ("Web", "web:"),
+    ("Calculator", "calc:"),
+    ("Packages", "pkg:"),
+    ("Keyboard shortcuts", "keys:"),
+    ("Clipboard", "clip:"),
+    ("Timers", "timer:"),
+    ("Notifications", "notif:"),
+    ("Wallpapers", "wall:"),
+    ("Bookmarks", "bookmark:"),
+    ("Recent Files", "recent:"),
+];
+
+pub(crate) fn select_prefix(entry: &gtk::Entry, default_mode: SearchMode, prefix: &str) {
+    let text = QueryInput::parse(&entry.text(), default_mode).text;
+    entry.set_text(&format!("{prefix} {text}"));
+    entry.grab_focus();
+    entry.set_position(-1);
+}
+
 #[derive(Clone)]
 pub(crate) struct SearchNavigation {
     pub root: gtk::Box,
     buttons: Vec<gtk::ToggleButton>,
+    picker: gtk::MenuButton,
 }
 
 impl SearchNavigation {
@@ -43,7 +73,103 @@ impl SearchNavigation {
             root.append(&button);
             buttons.push(button);
         }
-        let navigation = Self { root, buttons };
+        let picker = gtk::MenuButton::builder()
+            .label("More…")
+            .tooltip_text("Search all modes · Ctrl+K")
+            .build();
+        if let Some(button) = picker.first_child() {
+            button.add_css_class("launcher-mode");
+        }
+        let popover = gtk::Popover::new();
+        popover.add_css_class("launcher-mode-popover");
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        let filter = gtk::SearchEntry::builder()
+            .placeholder_text("Find a mode…")
+            .build();
+        content.append(&filter);
+        let choices = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        let mut mode_buttons = Vec::new();
+        for &(label, prefix) in ALL_MODES {
+            let button = gtk::Button::with_label(&format!("{label}  {prefix}"));
+            button.set_halign(gtk::Align::Fill);
+            button.add_css_class("launcher-mode-choice");
+            let entry = entry.downgrade();
+            let popover = popover.downgrade();
+            button.connect_clicked(move |_| {
+                let (Some(entry), Some(popover)) = (entry.upgrade(), popover.upgrade()) else {
+                    return;
+                };
+                popover.popdown();
+                select_prefix(&entry, default_mode, prefix);
+            });
+            choices.append(&button);
+            mode_buttons.push((label.to_lowercase(), prefix.to_string(), button));
+        }
+        let mode_buttons = std::rc::Rc::new(mode_buttons);
+        let filtered_buttons = mode_buttons.clone();
+        filter.connect_changed(move |filter| {
+            let text = filter.text().to_lowercase();
+            for (label, prefix, button) in filtered_buttons.iter() {
+                button.set_visible(label.contains(&text) || prefix.contains(&text));
+            }
+        });
+        let keys = gtk::EventControllerKey::new();
+        let key_buttons = mode_buttons.clone();
+        keys.connect_key_pressed(move |_, key, _, _| {
+            if key == gdk::Key::Down {
+                if let Some((_, _, button)) = key_buttons
+                    .iter()
+                    .find(|(_, _, button)| button.is_visible())
+                {
+                    button.grab_focus();
+                }
+                return gtk::glib::Propagation::Stop;
+            }
+            gtk::glib::Propagation::Proceed
+        });
+        filter.add_controller(keys);
+        filter.connect_activate(move |_| {
+            if let Some((_, _, button)) = mode_buttons
+                .iter()
+                .find(|(_, _, button)| button.is_visible())
+            {
+                button.emit_clicked();
+            }
+        });
+        let scroll = gtk::ScrolledWindow::builder()
+            .min_content_width(280)
+            .max_content_height(360)
+            .propagate_natural_height(true)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .child(&choices)
+            .build();
+        content.append(&scroll);
+        popover.set_child(Some(&content));
+        popover.connect_show(move |_| {
+            filter.set_text("");
+            filter.grab_focus();
+        });
+        let entry_for_close = entry.downgrade();
+        popover.connect_closed(move |_| {
+            let Some(entry) = entry_for_close.upgrade() else {
+                return;
+            };
+            let Some(window) = entry.root().and_downcast::<gtk::ApplicationWindow>() else {
+                return;
+            };
+            gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(50), move || {
+                if window.is_visible() && !window.is_active() {
+                    window.close();
+                }
+            });
+        });
+        picker.set_popover(Some(&popover));
+        root.append(&picker);
+        let navigation = Self {
+            root,
+            buttons,
+            picker,
+        };
         navigation.update(entry, default_mode);
         let navigation_for_query = navigation.clone();
         entry.connect_changed(move |entry| navigation_for_query.update(entry, default_mode));
@@ -57,9 +183,19 @@ impl SearchNavigation {
         }
     }
 
+    pub fn picker_visible(&self) -> bool {
+        self.picker
+            .popover()
+            .is_some_and(|popover| popover.is_visible())
+    }
+
     pub fn activate_shortcut(&self, key: gdk::Key, modifiers: gdk::ModifierType) -> bool {
         if !self.root.is_sensitive() || !modifiers.contains(gdk::ModifierType::CONTROL_MASK) {
             return false;
+        }
+        if key == gdk::Key::k {
+            self.picker.popup();
+            return true;
         }
         let index = match key {
             gdk::Key::_1 => 0,
@@ -87,6 +223,17 @@ fn query_for_mode(raw: &str, default_mode: SearchMode, target: SearchMode) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_discoverable_mode_has_a_working_prefix() {
+        for &(label, prefix) in ALL_MODES {
+            let query = QueryInput::parse(&format!("{prefix} example"), SearchMode::All);
+            assert_eq!(query.text, "example", "{label} prefix must be recognized");
+            if label != "All" && label != "Bookmarks" && label != "Recent Files" {
+                assert_ne!(query.mode, SearchMode::All, "{label} must narrow the mode");
+            }
+        }
+    }
 
     #[test]
     fn switching_scope_preserves_search_text_and_replaces_the_prefix() {

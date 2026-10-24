@@ -84,3 +84,28 @@ button.launcher-mode:focus-visible,
 .launcher-icon-wrap.has-thumbnail {
   padding: 0;
 }
+
+.launcher-mode-popover > contents {
+  background: @luma_surface;
+  color: @luma_on_surface;
+  border: 1px solid alpha(@luma_primary, 0.4);
+  padding: 8px;
+}
+.launcher-mode-popover entry,
+button.launcher-mode-choice {
+  background: @luma_surface_highest;
+  color: @luma_on_surface;
+  border: 1px solid transparent;
+  box-shadow: none;
+}
+button.launcher-mode-choice:hover,
+button.launcher-mode-choice:focus-visible {
+  background: @luma_primary_container;
+  color: @luma_on_primary_container;
+  border-color: @luma_primary;
+}
+
+.launcher-mode-popover > arrow {
+  background: @luma_surface;
+  border-color: alpha(@luma_primary, 0.4);
+}

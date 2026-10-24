@@ -8,7 +8,7 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
 use crate::model::{Action, DesktopControlOperation, ResultItem};
-use crate::sources::sort_and_limit_results;
+use crate::sources::sort_visible_results;
 
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_millis(400);
 const ACTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -558,16 +558,16 @@ pub fn merge_context_results(
         {
             local.retain(|item| local_action_matches_context(&item.action, selected));
         }
-        return sort_and_limit_results(local);
+        return sort_visible_results(local);
     }
 
     local.retain(|item| !duplicates_bar_control(&item.action));
     let cockpit = context_results(contexts, selected, query);
     if selected.is_some() && query.trim().is_empty() {
-        return sort_and_limit_results(cockpit);
+        return sort_visible_results(cockpit);
     }
     local.extend(cockpit);
-    sort_and_limit_results(local)
+    sort_visible_results(local)
 }
 
 fn local_action_matches_context(action: &Action, context: DesktopContext) -> bool {

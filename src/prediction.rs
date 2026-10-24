@@ -5,6 +5,32 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
+pub(crate) fn shared() -> std::sync::Arc<std::sync::Mutex<PredictionStore>> {
+    static STORE: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<PredictionStore>>> =
+        std::sync::OnceLock::new();
+    STORE
+        .get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(PredictionStore::load())))
+        .clone()
+}
+
+pub(crate) const HISTORY_SOURCES: &[&str] = &[
+    "Applications",
+    "Windows",
+    "Files",
+    "Passwords",
+    "Email",
+    "SSH",
+    "Commands",
+    "Bookmarks",
+    "Recent Files",
+    "Web",
+    "Calculator",
+    "Controls",
+    "Packages",
+    "Power",
+    "Settings",
+];
+
 const MAX_HISTORY_ENTRIES: usize = 500;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -84,6 +110,38 @@ impl PredictionStore {
         self.save()
     }
 
+    pub fn clear(&mut self) -> io::Result<()> {
+        let old = std::mem::take(&mut self.entries);
+        if let Err(error) = self.save() {
+            self.entries = old;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn forget(&mut self, key: &str) -> io::Result<()> {
+        let old = self.entries.remove(key);
+        if let Err(error) = self.save() {
+            if let Some(entry) = old {
+                self.entries.insert(key.into(), entry);
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn boost_allowed(&self, key: &str, now: u64, excluded: &[String]) -> i32 {
+        if self
+            .entries
+            .get(key)
+            .is_some_and(|entry| excluded.contains(&entry.prediction.source))
+        {
+            0
+        } else {
+            self.boost_for_key(key, now)
+        }
+    }
+
     pub fn boost_for_key(&self, key: &str, now: u64) -> i32 {
         let Some(entry) = self.entries.get(key) else {
             return 0;
@@ -152,7 +210,7 @@ impl PredictionStore {
             fs::create_dir_all(parent)?;
         }
         let contents = serde_json::to_string_pretty(&self.entries)?;
-        fs::write(path, contents)
+        crate::persistence::atomic_write(path, contents.as_bytes())
     }
 }
 
@@ -203,6 +261,8 @@ fn source_label(source: &str) -> &'static str {
         "Web" => "Web",
         "Calculator" => "Calculator",
         "Controls" => "Controls",
+        "Email" => "Email",
+        "Settings" => "Settings",
         _ => "Predictions",
     }
 }
@@ -228,6 +288,40 @@ mod tests {
                 .expect("system clock")
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn history_controls_persist_and_exclusions_remove_boosts() {
+        let path = temp_history_path("controls");
+        let mut store = PredictionStore::load_from_path(path.clone()).unwrap();
+        let prediction = StoredPrediction {
+            key: "app:test.desktop".into(),
+            title: "Test".into(),
+            subtitle: String::new(),
+            source: "Applications".into(),
+            icon_name: String::new(),
+            action: Action::LaunchApp {
+                desktop_id: "test.desktop".into(),
+            },
+        };
+        store.record(prediction.clone(), 100).unwrap();
+        assert!(store.boost_allowed("app:test.desktop", 100, &[]) > 0);
+        assert_eq!(
+            store.boost_allowed("app:test.desktop", 100, &["Applications".into()]),
+            0
+        );
+        store.forget("app:test.desktop").unwrap();
+        assert_eq!(
+            PredictionStore::load_from_path(path.clone()).unwrap().len(),
+            0
+        );
+        store.record(prediction, 100).unwrap();
+        store.clear().unwrap();
+        assert_eq!(
+            PredictionStore::load_from_path(path.clone()).unwrap().len(),
+            0
+        );
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use crate::model::{Action, ResultItem, score_text};
+use crate::search_runtime::SearchCommand;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -15,7 +16,7 @@ pub struct ClipboardEntry {
 pub(crate) fn load_clipboard_history(limit: usize) -> Vec<ClipboardEntry> {
     Command::new("cliphist")
         .arg("list")
-        .output()
+        .search_output()
         .ok()
         .filter(|output| output.status.success())
         .map(|output| parse_cliphist_list(&String::from_utf8_lossy(&output.stdout), limit))

@@ -7,6 +7,7 @@ use crate::model::{
     ResultItem, SearchMode, SourceFilter, browser_target, password_url_draft, score_text,
 };
 use crate::prediction::{PredictionStore, StoredPrediction};
+use crate::search_runtime::SearchCommand;
 use anyhow::{Context, Result};
 use gtk4::gio;
 use gtk4::prelude::*;
@@ -14,12 +15,13 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod clipboard;
+mod indexed;
+use indexed::{FileSearchBackend, PackageSearchBackend};
 mod keys;
 mod vigil;
 mod wallpapers;
@@ -88,6 +90,28 @@ pub(crate) struct DeferredSearchPlan {
 }
 
 impl DeferredSearchPlan {
+    pub fn providers(self) -> Vec<Self> {
+        let mut plans = Vec::new();
+        macro_rules! add {
+            ($field:ident) => {
+                if self.$field {
+                    plans.push(Self {
+                        $field: true,
+                        ..Self::default()
+                    });
+                }
+            };
+        }
+        add!(files);
+        add!(email);
+        add!(windows);
+        add!(controls);
+        add!(recents);
+        add!(calc);
+        add!(packages);
+        plans
+    }
+
     pub fn is_empty(self) -> bool {
         !self.files
             && !self.email
@@ -226,75 +250,6 @@ const POWER_ACTIONS: &[PowerAction] = &[
     },
 ];
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FileSearchBackend {
-    LocalSearch,
-    Tracker3,
-}
-
-impl FileSearchBackend {
-    fn detect() -> Option<Self> {
-        if command_exists("localsearch") {
-            Some(Self::LocalSearch)
-        } else if command_exists("tracker3") {
-            Some(Self::Tracker3)
-        } else {
-            None
-        }
-    }
-
-    fn run_search(self, query: &str, limit: usize) -> std::io::Result<std::process::Output> {
-        match self {
-            Self::LocalSearch => Command::new("localsearch")
-                .args(["search", "-f", "--limit", &limit.to_string(), query])
-                .output(),
-            Self::Tracker3 => Command::new("tracker3")
-                .args(["search", "--limit", &limit.to_string(), query])
-                .output(),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PackageSearchBackend {
-    Pacman,
-    Paru,
-}
-
-impl PackageSearchBackend {
-    fn detect() -> Option<Self> {
-        if package_command_path("paru").is_some() {
-            Some(Self::Paru)
-        } else if package_command_path("pacman").is_some() {
-            Some(Self::Pacman)
-        } else {
-            None
-        }
-    }
-
-    fn manager(self) -> PackageManager {
-        match self {
-            Self::Pacman => PackageManager::Pacman,
-            Self::Paru => PackageManager::Paru,
-        }
-    }
-
-    fn run_search(self, query: &str) -> std::io::Result<std::process::Output> {
-        match self {
-            Self::Pacman => {
-                Command::new(package_command_path("pacman").unwrap_or_else(|| "pacman".into()))
-                    .args(["-Ss", query])
-                    .output()
-            }
-            Self::Paru => {
-                Command::new(package_command_path("paru").unwrap_or_else(|| "paru".into()))
-                    .args(["-Ss", query])
-                    .output()
-            }
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct AppEntry {
     pub desktop_id: String,
@@ -395,7 +350,7 @@ impl Sources {
             file_search_backend: FileSearchBackend::detect(),
             pass_available: command_exists("pass"),
             qalc_available: command_exists("qalc"),
-            predictions: Arc::new(Mutex::new(PredictionStore::load())),
+            predictions: crate::prediction::shared(),
         };
         if crate::ui::results::profiling_enabled() {
             eprintln!(
@@ -473,7 +428,7 @@ impl Sources {
                 query.mode == SearchMode::Controls && self.current_config().sources.controls;
             return SearchSnapshot {
                 query,
-                immediate_results: results,
+                immediate_results: sort_and_limit_results(results),
                 deferred: DeferredSearchPlan {
                     controls: controls_deferred,
                     ..DeferredSearchPlan::default()
@@ -594,7 +549,7 @@ impl Sources {
 
         SearchSnapshot {
             query,
-            immediate_results: results,
+            immediate_results: sort_and_limit_results(results),
             deferred: DeferredSearchPlan {
                 files: file_search_deferred,
                 email: email_search_deferred,
@@ -811,6 +766,14 @@ impl Sources {
     }
 
     pub fn record_activation(&self, item: &ResultItem) {
+        if self
+            .current_config()
+            .history_disabled_sources
+            .iter()
+            .any(|source| source == item.source)
+        {
+            return;
+        }
         let Some(key) = item.prediction_key.clone() else {
             return;
         };
@@ -1279,125 +1242,6 @@ impl Sources {
         items
     }
 
-    fn search_files(&self, query: &QueryInput, now: u64) -> Vec<ResultItem> {
-        let config = self.current_config();
-        if !config.sources.files {
-            if query.mode == SearchMode::Files {
-                return vec![instruction_result(
-                    "File search is disabled",
-                    "Open settings to re-enable file search",
-                    "Files",
-                    "system-search-symbolic",
-                    520,
-                )];
-            }
-            return Vec::new();
-        }
-
-        if query.text.chars().count() < MIN_FILE_QUERY_CHARS {
-            if query.mode == SearchMode::Files {
-                return vec![instruction_result(
-                    "Keep typing to search files",
-                    "Type at least 2 characters before querying the file index",
-                    "Files",
-                    "system-search-symbolic",
-                    520,
-                )];
-            }
-            return Vec::new();
-        }
-
-        let Some(backend) = self.configured_file_search_backend() else {
-            if query.mode == SearchMode::Files {
-                return vec![ResultItem {
-                    prediction_key: None,
-                    title: "Indexed file search unavailable".to_string(),
-                    subtitle: "Install LocalSearch to enable indexed file search".to_string(),
-                    source: "Files",
-                    icon_name: "system-search-symbolic".to_string(),
-                    score: 500,
-                    action: Action::None,
-                    ..Default::default()
-                }];
-            }
-            return Vec::new();
-        };
-
-        let Ok(output) = backend.run_search(&query.text, MAX_FILES) else {
-            return Vec::new();
-        };
-
-        if !output.status.success() {
-            return Vec::new();
-        }
-
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter_map(parse_file_search_line)
-            .take(MAX_FILES)
-            .map(|path| {
-                let file_name = Path::new(&path)
-                    .file_name()
-                    .and_then(|part| part.to_str())
-                    .unwrap_or(path.as_str())
-                    .to_string();
-                let accessory = file_modified_label(&path, now);
-                ResultItem {
-                    prediction_key: Some(file_prediction_key(&path)),
-                    title: file_name,
-                    subtitle: path.clone(),
-                    source: "Files",
-                    icon_name: "folder-documents-symbolic".to_string(),
-                    score: FILE_BASE_SCORE
-                        + self.prediction_boost(&file_prediction_key(&path), now),
-                    action: Action::OpenFile { path },
-                    accessory,
-                    ..Default::default()
-                }
-            })
-            .collect()
-    }
-
-    fn search_packages(&self, query: &QueryInput, now: u64) -> Vec<ResultItem> {
-        let config = self.current_config();
-        if !config.sources.packages {
-            if query.mode == SearchMode::Packages {
-                return vec![instruction_result(
-                    "Package search is disabled",
-                    "Open settings to re-enable pacman/paru package results",
-                    "Packages",
-                    "system-software-install-symbolic",
-                    500,
-                )];
-            }
-            return Vec::new();
-        }
-
-        if query.text.chars().count() < MIN_PACKAGE_QUERY_CHARS {
-            if query.mode == SearchMode::Packages {
-                return self.package_search_status_result(query);
-            }
-            return Vec::new();
-        }
-
-        let Some(backend) = package_backend_for_query(query, self.package_search_backend) else {
-            if query.mode == SearchMode::Packages {
-                return self.package_search_status_result(query);
-            }
-            return Vec::new();
-        };
-
-        let Ok(output) = backend.run_search(&query.text) else {
-            return Vec::new();
-        };
-
-        if !output.status.success() && output.stdout.is_empty() {
-            return Vec::new();
-        }
-
-        package_search_results_from_output(&String::from_utf8_lossy(&output.stdout), backend, now)
-    }
-
     fn search_ssh(&self, query: &QueryInput, now: u64) -> Vec<ResultItem> {
         if !self.current_config().sources.ssh {
             return Vec::new();
@@ -1559,7 +1403,7 @@ impl Sources {
         seen_open_urls: &mut HashSet<String>,
     ) -> Vec<ResultItem> {
         if !command_exists("sqlite3") {
-            return Vec::new();
+            return provider_failure("Email", "Install sqlite3 to search Thunderbird");
         }
 
         let mut items = Vec::new();
@@ -1572,12 +1416,20 @@ impl Sources {
                     &thunderbird_database_uri(database),
                     &thunderbird_email_search_sql(&query.text, MAX_EMAIL * 2),
                 ])
-                .output()
+                .search_output()
             else {
+                items.extend(provider_failure(
+                    "Email",
+                    "Thunderbird search failed or timed out",
+                ));
                 continue;
             };
 
             if !output.status.success() {
+                items.extend(provider_failure(
+                    "Email",
+                    "Thunderbird database could not be read",
+                ));
                 continue;
             }
 
@@ -1868,7 +1720,7 @@ impl Sources {
 
         let output = Command::new("qalc")
             .args(["-t", "--terse", &query.text])
-            .output()
+            .search_output()
             .ok()?;
 
         if !output.status.success() {
@@ -1954,14 +1806,29 @@ impl Sources {
     fn prediction_boost(&self, key: &str, now: u64) -> i32 {
         self.predictions
             .lock()
-            .map(|predictions| predictions.boost_for_key(key, now))
+            .map(|predictions| {
+                predictions.boost_allowed(key, now, &self.current_config().history_disabled_sources)
+            })
             .unwrap_or_default()
     }
 
     fn top_prediction_results(&self, now: u64) -> Vec<ResultItem> {
         self.predictions
             .lock()
-            .map(|predictions| predictions.top_results(8, now))
+            .map(|predictions| {
+                predictions
+                    .top_results(500, now)
+                    .into_iter()
+                    .filter(|item| {
+                        !self
+                            .current_config()
+                            .history_disabled_sources
+                            .iter()
+                            .any(|source| source == item.source)
+                    })
+                    .take(8)
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -2072,7 +1939,7 @@ fn load_firefox_bookmarks() -> Vec<BookmarkEntry> {
             let database = format!("file:{}?immutable=1", path.to_string_lossy());
             let output = Command::new("sqlite3")
                 .args(["-separator", "\t", &database, query])
-                .output()
+                .search_output()
                 .ok()?;
             if !output.status.success() {
                 return None;
@@ -3633,11 +3500,11 @@ fn search_evolution_email_entries(
         MAX_EMAIL * 2,
         email_config.evolution_helper_timeout_ms,
     ) else {
-        return Vec::new();
+        return provider_failure("Email", "Evolution search failed or timed out");
     };
 
     if !response.ok {
-        return Vec::new();
+        return provider_failure("Email", "Evolution could not complete the query");
     }
 
     response
@@ -3834,26 +3701,7 @@ fn run_command_with_timeout(
     mut command: Command,
     timeout_ms: u64,
 ) -> std::io::Result<std::process::Output> {
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command.spawn()?;
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
-
-    loop {
-        if child.try_wait()?.is_some() {
-            return child.wait_with_output();
-        }
-
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "command timed out",
-            ));
-        }
-
-        thread::sleep(Duration::from_millis(25));
-    }
+    crate::search_runtime::output(&mut command, Duration::from_millis(timeout_ms.max(1)))
 }
 
 fn collect_local_email_entries(root: &Path, entries: &mut Vec<EmailEntry>) {
@@ -4951,6 +4799,21 @@ aur/veloren 0.18.0-1 [+21 ~0.00]
     }
 
     #[test]
+    fn full_initial_results_do_not_hide_late_files_and_email() {
+        let immediate = (0..24)
+            .map(|i| scored_item("Applications", &format!("App {i}"), 2000))
+            .collect();
+        let deferred = vec![
+            scored_item("Files", "Report", 300),
+            scored_item("Email", "Invoice", 400),
+        ];
+        let merged = append_deferred_results(immediate, deferred);
+        let merged = crate::cockpit::merge_context_results(merged, &[], None, "report", false);
+        assert!(merged.iter().any(|item| item.source == "Files"));
+        assert!(merged.iter().any(|item| item.source == "Email"));
+    }
+
+    #[test]
     fn deferred_results_load_below_immediate_results_without_reordering_them() {
         let immediate = vec![
             scored_item("Applications", "Firefox", 1900),
@@ -6027,33 +5890,30 @@ pub(crate) fn sort_and_limit_results(mut results: Vec<ResultItem>) -> Vec<Result
     results
 }
 
+/// Providers already apply individual limits. Keep their combined results
+/// reachable when integrating live controls or incremental provider batches.
+pub(crate) fn sort_visible_results(mut results: Vec<ResultItem>) -> Vec<ResultItem> {
+    sort_results(&mut results, 96);
+    results
+}
+
 /// Combine already-displayed `immediate` results with `deferred` results that
 /// finished loading later. The immediate block keeps its established order and
 /// the deferred results are sorted among themselves and appended below, so rows
 /// the user is looking at never reflow when slower providers return. The total
-/// is capped at the same limit as a normal search.
+/// keeps a bounded initial and deferred block so late sources remain reachable.
 pub(crate) fn append_deferred_results(
     immediate: Vec<ResultItem>,
     deferred: Vec<ResultItem>,
 ) -> Vec<ResultItem> {
     let mut results = sort_and_limit_results(immediate);
-    let mut deferred = sort_and_limit_results(deferred);
-    let package_rows = deferred
-        .iter()
-        .filter(|item| item.source == "Packages")
-        .cloned()
-        .collect::<Vec<_>>();
-    let remaining = MAX_RESULTS.saturating_sub(results.len());
-    if remaining > 0 {
-        deferred.truncate(remaining);
-        results.extend(deferred);
-    }
-    for package in package_rows {
+    let mut deferred = sort_visible_results(deferred);
+    for item in deferred.drain(..) {
         if !results
             .iter()
-            .any(|item| same_result_identity(item, &package))
+            .any(|existing| same_result_identity(existing, &item))
         {
-            results.push(package);
+            results.push(item);
         }
     }
     results
@@ -6098,4 +5958,19 @@ fn instruction_result(
         action: Action::None,
         ..Default::default()
     }
+}
+
+fn provider_failure(source: &'static str, detail: &str) -> Vec<ResultItem> {
+    if crate::search_runtime::cancelled() {
+        return Vec::new();
+    }
+    vec![ResultItem {
+        title: format!("{source} search unavailable"),
+        subtitle: format!("{detail} · Enter: settings · Ctrl+R: retry"),
+        source,
+        icon_name: "dialog-warning-symbolic".into(),
+        score: 0,
+        action: Action::OpenConfigPanel,
+        ..Default::default()
+    }]
 }
