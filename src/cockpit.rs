@@ -20,6 +20,7 @@ pub enum DesktopContext {
     Overview,
     Keyboard,
     Resources,
+    Storage,
     Network,
     Bluetooth,
     Audio,
@@ -34,6 +35,7 @@ impl DesktopContext {
             Self::Overview => "overview",
             Self::Keyboard => "keyboard",
             Self::Resources => "resources",
+            Self::Storage => "storage",
             Self::Network => "network",
             Self::Bluetooth => "bluetooth",
             Self::Audio => "audio",
@@ -506,6 +508,7 @@ pub fn context_results(
                         DesktopContext::Power => 1_140,
                         DesktopContext::Keyboard => 1_130,
                         DesktopContext::Resources => 1_120,
+                        DesktopContext::Storage => 1_110,
                     }
                 } else if context.title.to_ascii_lowercase().contains(&normalized) {
                     1_150
@@ -603,7 +606,10 @@ fn local_action_matches_context(action: &Action, context: DesktopContext) -> boo
                 | DesktopControlOperation::NotificationCloseAll
                 | DesktopControlOperation::NotificationPauseToggle
         ),
-        DesktopContext::Keyboard | DesktopContext::Resources | DesktopContext::Clock => false,
+        DesktopContext::Keyboard
+        | DesktopContext::Resources
+        | DesktopContext::Storage
+        | DesktopContext::Clock => false,
     }
 }
 
@@ -634,6 +640,27 @@ fn matches_query<'a>(query: &str, values: impl IntoIterator<Item = &'a String>) 
 mod tests {
     use super::{ContextAction, ContextActionSpec, ContextHealth, ContextSnapshot, DesktopContext};
     use crate::model::{Action, DesktopControlOperation, ResultItem};
+
+    #[test]
+    fn storage_context_deserializes_and_opens_the_matching_vigil_page() {
+        let context: ContextSnapshot = serde_json::from_str(
+            r#"{
+            "context":"storage", "title":"Storage", "icon_name":"drive-harddisk-symbolic",
+            "summary":"/home · 98% used", "detail":"Local filesystem usage",
+            "health":"healthy", "actions":[]
+        }"#,
+        )
+        .unwrap();
+        let results = super::context_results(&[context], None, "storage");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Open Storage");
+        assert!(matches!(
+            results[0].action,
+            Action::OpenCockpitContext {
+                context: DesktopContext::Storage
+            }
+        ));
+    }
 
     #[test]
     fn contextual_results_include_actions_and_reverse_navigation() {
