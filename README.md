@@ -12,7 +12,7 @@ Luma also includes a built-in settings panel for interactive configuration. Type
 - Pacman/paru package search with terminal-backed installs
 - Active window switching on Hyprland and Niri
 - Predictive ranking based on local activation history
-- File search through `localsearch`
+- Indexed file-name and content search through `localsearch` (or Tracker), with up to 100 file matches per query
 - Password-store search and native `pass` actions
 - On-the-fly password creation with optional username, email, and URL metadata
 - Email search with open, reply, compose, and copy-sender actions

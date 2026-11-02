@@ -44,7 +44,9 @@ use windows::{
 
 const MAX_APPS: usize = 8;
 const MAX_WINDOWS: usize = 8;
-const MAX_FILES: usize = 8;
+// Content queries can match many documents whose names do not match the query.
+// Keep a useful, bounded set reachable in the scrollable result list.
+const MAX_FILES: usize = 100;
 const MAX_SSH: usize = 6;
 const MAX_PASS: usize = 8;
 const MAX_COMMANDS: usize = 8;
@@ -1011,7 +1013,7 @@ impl Sources {
             } else if self.configured_file_search_backend().is_some() {
                 results.push(instruction_result(
                     "File mode",
-                    "Type a name or path fragment to search indexed files",
+                    "Search indexed file names and document contents",
                     "Files",
                     "system-search-symbolic",
                     65,
@@ -4052,7 +4054,8 @@ fn parse_file_search_line(line: &str) -> Option<String> {
         return Some(decoded.into_owned());
     }
 
-    Some(candidate.to_string())
+    // Ignore CLI headings, summaries and other non-file output.
+    None
 }
 
 fn app_direct_match_bonus(app: &AppEntry, query: &str) -> i32 {
@@ -4293,6 +4296,46 @@ mod tests {
             parse_file_search_line(line).as_deref(),
             Some("/tmp/with space#hash.txt")
         );
+    }
+
+    #[test]
+    fn indexed_search_ignores_cli_headings_and_summaries() {
+        for line in [
+            "",
+            "Files:",
+            "Results:",
+            "…",
+            "100 results",
+            "https://example.com",
+        ] {
+            assert_eq!(parse_file_search_line(line), None, "{line}");
+        }
+        assert_eq!(
+            parse_file_search_line("  file:///tmp/thesis.pdf").as_deref(),
+            Some("/tmp/thesis.pdf")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a live index; set LUMA_TEST_CONTENT_QUERY and LUMA_TEST_CONTENT_PATH"]
+    fn live_indexed_content_match_survives_result_merging() {
+        let text = std::env::var("LUMA_TEST_CONTENT_QUERY").expect("content query");
+        let path = std::env::var("LUMA_TEST_CONTENT_PATH").expect("indexed file path");
+        let sources = Sources {
+            file_search_backend: FileSearchBackend::detect(),
+            ..empty_sources()
+        };
+        for mode in [SearchMode::All, SearchMode::Files] {
+            let snapshot = sources.search_snapshot(&text, mode, None);
+            assert!(snapshot.deferred.files, "file provider must be enabled");
+            let files = sources.search_files(&snapshot.query, super::current_unix_time());
+            let merged = append_deferred_results(snapshot.immediate_results, files);
+            let merged = crate::cockpit::merge_context_results(merged, &[], None, &text, false);
+            assert!(
+                merged.iter().any(|item| matches!(&item.action, Action::OpenFile { path: found } if found == &path)),
+                "content match missing in {mode:?}: {path}"
+            );
+        }
     }
 
     #[test]
@@ -4811,6 +4854,24 @@ aur/veloren 0.18.0-1 [+21 ~0.00]
         let merged = crate::cockpit::merge_context_results(merged, &[], None, "report", false);
         assert!(merged.iter().any(|item| item.source == "Files"));
         assert!(merged.iter().any(|item| item.source == "Email"));
+    }
+
+    #[test]
+    fn content_matches_beyond_the_old_limits_remain_reachable() {
+        let immediate = (0..24)
+            .map(|i| scored_item("Applications", &format!("App {i}"), 2000))
+            .collect();
+        let deferred = (0..super::MAX_FILES)
+            .map(|i| scored_item("Files", &format!("Document {i:03}"), 280))
+            .collect();
+        let merged = append_deferred_results(immediate, deferred);
+        let merged =
+            crate::cockpit::merge_context_results(merged, &[], None, "problem statement", false);
+        assert_eq!(
+            merged.iter().filter(|item| item.source == "Files").count(),
+            100
+        );
+        assert!(merged.iter().any(|item| item.title == "Document 099"));
     }
 
     #[test]
@@ -5824,7 +5885,8 @@ pub(crate) fn no_results_item(query: &QueryInput) -> ResultItem {
             SearchMode::Apps => "Try a different app name or executable.".to_string(),
             SearchMode::Windows => "Try a window title, app id, or workspace name.".to_string(),
             SearchMode::Files => {
-                "Try a different file name or ensure the file indexer has indexed it.".to_string()
+                "Try a different file name or content phrase, or check the file indexer."
+                    .to_string()
             }
             SearchMode::Ssh => {
                 "Check ~/.ssh/config and known_hosts for the expected host.".to_string()
@@ -5893,7 +5955,9 @@ pub(crate) fn sort_and_limit_results(mut results: Vec<ResultItem>) -> Vec<Result
 /// Providers already apply individual limits. Keep their combined results
 /// reachable when integrating live controls or incremental provider batches.
 pub(crate) fn sort_visible_results(mut results: Vec<ResultItem>) -> Vec<ResultItem> {
-    sort_results(&mut results, 96);
+    // Each provider bounds its own output; a second cap would hide valid
+    // content matches when other sources or cockpit results are merged in.
+    sort_results(&mut results, usize::MAX);
     results
 }
 

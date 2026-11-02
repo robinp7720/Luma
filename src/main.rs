@@ -2304,7 +2304,7 @@ fn placeholder_for_mode(mode: SearchMode) -> &'static str {
         SearchMode::All => "Search apps, windows, files, or actions",
         SearchMode::Apps => "Launch an application",
         SearchMode::Windows => "Switch to an active window",
-        SearchMode::Files => "Search files with LocalSearch",
+        SearchMode::Files => "Search file names and contents",
         SearchMode::Ssh => "Search SSH hosts",
         SearchMode::Pass => "Search password-store entries",
         SearchMode::Email => "Search email messages",

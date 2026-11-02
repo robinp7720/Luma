@@ -146,7 +146,7 @@ pub fn open_config_panel(parent: &ApplicationWindow) -> Result<()> {
     append_setting_row(
         &sources_card,
         "Files",
-        "Search indexed files via LocalSearch or Tracker.",
+        "Search indexed file names and contents via LocalSearch or Tracker.",
         &files_switch,
     );
     append_setting_row(

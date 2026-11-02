@@ -21,7 +21,9 @@ impl FileSearchBackend {
     fn run_search(self, query: &str, limit: usize) -> std::io::Result<std::process::Output> {
         match self {
             Self::LocalSearch => Command::new("localsearch")
-                .args(["search", "-f", "--limit", &limit.to_string(), query])
+                // --files searches filesystem records, excluding extracted
+                // document contents. The default query searches both.
+                .args(["search", "--limit", &limit.to_string(), query])
                 .search_output(),
             Self::Tracker3 => Command::new("tracker3")
                 .args(["search", "--limit", &limit.to_string(), query])
