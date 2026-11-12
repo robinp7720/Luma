@@ -12,11 +12,11 @@ Examples from an isolated desktop session with sample search data and a custom t
 
 **File search** — narrow results to a source without leaving the launcher.
 
-![Luma file search showing two sample report files](artifacts/search-improvements/source-filter.png)
+![Luma file search showing two sample report files](docs/screenshots/source-filter.png)
 
 **Mode picker** — find additional search modes with Ctrl+K.
 
-![Luma mode picker filtering the available modes to Email](artifacts/search-improvements/modes.png)
+![Luma mode picker filtering the available modes to Email](docs/screenshots/modes.png)
 
 ## Features
 
