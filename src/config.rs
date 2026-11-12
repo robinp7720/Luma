@@ -102,7 +102,7 @@ impl Default for EmailConfig {
             thunderbird_enabled: true,
             evolution_enabled: false,
             evolution_helper_command: None,
-            evolution_helper_timeout_ms: 2_000,
+            evolution_helper_timeout_ms: 5_000,
             local_mail_enabled: true,
         }
     }
@@ -318,7 +318,7 @@ mod tests {
         assert!(config.integrations.email.thunderbird_enabled);
         assert!(!config.integrations.email.evolution_enabled);
         assert!(config.integrations.email.evolution_helper_command.is_none());
-        assert_eq!(config.integrations.email.evolution_helper_timeout_ms, 2_000);
+        assert_eq!(config.integrations.email.evolution_helper_timeout_ms, 5_000);
         assert!(config.integrations.email.local_mail_enabled);
         assert!(config.ui.use_layer_shell);
     }

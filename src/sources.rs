@@ -4351,6 +4351,30 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires configured Evolution mail; set LUMA_TEST_EMAIL_QUERY to a known match"]
+    fn live_evolution_search_returns_openable_results() {
+        let text = std::env::var("LUMA_TEST_EMAIL_QUERY").expect("email query");
+        let config = crate::config::ConfigStore::load().current();
+        assert!(config.integrations.email.evolution_enabled);
+        for mode in [SearchMode::All, SearchMode::Email] {
+            let query = QueryInput::parse(&text, mode);
+            let results = super::search_evolution_email_entries(
+                &query,
+                super::current_unix_time(),
+                &config.integrations.email,
+                &mut Default::default(),
+            );
+            assert!(
+                results.iter().any(|item| matches!(
+                    &item.action,
+                    Action::OpenUrl { url } if url.starts_with("luma-mail-eds://open?")
+                )),
+                "Evolution returned no openable result in {mode:?}"
+            );
+        }
+    }
+
+    #[test]
     fn pacman_and_paru_search_output_parses_package_rows() {
         let output = "\
 extra/firefox 139.0-1 [installed]
