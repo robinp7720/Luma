@@ -6,6 +6,18 @@ It helps you launch apps, switch windows, search files, search email, run comman
 
 Luma also includes a built-in settings panel for interactive configuration. Type `settings` in the launcher to open it, or use the `Open settings` result that appears in the default mode.
 
+## Screenshots
+
+Examples from an isolated desktop session with sample search data and a custom theme.
+
+**File search** — narrow results to a source without leaving the launcher.
+
+![Luma file search showing two sample report files](artifacts/search-improvements/source-filter.png)
+
+**Mode picker** — find additional search modes with Ctrl+K.
+
+![Luma mode picker filtering the available modes to Email](artifacts/search-improvements/modes.png)
+
 ## Features
 
 - Application launcher with icon-theme support
