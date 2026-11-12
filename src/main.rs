@@ -144,6 +144,8 @@ struct SearchController {
     cockpit_refresh_in_flight: Arc<AtomicBool>,
     state: Rc<RefCell<SearchAsyncState>>,
     source_counts: GtkBox,
+    wallpaper_controls: ui::wallpapers::WallpaperControls,
+    wallpaper_busy: Rc<Cell<bool>>,
     workers: Vec<search_runtime::LatestWorker>,
     cancel: Rc<RefCell<Arc<AtomicBool>>>,
     update_tx: std::sync::mpsc::Sender<SearchUpdate>,
@@ -226,11 +228,14 @@ impl SearchController {
         cockpit_context: Option<DesktopContext>,
         cockpit_output: Option<String>,
         cockpit_header: ContextHeader,
+        wallpaper_controls: ui::wallpapers::WallpaperControls,
     ) -> Self {
         let (update_tx, update_rx) = std::sync::mpsc::channel();
         let (cockpit_update_tx, cockpit_update_rx) = std::sync::mpsc::channel();
         let (cockpit_command_tx, cockpit_command_rx) = std::sync::mpsc::channel();
         Self {
+            wallpaper_controls,
+            wallpaper_busy: Rc::new(Cell::new(false)),
             window,
             entry,
             spinner,
@@ -285,12 +290,15 @@ impl SearchController {
     }
 
     fn refresh(&self) {
-        if self.add_password_draft.borrow().is_some() {
+        if self.wallpaper_busy.get() || self.add_password_draft.borrow().is_some() {
             return;
         }
 
         self.state.borrow_mut().presentation = ResultsPresentation::Search;
         let query = self.entry.text().to_string();
+        self.wallpaper_controls
+            .root
+            .set_visible(QueryInput::parse(&query, self.mode).mode == SearchMode::Wallpapers);
         let clipboard_url = self.clipboard_url.borrow().clone();
         let generation = self.bump_generation();
 
@@ -451,6 +459,8 @@ impl SearchController {
         );
 
         if phase == SearchUpdatePhase::Immediate {
+            self.wallpaper_controls
+                .sync(&self.sources.wallpaper_session);
             self.state.borrow_mut().local_results =
                 Some((snapshot.query.clone(), snapshot.immediate_results.clone()));
             let results =
@@ -1171,6 +1181,10 @@ fn build_ui(
 
     outer.append(&entry_overlay);
     outer.append(&context_header.root);
+    let wallpaper_controls =
+        ui::wallpapers::WallpaperControls::new(&config.integrations.wallpapers);
+    *sources.wallpaper_session.lock().unwrap() = Default::default();
+    outer.append(&wallpaper_controls.root);
     outer.append(&scroller);
     window.set_child(Some(&outer));
 
@@ -1229,6 +1243,7 @@ fn build_ui(
         context,
         output,
         context_header,
+        wallpaper_controls.clone(),
     );
     let source_counts_scroll = ScrolledWindow::builder()
         .hscrollbar_policy(gtk4::PolicyType::Automatic)
@@ -1240,7 +1255,11 @@ fn build_ui(
 
     search.start_update_poller();
     search.install_level_sink();
-    let mut window_signals = Vec::new();
+    let controller = search.clone();
+    let mut window_signals = wallpaper_controls
+        .connect(sources.wallpaper_session.clone(), move || {
+            controller.refresh()
+        });
     if let Some(context) = context {
         let search_for_open = search.clone();
         let handler = context_open_button.connect_clicked(move |_| {
@@ -1703,6 +1722,64 @@ fn activate_item(
         return;
     }
 
+    if matches!(
+        item.action,
+        Action::SetWallpaper { .. }
+            | Action::DesktopControl {
+                operation: crate::model::DesktopControlOperation::ReapplyTheme
+            }
+    ) {
+        if search.wallpaper_busy.replace(true) {
+            return;
+        }
+        search.show_submenu_status(ResultItem {
+            title: "Applying desktop appearance…".into(),
+            subtitle: "Waiting for your configured integration".into(),
+            ..Default::default()
+        });
+        search.entry.set_sensitive(false);
+        search.wallpaper_controls.root.set_sensitive(false);
+        let config = app_config()
+            .map(|s| s.current().integrations.wallpapers)
+            .unwrap_or_default();
+        let action = item.action.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = match action {
+                Action::SetWallpaper {
+                    path,
+                    output,
+                    update_theme,
+                } => sources::wallpapers::apply_wallpaper(&config, &path, &output, update_theme),
+                _ => sources::wallpapers::regenerate_theme(&config),
+            };
+            let _ = tx.send(result.map_err(|error| format!("{error:#}")));
+        });
+        let controller = search.clone();
+        let item = item.clone();
+        glib::timeout_add_local(Duration::from_millis(30), move || {
+            let result = match rx.try_recv() {
+                Ok(result) => result,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                Err(_) => Err("Wallpaper worker stopped unexpectedly".into()),
+            };
+            controller.wallpaper_busy.set(false);
+            controller.entry.set_sensitive(true);
+            controller.wallpaper_controls.root.set_sensitive(true);
+            if controller.window.is_visible() {
+                match result {
+                    Ok(()) => {
+                        controller.sources.record_activation(&item);
+                        controller.window.close();
+                    }
+                    Err(error) => controller.show_submenu_status(wallpaper_failure_result(&error)),
+                }
+            }
+            glib::ControlFlow::Break
+        });
+        return;
+    }
+
     if let Err(error) = execute_action(window, item.action.clone(), previous_focus_target) {
         show_status_result(
             list,
@@ -1712,6 +1789,19 @@ fn activate_item(
         );
     } else {
         sources.record_activation(&item);
+    }
+}
+
+fn wallpaper_failure_result(error: &str) -> ResultItem {
+    let (title, detail) = error
+        .split_once(": ")
+        .unwrap_or(("Desktop appearance update failed", error));
+    ResultItem {
+        title: title.into(),
+        subtitle: detail.into(),
+        source: "Wallpapers",
+        icon_name: "dialog-error-symbolic".into(),
+        ..Default::default()
     }
 }
 
@@ -2020,7 +2110,9 @@ fn execute_action(
                 .context("failed to restore clipboard entry")?;
         }
         Action::Vigil { command } => execute_vigil_command(command)?,
-        Action::SetWallpaper { path } => sources::apply_wallpaper(&path)?,
+        Action::SetWallpaper { .. } => {
+            anyhow::bail!("wallpaper actions must run through the UI controller")
+        }
         Action::TimerActions { .. } | Action::NotificationActions { .. } => {
             anyhow::bail!("Vigil action menus must open from the launcher UI");
         }

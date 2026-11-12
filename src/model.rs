@@ -183,9 +183,11 @@ pub enum Action {
     Vigil {
         command: VigilCommand,
     },
-    /// A `~/`-relative wallpaper for the focused output and the theme.
+    /// A selection bound to the output shown in the picker.
     SetWallpaper {
         path: String,
+        output: String,
+        update_theme: bool,
     },
     TimerActions {
         id: String,

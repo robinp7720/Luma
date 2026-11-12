@@ -1,6 +1,6 @@
 //! Bounded latest-request workers and cancellable, output-draining subprocesses.
 use std::cell::RefCell;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Output, Stdio};
@@ -83,6 +83,14 @@ impl SearchCommand for Command {
 }
 
 pub(crate) fn output(command: &mut Command, timeout: Duration) -> io::Result<Output> {
+    output_with_input(command, timeout, None)
+}
+
+pub(crate) fn output_with_input(
+    command: &mut Command,
+    timeout: Duration,
+    input: Option<&[u8]>,
+) -> io::Result<Output> {
     if cancelled() {
         return Err(io::Error::new(
             io::ErrorKind::Interrupted,
@@ -93,11 +101,19 @@ pub(crate) fn output(command: &mut Command, timeout: Duration) -> io::Result<Out
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
+    if input.is_some() {
+        command.stdin(Stdio::piped());
+    }
     let mut child = command.spawn()?;
+    let mut stdin = child.stdin.take();
+    let mut remaining = input.unwrap_or_default();
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
     let result = (|| {
-        for fd in [stdout.as_raw_fd(), stderr.as_raw_fd()] {
+        for fd in [stdout.as_raw_fd(), stderr.as_raw_fd()]
+            .into_iter()
+            .chain(stdin.as_ref().map(AsRawFd::as_raw_fd))
+        {
             // Owned pipes: preserve flags while making reads nonblocking.
             let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
             if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
@@ -116,6 +132,22 @@ pub(crate) fn output(command: &mut Command, timeout: Duration) -> io::Result<Out
             }
             if Instant::now() >= deadline {
                 return Err(io::Error::new(io::ErrorKind::TimedOut, "search timed out"));
+            }
+            if let Some(pipe) = stdin.as_mut() {
+                if !remaining.is_empty() {
+                    match pipe.write(remaining) {
+                        Ok(n) => remaining = &remaining[n..],
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                            ) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+                if remaining.is_empty() {
+                    stdin.take();
+                }
             }
             drain(&mut stdout, &mut out)?;
             drain(&mut stderr, &mut err)?;
@@ -164,6 +196,29 @@ fn drain(reader: &mut impl Read, bytes: &mut Vec<u8>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn json_input_is_delivered_and_closed_without_shell_interpolation() {
+        let input = br#"{"path":"/tmp/$(literal) 'file'.png"}"#;
+        let result = output_with_input(
+            &mut Command::new("cat"),
+            Duration::from_secs(1),
+            Some(input),
+        )
+        .unwrap();
+        assert_eq!(result.stdout, input);
+    }
+    #[test]
+    fn unconsumed_large_input_respects_deadline() {
+        let input = vec![b'x'; 1024 * 1024];
+        let error = output_with_input(
+            Command::new("sleep").arg("5"),
+            Duration::from_millis(50),
+            Some(&input),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
     #[test]
     fn drains_output_larger_than_pipe_capacity() {
         let result = output(

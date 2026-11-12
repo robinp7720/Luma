@@ -122,6 +122,29 @@ impl Default for EmailBackendPreference {
     }
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(default)]
+pub struct WallpaperCommand {
+    /// Executable and literal arguments. Never interpreted by a shell.
+    pub command: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(default)]
+pub struct WallpaperThemeConfig {
+    pub command: Vec<String>,
+    pub update_on_selection: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(default)]
+pub struct WallpaperConfig {
+    pub directories: Vec<String>,
+    pub recursive: bool,
+    pub backend: WallpaperCommand,
+    pub theme: WallpaperThemeConfig,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct IntegrationConfig {
@@ -132,6 +155,7 @@ pub struct IntegrationConfig {
     pub file_search_backend: FileSearchBackendChoice,
     pub file_search_min_query_chars: usize,
     pub email: EmailConfig,
+    pub wallpapers: WallpaperConfig,
 }
 
 impl Default for IntegrationConfig {
@@ -144,6 +168,7 @@ impl Default for IntegrationConfig {
             file_search_backend: FileSearchBackendChoice::Auto,
             file_search_min_query_chars: 2,
             email: EmailConfig::default(),
+            wallpapers: WallpaperConfig::default(),
         }
     }
 }

@@ -1,111 +1,206 @@
-//! Wallpaper picker: lists the dotfiles wallpapers, writes the choice into
-//! `awww_wallpapers.conf` and restarts the watcher, which reapplies wallpapers
-//! and regenerates the matugen theme that every surface follows.
-
+//! Executable wallpaper adapters. Desktop policy belongs to the configured helper.
 use super::instruction_result;
+use crate::config::WallpaperConfig;
 use crate::model::{Action, ResultItem, score_text};
-use crate::search_runtime::SearchCommand;
-use anyhow::{Context, Result, anyhow};
-use std::collections::hash_map::DefaultHasher;
+use anyhow::{Context, Result, bail};
+use serde::Deserialize;
+use serde_json::json;
+use std::collections::{HashSet, hash_map::DefaultHasher};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::UNIX_EPOCH;
+use std::sync::Mutex;
+use std::time::{Duration, UNIX_EPOCH};
 
 const IMAGE_EXTENSIONS: [&str; 4] = ["jpg", "jpeg", "png", "webp"];
 const THUMBNAIL_WIDTH: i32 = 112;
 const THUMBNAIL_HEIGHT: i32 = 68;
 
-fn home() -> Option<PathBuf> {
-    dirs::home_dir()
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WallpaperState {
+    Observed,
+    Configured,
 }
 
-fn wallpaper_dir() -> Option<PathBuf> {
-    home().map(|home| home.join(".dotfiles/wallpapers"))
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub(crate) struct WallpaperOutput {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub focused: bool,
+    pub wallpaper: Option<String>,
+    pub wallpaper_state: WallpaperState,
 }
 
-fn wallpaper_config_path() -> Option<PathBuf> {
-    std::env::var_os("AWWW_WALLPAPER_CONFIG")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| home().map(|home| home.join(".dotfiles/scripts/awww_wallpapers.conf")))
+#[derive(Debug, Deserialize)]
+struct StatusResponse {
+    version: u32,
+    outputs: Vec<WallpaperOutput>,
+}
+#[derive(Debug, Deserialize)]
+struct ApplyResponse {
+    version: u32,
+    ok: bool,
 }
 
-fn expand_home(value: &str, home: &Path) -> PathBuf {
-    match value.strip_prefix("~/") {
-        Some(rest) => home.join(rest),
-        None if value == "~" => home.to_path_buf(),
-        None => PathBuf::from(value),
-    }
+#[derive(Clone, Debug, Default)]
+pub(crate) struct WallpaperSession {
+    pub outputs: Vec<WallpaperOutput>,
+    pub selected_output: Option<String>,
+    pub update_theme: Option<bool>,
 }
 
-/// The config keeps `~/` paths so it stays portable between machines.
-fn collapse_home(path: &Path, home: &Path) -> String {
-    path.strip_prefix(home)
-        .map(|rest| format!("~/{}", rest.display()))
-        .unwrap_or_else(|_| path.display().to_string())
-}
-
-fn config_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
-    text.lines().find_map(|line| {
-        let line = line.split('#').next().unwrap_or("").trim();
-        line.strip_prefix(key)
-            .and_then(|rest| rest.strip_prefix('='))
-            .map(str::trim)
-    })
-}
-
-/// The wallpaper the watcher shows on `output`: its override, else `default=`.
-pub(crate) fn current_wallpaper(text: &str, output: Option<&str>, home: &Path) -> Option<PathBuf> {
-    output
-        .and_then(|output| config_value(text, output))
-        .or_else(|| config_value(text, "default"))
-        .map(|value| expand_home(value, home))
-}
-
-/// Points `output` and the theme at `wallpaper`, replacing existing lines in
-/// place and keeping comments and other outputs untouched.
-pub(crate) fn update_wallpaper_config(text: &str, output: &str, wallpaper: &str) -> String {
-    let mut lines = text.lines().map(str::to_string).collect::<Vec<_>>();
-    for key in ["theme", output] {
-        let entry = format!("{key}={wallpaper}");
-        let existing = lines.iter().position(|line| {
-            let line = line.trim_start();
-            line.strip_prefix(key)
-                .is_some_and(|rest| rest.trim_start().starts_with('='))
-        });
-        match existing {
-            Some(index) => lines[index] = entry,
-            None => lines.push(entry),
+pub(crate) fn expand_home(value: &str) -> PathBuf {
+    if let Some(home) = dirs::home_dir() {
+        if value == "~" {
+            return home;
+        }
+        if let Some(rest) = value.strip_prefix("~/") {
+            return home.join(rest);
         }
     }
-    let mut updated = lines.join("\n");
-    updated.push('\n');
-    updated
+    PathBuf::from(value)
 }
 
-fn list_wallpapers(dir: &Path) -> Vec<PathBuf> {
-    let mut paths = fs::read_dir(dir)
-        .map(|entries| {
-            entries
-                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-                .filter(|path| {
-                    path.is_file()
-                        && path
-                            .extension()
-                            .and_then(|extension| extension.to_str())
-                            .is_some_and(|extension| {
-                                IMAGE_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
-                            })
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+pub(crate) fn command_available(command: &[String]) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(program) = command.first().filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    let executable = |path: &Path| {
+        fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    };
+    let program = expand_home(program);
+    if program.components().count() > 1 || program.is_absolute() {
+        return executable(&program);
+    }
+    std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|dir| executable(&dir.join(&program))))
+}
+
+fn request(
+    command: &[String],
+    payload: serde_json::Value,
+    timeout: Duration,
+) -> Result<serde_json::Value> {
+    let Some(program) = command.first().filter(|s| !s.is_empty()) else {
+        bail!("No wallpaper integration configured");
+    };
+    let mut process = Command::new(expand_home(program));
+    process.args(&command[1..]);
+    let input = serde_json::to_vec(&payload)?;
+    let result = crate::search_runtime::output_with_input(&mut process, timeout, Some(&input))
+        .context("Wallpaper integration failed or timed out; check its status before retrying")?;
+    if !result.status.success() {
+        bail!(
+            "Wallpaper integration failed: {}",
+            String::from_utf8_lossy(&result.stderr).trim()
+        );
+    }
+    serde_json::from_slice(&result.stdout).context("Wallpaper integration returned invalid JSON")
+}
+
+fn read_status(config: &WallpaperConfig) -> Result<Vec<WallpaperOutput>> {
+    let response: StatusResponse = serde_json::from_value(request(
+        &config.backend.command,
+        json!({"version": 1, "operation": "status"}),
+        Duration::from_secs(3),
+    )?)?;
+    if response.version != 1 {
+        bail!("Unsupported wallpaper adapter version");
+    }
+    let mut ids = HashSet::new();
+    for output in &response.outputs {
+        if output.id.is_empty() || !ids.insert(&output.id) {
+            bail!("Wallpaper adapter returned empty or duplicate display IDs");
+        }
+    }
+    Ok(response.outputs)
+}
+
+fn checked_apply(command: &[String], payload: serde_json::Value) -> Result<()> {
+    let response: ApplyResponse =
+        serde_json::from_value(request(command, payload, Duration::from_secs(30))?)?;
+    if response.version != 1 || !response.ok {
+        bail!("Wallpaper integration did not confirm success");
+    }
+    Ok(())
+}
+
+pub(crate) fn apply_wallpaper(
+    config: &WallpaperConfig,
+    path: &str,
+    output: &str,
+    update_theme: bool,
+) -> Result<()> {
+    checked_apply(
+        &config.backend.command,
+        json!({"version": 1, "operation": "apply", "output": output, "path": path}),
+    )
+    .context("Could not apply wallpaper")?;
+    if update_theme {
+        checked_apply(
+            &config.theme.command,
+            json!({"version": 1, "operation": "apply", "path": path}),
+        )
+        .context("Wallpaper applied; theme update failed")?;
+    }
+    Ok(())
+}
+
+pub(crate) fn regenerate_theme(config: &WallpaperConfig) -> Result<()> {
+    checked_apply(
+        &config.theme.command,
+        json!({"version": 1, "operation": "regenerate"}),
+    )
+}
+
+fn list_wallpapers(config: &WallpaperConfig) -> Vec<PathBuf> {
+    let mut pending: Vec<_> = config
+        .directories
+        .iter()
+        .map(|path| expand_home(path))
+        .collect();
+    let mut visited = HashSet::new();
+    let mut paths = Vec::new();
+    while let Some(dir) = pending.pop() {
+        if crate::search_runtime::cancelled() {
+            break;
+        }
+        let Ok(dir) = dir.canonicalize() else {
+            continue;
+        };
+        if !visited.insert(dir.clone()) {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if crate::search_runtime::cancelled() {
+                break;
+            }
+            let path = entry.path();
+            if config.recursive && path.is_dir() {
+                pending.push(path);
+            } else if path.is_file()
+                && path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|s| IMAGE_EXTENSIONS.contains(&s.to_ascii_lowercase().as_str()))
+            {
+                if let Ok(path) = path.canonicalize() {
+                    paths.push(path);
+                }
+            }
+        }
+    }
     paths.sort();
+    paths.dedup();
     paths
 }
-
 /// Decoding a 4K wallpaper is slow, so rows load a cached thumbnail that the
 /// search worker renders once per wallpaper revision.
 fn ensure_thumbnail(source: &Path) -> Option<PathBuf> {
@@ -135,171 +230,279 @@ fn ensure_thumbnail(source: &Path) -> Option<PathBuf> {
     Some(thumbnail)
 }
 
-pub(crate) fn wallpaper_results(text: &str) -> Vec<ResultItem> {
-    let (Some(dir), Some(home)) = (wallpaper_dir(), home()) else {
-        return Vec::new();
-    };
-    let wallpapers = list_wallpapers(&dir);
-    if wallpapers.is_empty() {
-        return vec![instruction_result(
-            "No wallpapers found",
-            "Add images to ~/.dotfiles/wallpapers to pick them here",
+pub(crate) fn wallpaper_results(
+    text: &str,
+    config: &WallpaperConfig,
+    session: &Mutex<WallpaperSession>,
+) -> Vec<ResultItem> {
+    let message = |title: &str, detail: &str| {
+        vec![instruction_result(
+            title,
+            detail,
             "Wallpapers",
             "preferences-desktop-wallpaper-symbolic",
             65,
-        )];
+        )]
+    };
+    if !command_available(&config.backend.command) {
+        session.lock().unwrap().outputs.clear();
+        return message(
+            "Configure a wallpaper backend",
+            "Set integrations.wallpapers.backend.command and directories in Luma's config.json",
+        );
     }
-    let output = focused_output();
-    let config = wallpaper_config_path()
-        .and_then(|path| fs::read_to_string(path).ok())
-        .unwrap_or_default();
-    let current = current_wallpaper(&config, output.as_deref(), &home);
-    let target = output.as_deref().unwrap_or("this display");
-
-    let query = text.trim();
+    let outputs = match read_status(config) {
+        Ok(outputs) => outputs,
+        Err(error) => {
+            session.lock().unwrap().outputs.clear();
+            return message("Wallpaper displays unavailable", &format!("{error:#}"));
+        }
+    };
+    let (target, update_theme) = {
+        let mut session = session.lock().unwrap();
+        let target = session
+            .selected_output
+            .as_ref()
+            .and_then(|id| outputs.iter().find(|o| &o.id == id))
+            .or_else(|| outputs.iter().find(|o| o.focused))
+            .or_else(|| outputs.first())
+            .cloned();
+        session.outputs = outputs;
+        session.selected_output = target.as_ref().map(|o| o.id.clone());
+        (
+            target,
+            session
+                .update_theme
+                .unwrap_or(config.theme.update_on_selection)
+                && command_available(&config.theme.command),
+        )
+    };
+    let Some(target) = target else {
+        return message(
+            "No wallpaper displays available",
+            "Connect a display and retry with Ctrl+R",
+        );
+    };
+    let wallpapers = list_wallpapers(config);
+    if wallpapers.is_empty() {
+        return message(
+            "No wallpapers found",
+            "Add JPG, PNG or WebP images to your configured wallpaper directories",
+        );
+    }
+    let current = target
+        .wallpaper
+        .as_deref()
+        .map(expand_home)
+        .map(|p| p.canonicalize().unwrap_or(p));
     let mut results = Vec::new();
     for (index, path) in wallpapers.into_iter().enumerate() {
+        if crate::search_runtime::cancelled() {
+            break;
+        }
         let name = path
             .file_stem()
-            .map(|stem| stem.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let score = if query.is_empty() {
-            Some(1000 - index as i32)
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let score = if text.trim().is_empty() {
+            Some(1000i32.saturating_sub(index as i32))
         } else {
-            score_text(&name, query)
+            score_text(&name, text.trim())
         };
         let Some(score) = score else {
             continue;
         };
         let is_current = current.as_deref() == Some(path.as_path());
+        let state = match target.wallpaper_state {
+            WallpaperState::Observed => "Current",
+            WallpaperState::Configured => "Configured",
+        };
         results.push(ResultItem {
             title: name,
             subtitle: if is_current {
-                format!("Current on {target}")
+                format!("{state} on {}", target.label)
             } else {
-                format!("Set on {target} and rebuild the theme")
+                format!(
+                    "Set on {}{}",
+                    target.label,
+                    if update_theme {
+                        " and update desktop colors"
+                    } else {
+                        ""
+                    }
+                )
             },
             source: "Wallpapers",
-            icon_name: "preferences-desktop-wallpaper-symbolic".to_string(),
-            thumbnail: ensure_thumbnail(&path).map(|path| path.display().to_string()),
+            icon_name: "preferences-desktop-wallpaper-symbolic".into(),
+            thumbnail: ensure_thumbnail(&path).map(|p| p.display().to_string()),
             score,
             action: Action::SetWallpaper {
-                path: collapse_home(&path, &home),
+                path: path.display().to_string(),
+                output: target.id.clone(),
+                update_theme,
             },
-            accessory: is_current.then(|| "Current".to_string()),
+            accessory: is_current.then(|| state.into()),
             ..Default::default()
         });
     }
     if results.is_empty() {
-        results.push(instruction_result(
+        return message(
             "No matching wallpapers",
             "Try part of a wallpaper file name",
-            "Wallpapers",
-            "preferences-desktop-wallpaper-symbolic",
-            65,
-        ));
+        );
     }
     results
-}
-
-fn focused_output() -> Option<String> {
-    if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() {
-        let output = Command::new("hyprctl")
-            .args(["monitors", "-j"])
-            .search_output()
-            .ok()?;
-        let monitors: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-        return monitors
-            .as_array()?
-            .iter()
-            .find(|monitor| monitor["focused"].as_bool() == Some(true))
-            .and_then(|monitor| monitor["name"].as_str())
-            .map(str::to_string);
-    }
-    if std::env::var_os("NIRI_SOCKET").is_some() {
-        let output = Command::new("niri")
-            .args(["msg", "--json", "focused-output"])
-            .search_output()
-            .ok()?;
-        let focused: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-        return focused["name"].as_str().map(str::to_string);
-    }
-    None
-}
-
-/// Writes the choice for the focused output and restarts the watcher; the
-/// watcher holds a lock while running, so a one-shot run would be skipped.
-pub fn apply_wallpaper(wallpaper: &str) -> Result<()> {
-    let output = focused_output().ok_or_else(|| anyhow!("no focused output to set"))?;
-    let config_path =
-        wallpaper_config_path().ok_or_else(|| anyhow!("wallpaper config path is unknown"))?;
-    let text = fs::read_to_string(&config_path).unwrap_or_default();
-    let updated = update_wallpaper_config(&text, &output, wallpaper);
-    let temporary = config_path.with_extension("conf.tmp");
-    fs::write(&temporary, updated)
-        .with_context(|| format!("failed to write {}", temporary.display()))?;
-    fs::rename(&temporary, &config_path)
-        .with_context(|| format!("failed to replace {}", config_path.display()))?;
-    let command = crate::actions::desktop_controls::reapply_theme_command();
-    Command::new(&command.program)
-        .args(&command.args)
-        .spawn()
-        .context("failed to restart the wallpaper watcher")?;
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const CONFIG: &str = "# awww wallpapers per output\n\
-default=~/.dotfiles/wallpapers/a.png\n\
-theme=~/.dotfiles/wallpapers/a.png\n\
-\n\
-DP-2=~/.dotfiles/wallpapers/b.jpg\n\
-DP-3=~/.dotfiles/wallpapers/a.png\n";
-
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "luma-wallpaper-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&root).unwrap();
+            Self(root)
+        }
+        fn config(&self, failure: &str) -> WallpaperConfig {
+            let helper = self.0.join("adapter.py");
+            fs::write(&helper, r#"#!/usr/bin/python3
+import json, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+request = json.load(sys.stdin)
+with (root / 'calls').open('a') as f: f.write(json.dumps(request) + '\n')
+if request['operation'] == 'status':
+    print(json.dumps({'version': 1, 'outputs': [
+      {'id': 'left', 'label': 'Left', 'focused': True, 'wallpaper': str(root / 'a.png'), 'wallpaper_state': 'configured'},
+      {'id': 'right', 'label': 'Right', 'focused': False, 'wallpaper': None, 'wallpaper_state': 'observed'}]}))
+elif sys.argv[2] == 'fail':
+    print('fixture failure', file=sys.stderr)
+    sys.exit(1)
+else: print('{"version":1,"ok":true}')
+"#).unwrap();
+            fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+            WallpaperConfig {
+                directories: vec![self.0.display().to_string()],
+                backend: crate::config::WallpaperCommand {
+                    command: vec![
+                        helper.display().to_string(),
+                        self.0.display().to_string(),
+                        failure.into(),
+                    ],
+                },
+                ..Default::default()
+            }
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
     #[test]
-    fn current_wallpaper_prefers_the_output_override() {
-        let home = Path::new("/home/test");
-        assert_eq!(
-            current_wallpaper(CONFIG, Some("DP-2"), home),
-            Some(PathBuf::from("/home/test/.dotfiles/wallpapers/b.jpg"))
+    fn selection_is_bound_to_explicit_display_and_saved_state_is_honest() {
+        let f = Fixture::new();
+        let config = f.config("ok");
+        fs::write(f.0.join("a.png"), b"").unwrap();
+        let state = Mutex::new(WallpaperSession::default());
+        let rows = wallpaper_results("", &config, &state);
+        assert_eq!(rows[0].accessory.as_deref(), Some("Configured"));
+        state.lock().unwrap().selected_output = Some("right".into());
+        let rows = wallpaper_results("a", &config, &state);
+        assert!(
+            matches!(&rows[0].action, Action::SetWallpaper { output, update_theme: false, .. } if output == "right")
         );
-        assert_eq!(
-            current_wallpaper(CONFIG, Some("HDMI-1"), home),
-            Some(PathBuf::from("/home/test/.dotfiles/wallpapers/a.png"))
+        // Changing focus/session selection cannot retarget an already constructed action.
+        state.lock().unwrap().selected_output = Some("left".into());
+        assert!(
+            matches!(&rows[0].action, Action::SetWallpaper { output, .. } if output == "right")
         );
     }
-
     #[test]
-    fn updating_replaces_output_and_theme_lines_in_place() {
-        let updated = update_wallpaper_config(CONFIG, "DP-3", "~/.dotfiles/wallpapers/c.jpg");
+    fn optional_theme_and_partial_failure_are_distinct() {
+        let f = Fixture::new();
+        let mut config = f.config("ok");
+        config.theme.command = config.backend.command.clone();
+        *config.theme.command.last_mut().unwrap() = "fail".into();
+        let path = "/tmp/a 'quoted' $(literal).png";
+        apply_wallpaper(&config, path, "right", false).unwrap();
         assert_eq!(
-            updated,
-            "# awww wallpapers per output\n\
-default=~/.dotfiles/wallpapers/a.png\n\
-theme=~/.dotfiles/wallpapers/c.jpg\n\
-\n\
-DP-2=~/.dotfiles/wallpapers/b.jpg\n\
-DP-3=~/.dotfiles/wallpapers/c.jpg\n"
+            fs::read_to_string(f.0.join("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        let error = apply_wallpaper(&config, path, "right", true).unwrap_err();
+        assert!(format!("{error:#}").contains("Wallpaper applied; theme update failed"));
+        let calls = fs::read_to_string(f.0.join("calls")).unwrap();
+        let request: serde_json::Value =
+            serde_json::from_str(calls.lines().next().unwrap()).unwrap();
+        assert_eq!(request["path"], path);
+        assert_eq!(request["output"], "right");
+        config.backend.command = config.theme.command.clone();
+        let before = calls.lines().count();
+        assert!(apply_wallpaper(&config, path, "right", true).is_err());
+        assert_eq!(
+            fs::read_to_string(f.0.join("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            before + 1
         );
     }
-
     #[test]
-    fn updating_appends_a_new_output_without_touching_prefixes() {
-        let updated = update_wallpaper_config(CONFIG, "DP-", "~/x.png");
-        assert!(updated.contains("DP-2=~/.dotfiles/wallpapers/b.jpg\n"));
-        assert!(updated.ends_with("DP-=~/x.png\n"));
+    fn recursive_directories_deduplicate_and_stop_symlink_cycles() {
+        let f = Fixture::new();
+        let mut config = f.config("ok");
+        fs::create_dir(f.0.join("nested")).unwrap();
+        fs::write(f.0.join("a.PNG"), b"").unwrap();
+        fs::write(f.0.join("nested/b.webp"), b"").unwrap();
+        symlink(&f.0, f.0.join("nested/cycle")).unwrap();
+        config.directories.push(f.0.display().to_string());
+        assert_eq!(list_wallpapers(&config).len(), 1);
+        config.recursive = true;
+        assert_eq!(list_wallpapers(&config).len(), 2);
     }
-
     #[test]
-    fn config_paths_collapse_to_home_shorthand() {
-        let home = Path::new("/home/test");
-        assert_eq!(
-            collapse_home(Path::new("/home/test/.dotfiles/wallpapers/a.png"), home),
-            "~/.dotfiles/wallpapers/a.png"
+    fn rejects_malformed_and_unconfirmed_responses() {
+        let command = |body: &str| {
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!("cat >/dev/null; printf '%s' '{body}'"),
+            ]
+        };
+        for body in [
+            "not json",
+            "{}",
+            r#"{"version":2,"ok":true}"#,
+            r#"{"version":1,"ok":false}"#,
+        ] {
+            assert!(checked_apply(&command(body), json!({"version":1})).is_err());
+        }
+        let config = WallpaperConfig {
+            backend: crate::config::WallpaperCommand {
+                command: command(
+                    r#"{"version":1,"outputs":[{"id":"a","label":"A","wallpaper_state":"observed"},{"id":"a","label":"B","wallpaper_state":"configured"}]}"#,
+                ),
+            },
+            ..Default::default()
+        };
+        assert!(
+            read_status(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate")
         );
-        assert_eq!(collapse_home(Path::new("/srv/a.png"), home), "/srv/a.png");
     }
 }

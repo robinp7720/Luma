@@ -24,7 +24,7 @@ mod indexed;
 use indexed::{FileSearchBackend, PackageSearchBackend};
 mod keys;
 mod vigil;
-mod wallpapers;
+pub(crate) mod wallpapers;
 mod windows;
 pub use clipboard::restore_clipboard_entry;
 use clipboard::{clipboard_match_score, clipboard_result_item, load_clipboard_history};
@@ -34,7 +34,6 @@ use keys::{
 };
 pub(crate) use vigil::{notification_action_results, timer_action_results};
 use vigil::{notification_results, timer_results};
-pub use wallpapers::apply_wallpaper;
 use wallpapers::wallpaper_results;
 pub use windows::{focus_window, focused_window_target};
 use windows::{
@@ -160,7 +159,7 @@ pub(crate) struct ControlSnapshot {
     pub has_hyprpicker: bool,
     pub is_hyprland: bool,
     pub has_hyprsunset: bool,
-    pub has_wallpaper_watcher: bool,
+    pub has_theme_integration: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -318,6 +317,7 @@ enum EmailBackend {
 #[derive(Clone, Debug)]
 pub struct Sources {
     config: Arc<ConfigStore>,
+    pub(crate) wallpaper_session: Arc<Mutex<wallpapers::WallpaperSession>>,
     apps: Vec<AppEntry>,
     ssh_hosts: Vec<String>,
     pass_entries: Arc<Mutex<Vec<PassEntry>>>,
@@ -338,6 +338,7 @@ impl Sources {
         let started = Instant::now();
         let sources = Self {
             config: config.clone(),
+            wallpaper_session: Default::default(),
             apps: load_applications(),
             ssh_hosts: load_ssh_hosts(),
             pass_entries: Arc::new(Mutex::new(load_pass_entries(&config.current()))),
@@ -487,7 +488,11 @@ impl Sources {
         }
 
         if query.mode == SearchMode::Wallpapers {
-            results.extend(wallpaper_results(&query.text));
+            results.extend(wallpaper_results(
+                &query.text,
+                &self.config.current().integrations.wallpapers,
+                &self.wallpaper_session,
+            ));
         }
 
         if query.mode.includes(SearchMode::Pass) {
@@ -912,7 +917,11 @@ impl Sources {
         }
 
         if mode == SearchMode::Wallpapers {
-            results.extend(wallpaper_results(""));
+            results.extend(wallpaper_results(
+                "",
+                &config.integrations.wallpapers,
+                &self.wallpaper_session,
+            ));
             return results;
         }
 
@@ -1606,7 +1615,10 @@ impl Sources {
             return Vec::new();
         }
 
-        let snapshot = load_control_snapshot(integrated_controls);
+        let mut snapshot = load_control_snapshot(integrated_controls);
+        snapshot.has_theme_integration = wallpapers::command_available(
+            &self.config.current().integrations.wallpapers.theme.command,
+        );
         control_results_from_snapshot(&snapshot, query, now, |key| self.prediction_boost(key, now))
     }
 
@@ -2991,13 +3003,13 @@ fn control_results_from_snapshot(
         }
     }
 
-    if snapshot.has_wallpaper_watcher {
+    if snapshot.has_theme_integration {
         push_control_action(
             &mut items,
             query,
             ControlActionSpec {
                 title: "Regenerate theme",
-                subtitle: "Reapply wallpapers and rebuild colors from them",
+                subtitle: "Regenerate desktop colors with the configured theme integration",
                 icon_name: "preferences-desktop-wallpaper-symbolic",
                 search_terms: &[
                     "theme",
@@ -4612,7 +4624,7 @@ aur/veloren 0.18.0-1 [+21 ~0.00]
             has_hyprpicker: true,
             is_hyprland: true,
             has_hyprsunset: true,
-            has_wallpaper_watcher: true,
+            has_theme_integration: true,
         };
         let query = QueryInput::parse("control:", SearchMode::All);
         let items = control_results_from_snapshot(&snapshot, &query, 1_700_000_000, |_| 0);
@@ -5657,7 +5669,7 @@ fn load_control_snapshot(integrated_controls: bool) -> ControlSnapshot {
     let has_hyprpicker = command_exists("hyprpicker");
     let is_hyprland = env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some();
     let has_hyprsunset = is_hyprland && command_exists("hyprsunset");
-    let has_wallpaper_watcher = command_exists("awww") && command_exists("matugen");
+    let has_theme_integration = false;
 
     ControlSnapshot {
         media: if has_playerctl {
@@ -5751,7 +5763,7 @@ fn load_control_snapshot(integrated_controls: bool) -> ControlSnapshot {
         has_hyprpicker,
         is_hyprland,
         has_hyprsunset,
-        has_wallpaper_watcher,
+        has_theme_integration,
     }
 }
 

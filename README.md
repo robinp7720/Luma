@@ -43,6 +43,10 @@ Type `settings` to configure sources and appearance. Settings are saved in
 `~/.config/Luma/config.json`; CSS overrides go in `theme.css` or `style.css`
 in the same directory. Run `Luma --help` for command-line options.
 
+Wallpaper mode (`wall:` or `Luma --mode wallpapers`) supports configurable image
+folders, display selection, and optional theme updates through an executable
+adapter. See [wallpaper configuration and adapter protocol](docs/wallpapers.md).
+
 ## Screenshots
 
 Default settings and built-in styling, with GTK's Adwaita dark theme.

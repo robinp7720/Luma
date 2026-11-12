@@ -127,17 +127,8 @@ pub(crate) fn desktop_control_commands(
             "scripts/night_light.sh",
             &[if *enabled { "on" } else { "off" }],
         )],
-        DesktopControlOperation::ReapplyTheme => vec![reapply_theme_command()],
+        DesktopControlOperation::ReapplyTheme => Vec::new(),
     }
-}
-
-/// The wallpaper watcher holds a lock while it runs, so restarting it is what
-/// re-reads `awww_wallpapers.conf` and regenerates the matugen theme.
-pub(crate) fn reapply_theme_command() -> DesktopControlCommand {
-    DesktopControlCommand::new(
-        "systemctl",
-        &["--user", "restart", "awww-wallpaper.service"],
-    )
 }
 
 pub(crate) const DISPLAY_MODES: [(&str, &str, &str); 3] = [
@@ -242,12 +233,7 @@ mod tests {
         let day = desktop_control_commands(&DesktopControlOperation::NightLight { enabled: false });
         assert_eq!(day[0].args, vec!["off"]);
 
-        let theme = desktop_control_commands(&DesktopControlOperation::ReapplyTheme);
-        assert_eq!(theme[0].program, "systemctl");
-        assert_eq!(
-            theme[0].args,
-            vec!["--user", "restart", "awww-wallpaper.service"]
-        );
+        assert!(desktop_control_commands(&DesktopControlOperation::ReapplyTheme).is_empty());
     }
 
     #[test]
